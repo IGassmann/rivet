@@ -1,5 +1,6 @@
 import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
+import { RivetError } from "./RivetError";
 
 const TypeId = "~@rivetkit/effect/Action";
 
@@ -153,7 +154,7 @@ const makeProto = <
 }): Action<Tag, Payload, Success, Error> => {
 	const self = Object.assign(Object.create(Proto), options);
 	self.key = `@rivetkit/effect/Action/${options._tag}`;
-	self.defectSchema = Schema.Defect;
+	self.defectSchema = RivetError;
 	return self;
 };
 
