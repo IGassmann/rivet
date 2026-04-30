@@ -83,13 +83,6 @@ type HandlerServices<Handlers> = {
 
 export type ActorKey = string | ReadonlyArray<string>;
 
-export interface GetOrCreateOptions {
-	readonly params?: unknown;
-	readonly getParams?: () => Effect.Effect<unknown>;
-	readonly createInRegion?: string;
-	readonly createWithInput?: unknown;
-}
-
 type ActionClientArgs<A extends Action.AnyWithProps> = [
 	Action.PayloadConstructor<A>,
 ] extends [void]
@@ -105,10 +98,7 @@ export type ActorHandle<Actions extends Action.AnyWithProps> = {
 };
 
 export interface ActorClient<Actions extends Action.AnyWithProps> {
-	readonly getOrCreate: (
-		key?: ActorKey,
-		options?: GetOrCreateOptions,
-	) => ActorHandle<Actions>;
+	readonly getOrCreate: (key?: ActorKey) => ActorHandle<Actions>;
 }
 
 /**
