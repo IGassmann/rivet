@@ -22,14 +22,36 @@ export interface RegistryShape {
 	readonly _: unique symbol;
 }
 
-export interface RegistryOptions {
-	readonly storagePath: string;
+/**
+ * Connection options for the Rivet Engine.
+ *
+ * Mirrors the engine wiring used by the non-Effect TS SDK: an optional
+ * endpoint (with URL-auth syntax for namespace and token), plus
+ * standalone `token` and `namespace` fields. All fields are optional
+ * and fall back to the matching `RIVET_*` environment variables.
+ */
+export interface EngineOptions {
+	/**
+	 * Endpoint URL of the Rivet Engine.
+	 *
+	 * Supports URL auth syntax for namespace and token:
+	 * - `https://namespace:token@api.rivet.dev`
+	 * - `https://namespace@api.rivet.dev`
+	 *
+	 * Falls back to `RIVET_ENDPOINT`.
+	 */
+	readonly endpoint?: string;
+	/** Auth token. Falls back to `RIVET_TOKEN`. */
+	readonly token?: string;
+	/**
+	 * Namespace. Falls back to `RIVET_NAMESPACE`, then `"default"`.
+	 */
+	readonly namespace?: string;
 }
 
-export interface ClientOptions {
-	readonly endpoint: string;
-	readonly token?: string;
-}
+export interface RegistryOptions extends EngineOptions {}
+
+export interface ClientOptions extends EngineOptions {}
 
 export interface ClientShape extends ClientOptions {
 	readonly _: unique symbol;
@@ -38,7 +60,7 @@ export interface ClientShape extends ClientOptions {
 export class Registry extends Context.Service<Registry, RegistryShape>()(
 	"@rivetkit/effect/Actor/Registry",
 ) {
-	static layer(_options: RegistryOptions): Layer.Layer<Registry> {
+	static layer(_options?: RegistryOptions): Layer.Layer<Registry> {
 		return Layer.sync(Registry, () => {
 			throw new Error(
 				"Registry.layer is not yet implemented. Engine wiring is pending.",
@@ -50,7 +72,7 @@ export class Registry extends Context.Service<Registry, RegistryShape>()(
 export class Client extends Context.Service<Client, ClientShape>()(
 	"@rivetkit/effect/Client",
 ) {
-	static layer(options: ClientOptions): Layer.Layer<Client> {
+	static layer(options?: ClientOptions): Layer.Layer<Client> {
 		return Layer.succeed(Client, {
 			...options,
 			_: undefined as never,

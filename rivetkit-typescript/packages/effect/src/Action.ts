@@ -21,6 +21,7 @@ export interface Action<
 	readonly payloadSchema: Payload;
 	readonly successSchema: Success;
 	readonly errorSchema: Error;
+	readonly defectSchema: Schema.Top;
 }
 
 /**
@@ -44,6 +45,7 @@ export interface AnyWithProps {
 	readonly payloadSchema: Schema.Top;
 	readonly successSchema: Schema.Top;
 	readonly errorSchema: Schema.Top;
+	readonly defectSchema: Schema.Top;
 }
 
 // --- Type helpers ---------------------------------------------------
@@ -151,6 +153,7 @@ const makeProto = <
 }): Action<Tag, Payload, Success, Error> => {
 	const self = Object.assign(Object.create(Proto), options);
 	self.key = `@rivetkit/effect/Action/${options._tag}`;
+	self.defectSchema = Schema.Defect;
 	return self;
 };
 

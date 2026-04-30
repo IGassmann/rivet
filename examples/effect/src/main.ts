@@ -10,7 +10,7 @@ const ActorsLayer = Layer.mergeAll(
 )
 
 const MainLayer = ActorsLayer.pipe(
-	Layer.provide(Registry.layer({ storagePath: "./data" })),
+	Layer.provide(Registry.layer({ endpoint: "https://api.rivet.dev" })),
 )
 
 // Keeps the layer alive. Tears down on SIGINT/SIGTERM.
