@@ -81,21 +81,11 @@ type HandlerServices<Handlers> = {
 		: never;
 }[keyof Handlers];
 
-export interface AbortSignalLike {
-	readonly aborted: boolean;
-	readonly reason?: unknown;
-}
-
-export interface CallOptions {
-	readonly signal?: AbortSignalLike;
-}
-
 export type ActorKey = string | ReadonlyArray<string>;
 
 export interface GetOptions {
 	readonly params?: unknown;
 	readonly getParams?: () => Effect.Effect<unknown>;
-	readonly signal?: AbortSignalLike;
 }
 
 export interface GetOrCreateOptions extends GetOptions {
@@ -111,8 +101,8 @@ export interface CreateOptions extends GetOptions {
 type ActionClientArgs<A extends Action.AnyWithProps> = [
 	Action.PayloadConstructor<A>,
 ] extends [void]
-	? readonly [payload?: Action.PayloadConstructor<A>, options?: CallOptions]
-	: readonly [payload: Action.PayloadConstructor<A>, options?: CallOptions];
+	? readonly [payload?: Action.PayloadConstructor<A>]
+	: readonly [payload: Action.PayloadConstructor<A>];
 
 type ActionClientMethod<A extends Action.AnyWithProps> = (
 	...args: ActionClientArgs<A>
