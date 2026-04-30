@@ -92,7 +92,7 @@ export type ActionRequest<A extends Action.AnyWithProps> =
 export type ActionHandlers<Actions extends Action.AnyWithProps> = {
 	readonly [A in Actions as Action.Tag<A>]: (
 		request: ActionRequest<A>,
-	) => Effect.Effect<Action.Success<A>, Action.Error<A>, any>;
+	) => Effect.Effect<Action.Success<A>, Action.Error<A>, unknown>;
 };
 
 type HandlerServices<Handlers> = {
