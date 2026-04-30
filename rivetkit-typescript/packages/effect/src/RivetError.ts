@@ -1,8 +1,34 @@
 import * as Schema from "effect/Schema";
 import * as Getter from "effect/SchemaGetter";
-import { RivetError as RivetErrorClass } from "rivetkit";
+import {
+	RivetError as RivetErrorClass,
+	type RivetErrorLike,
+	type RivetErrorOptions,
+} from "rivetkit";
 
-const RivetErrorEncoded = Schema.Struct({
+/**
+ * The cross-boundary Rivet error. Wraps the underlying
+ * `rivetkit.RivetError` instance on its `error` field, preserving
+ * `instanceof` checks and direct access to `group` / `code` /
+ * `message` / `metadata`.
+ *
+ * Recover with `Effect.catchTag("RivetError", e => …)` and discriminate
+ * on `e.error.group` / `e.error.code`.
+ */
+export class RivetError extends Schema.TaggedErrorClass<RivetError>()(
+	"RivetError",
+	{ error: Schema.instanceOf(RivetErrorClass) },
+) {}
+
+// On-the-wire envelope: the subset of rivetkit's `RivetErrorLike` that
+// crosses the action boundary. `Pick`ing here anchors the codec
+// against drift in the canonical wire shape.
+type WirePayload = Pick<
+	RivetErrorLike,
+	"group" | "code" | "message" | "metadata"
+>;
+
+const Wire = Schema.Struct({
 	group: Schema.String,
 	code: Schema.String,
 	message: Schema.String,
@@ -10,34 +36,27 @@ const RivetErrorEncoded = Schema.Struct({
 });
 
 /**
- * Schema for the cross-boundary `RivetError` envelope.
- *
- * Decodes to the existing `RivetError` class from `rivetkit`, so any
- * code that catches `instanceof RivetError` keeps working across
- * SDKs.
- *
- * Server-side defects (unexpected throws from action handlers) are
- * sanitized into `RivetError("internal", "internal_error", ...)`
- * before they hit the wire. This is the wire shape the Effect SDK
- * uses as the default `defectSchema` for every action.
+ * Wire codec used as the default `defectSchema` for actions. Decodes
+ * the `(group, code, message, metadata)` envelope produced by
+ * `rivetkit-core`'s defect sanitizer into a `RivetError` instance.
  */
-export const RivetError = RivetErrorEncoded.pipe(
-	Schema.decodeTo(Schema.instanceOf(RivetErrorClass), {
-		decode: Getter.transform(({ group, code, message, metadata }) =>
-			new RivetErrorClass(group, code, message, { metadata }),
+export const RivetErrorFromWire = Wire.pipe(
+	Schema.decodeTo(Schema.instanceOf(RivetError), {
+		decode: Getter.transform(
+			({ group, code, message, metadata }) =>
+				new RivetError({
+					error: new RivetErrorClass(group, code, message, {
+						metadata,
+					} satisfies RivetErrorOptions),
+				}),
 		),
-		encode: Getter.transform((e: RivetErrorClass) => {
-			const out: {
-				group: string;
-				code: string;
-				message: string;
-				metadata?: unknown;
-			} = {
-				group: e.group,
-				code: e.code,
-				message: e.message,
+		encode: Getter.transform((e: RivetError) => {
+			const out: WirePayload = {
+				group: e.error.group,
+				code: e.error.code,
+				message: e.error.message,
 			};
-			if (e.metadata !== undefined) out.metadata = e.metadata;
+			if (e.error.metadata !== undefined) out.metadata = e.error.metadata;
 			return out;
 		}),
 	}),

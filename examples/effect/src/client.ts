@@ -14,8 +14,8 @@ const program = Effect.gen(function* () {
 	const total = yield* counter.GetCount()
 	yield* Effect.log(`Total: ${total}`)
 })
-// program: Effect<void, CounterOverflowError | ClientError, Client>
-//                                             ^^^^^^
+// program: Effect<void, CounterOverflowError | RivetError.RivetError, Client>
+//                                                                     ^^^^^^
 //  Missing Client -> compile error naming the central runtime dependency.
 
 // ------------------------------------------------------------------

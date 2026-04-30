@@ -4,6 +4,7 @@ import * as Layer from "effect/Layer";
 import * as Predicate from "effect/Predicate";
 import type * as Scope from "effect/Scope";
 import type * as Action from "./Action";
+import type { RivetError } from "./RivetError";
 
 const TypeId = "~@rivetkit/effect/Actor";
 
@@ -113,7 +114,7 @@ type ActionClientArgs<A extends Action.AnyWithProps> = [
 
 type ActionClientMethod<A extends Action.AnyWithProps> = (
 	...args: ActionClientArgs<A>
-) => Effect.Effect<Action.Success<A>, Action.Error<A>>;
+) => Effect.Effect<Action.Success<A>, Action.Error<A> | RivetError>;
 
 export type ActorHandle<Actions extends Action.AnyWithProps> = {
 	readonly [A in Actions as Action.Tag<A>]: ActionClientMethod<A>;
