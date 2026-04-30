@@ -26,9 +26,6 @@ export class CounterOverflowError extends Schema.TaggedErrorClass<CounterOverflo
 // Actions are standalone values (vs. embedded in the actor
 // definition) because:
 //
-// - Per-action middleware and annotations. Allows for Auth on some
-//   actions but not others, timeout overrides...
-//
 // - Shared action protocols. A Ping health-check or GetMetrics
 //   action defined once and composed into multiple actors.
 export const Increment = Action.make("Increment", {
