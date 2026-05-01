@@ -3,8 +3,8 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"dev": "RIVET_RUN_ENGINE=1 tsx watch src/main.ts",
-		"start": "RIVET_RUN_ENGINE=1 tsx src/main.ts",
+		"dev": "RIVET_RUN_ENGINE=1 RIVET_ENGINE_BINARY=../../target/debug/rivet-engine tsx watch src/main.ts",
+		"start": "RIVET_RUN_ENGINE=1 RIVET_ENGINE_BINARY=../../target/debug/rivet-engine tsx src/main.ts",
 		"client": "tsx src/client.ts",
 		"client:raw": "tsx src/client-raw.ts",
 		"check-types": "tsc --noEmit"
