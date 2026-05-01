@@ -1,10 +1,9 @@
 import * as Context from "effect/Context";
-import type * as Effect from "effect/Effect";
+import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Predicate from "effect/Predicate";
 import type * as Scope from "effect/Scope";
 import type * as Action from "./Action";
-import type { RivetError } from "./RivetError";
 
 const TypeId = "~@rivetkit/effect/Actor";
 
@@ -20,6 +19,10 @@ export interface Options {
 }
 
 export interface RegistryShape {
+	readonly _: unique symbol;
+}
+
+export interface RunnerShape {
 	readonly _: unique symbol;
 }
 
@@ -52,12 +55,14 @@ export interface EngineOptions {
 
 export interface RegistryOptions extends EngineOptions {}
 
-export interface ClientOptions extends EngineOptions {}
-
-export interface ClientShape extends ClientOptions {
-	readonly _: unique symbol;
-}
-
+/**
+ * Service collecting actor defs/builders together with the engine
+ * connection config. Provided once via `Registry.layer({ ... })` and
+ * consumed by both `Actor.toLayer` (which registers itself into the
+ * collector on acquire) and the `Runner.*` mode layers (which
+ * materialize the underlying rivetkit registry from the collected
+ * entries).
+ */
 export class Registry extends Context.Service<Registry, RegistryShape>()(
 	"@rivetkit/effect/Actor/Registry",
 ) {
@@ -70,15 +75,38 @@ export class Registry extends Context.Service<Registry, RegistryShape>()(
 	}
 }
 
-export class Client extends Context.Service<Client, ClientShape>()(
-	"@rivetkit/effect/Client",
+const runnerNotImplemented = (
+	mode: string,
+): Layer.Layer<Runner, never, Registry> =>
+	Layer.effect(
+		Runner,
+		Effect.gen(function* () {
+			yield* Registry;
+			throw new Error(
+				`Runner.${mode} is not yet implemented. Server runtime wiring is pending.`,
+			);
+		}),
+	);
+
+/**
+ * Service that selects how the registered actors are served. Each
+ * static field is a `Layer` for a specific mode mirroring the
+ * non-Effect TS SDK: `start`, `serve`, `handler`, `startEnvoy`, plus a
+ * `test` mode for in-process testing. Each requires `Registry`.
+ */
+export class Runner extends Context.Service<Runner, RunnerShape>()(
+	"@rivetkit/effect/Actor/Runner",
 ) {
-	static layer(options?: ClientOptions): Layer.Layer<Client> {
-		return Layer.succeed(Client, {
-			...options,
-			_: undefined as never,
-		});
-	}
+	static start: Layer.Layer<Runner, never, Registry> =
+		runnerNotImplemented("start");
+	static serve: Layer.Layer<Runner, never, Registry> =
+		runnerNotImplemented("serve");
+	static handler: Layer.Layer<Runner, never, Registry> =
+		runnerNotImplemented("handler");
+	static startEnvoy: Layer.Layer<Runner, never, Registry> =
+		runnerNotImplemented("startEnvoy");
+	static test: Layer.Layer<Runner, never, Registry> =
+		runnerNotImplemented("test");
 }
 
 export type ActionRequest<A extends Action.AnyWithProps> =
@@ -106,24 +134,6 @@ type HandlerServices<Handlers> = {
 
 export type ActorKey = string | ReadonlyArray<string>;
 
-type ActionClientArgs<A extends Action.AnyWithProps> = [
-	Action.PayloadConstructor<A>,
-] extends [void]
-	? readonly [payload?: Action.PayloadConstructor<A>]
-	: readonly [payload: Action.PayloadConstructor<A>];
-
-type ActionClientMethod<A extends Action.AnyWithProps> = (
-	...args: ActionClientArgs<A>
-) => Effect.Effect<Action.Success<A>, Action.Error<A> | RivetError>;
-
-export type ActorHandle<Actions extends Action.AnyWithProps> = {
-	readonly [A in Actions as Action.Tag<A>]: ActionClientMethod<A>;
-};
-
-export interface ActorClient<Actions extends Action.AnyWithProps> {
-	readonly getOrCreate: (key?: ActorKey) => ActorHandle<Actions>;
-}
-
 /**
  * A Rivet Actor contract. It carries the action schemas and
  * display options, but no server implementation.
@@ -137,11 +147,6 @@ export interface Actor<
 	readonly key: string;
 	readonly actions: ReadonlyArray<Actions>;
 	readonly options: Options;
-	readonly client: Effect.Effect<
-		ActorClient<Actions>,
-		never,
-		Client | ClientServices<Actor<Name, Actions>>
-	>;
 
 	of<Handlers extends ActionHandlers<Actions>>(handlers: Handlers): Handlers;
 
@@ -196,12 +201,6 @@ const Proto = {
 	toLayer(this: AnyWithProps) {
 		throw new Error(
 			`Actor.toLayer for ${this._tag} is not yet implemented. Registry runtime wiring is pending.`,
-		);
-	},
-	get client(): never {
-		const self = this as unknown as AnyWithProps;
-		throw new Error(
-			`Actor.client for ${self._tag} is not yet implemented. Client runtime wiring is pending.`,
 		);
 	},
 };

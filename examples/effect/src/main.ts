@@ -1,6 +1,6 @@
 import { Layer } from "effect"
 import { NodeRuntime } from "@effect/platform-node"
-import { Registry } from "@rivetkit/effect"
+import { Registry, Runner } from "@rivetkit/effect"
 import { CounterLive } from "./actors/counter/live.ts"
 // import { ChatRoomLive } from "./actors/chat-room/live.ts"
 
@@ -9,7 +9,8 @@ const ActorsLayer = Layer.mergeAll(
 //	ChatRoomLive,
 )
 
-const MainLayer = ActorsLayer.pipe(
+const MainLayer = Runner.start.pipe(
+	Layer.provide(ActorsLayer),
 	Layer.provide(Registry.layer({ endpoint: "https://api.rivet.dev" })),
 )
 
