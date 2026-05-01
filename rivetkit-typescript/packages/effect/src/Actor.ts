@@ -310,7 +310,7 @@ export class Runner extends Context.Service<Runner, RunnerShape>()(
 			// (which run in rivetkit's plain Promise world) can run
 			// handler effects against the same services Runner.start
 			// was provided with.
-			const context = yield* Effect.context<never>();
+			const context = yield* Effect.context();
 			const runHandler = <A>(
 				effect: Effect.Effect<A, unknown, unknown>,
 			): Promise<A> =>
