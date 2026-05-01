@@ -33,7 +33,9 @@ const program = Effect.gen(function* () {
 	yield* Effect.log(`Increment(100) [unexpected success]: ${overflowed}`)
 }).pipe(
 	Effect.catchTag("CounterOverflowError", (e) =>
-		Effect.log(`CounterOverflowError caught: limit=${e.limit}`),
+		Effect.log(
+			`CounterOverflowError caught: limit=${e.limit} message="${e.message}"`,
+		),
 	),
 )
 

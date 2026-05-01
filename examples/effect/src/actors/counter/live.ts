@@ -43,7 +43,10 @@ export const CounterLive = Counter.toLayer(
 						(n) => n + payload.amount,
 					)
 					if (next > 20) {
-						return yield* new CounterOverflowError({ limit: 20 })
+						return yield* new CounterOverflowError({
+							limit: 20,
+							message: `count ${next} would exceed limit 20`,
+						})
 					}
 					return next
 				}),

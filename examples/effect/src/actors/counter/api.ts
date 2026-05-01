@@ -5,7 +5,10 @@ import { Actor, Action } from "@rivetkit/effect"
 
 export class CounterOverflowError extends Schema.TaggedErrorClass<CounterOverflowError>()(
 	"CounterOverflowError",
-	{ limit: Schema.Number },
+	{
+		limit: Schema.Number,
+		message: Schema.String,
+	},
 ) {}
 
 // --- Actions ---
