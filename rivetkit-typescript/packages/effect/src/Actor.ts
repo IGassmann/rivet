@@ -1,9 +1,11 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Predicate from "effect/Predicate";
 import * as Ref from "effect/Ref";
-import type * as Scope from "effect/Scope";
+import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import {
 	actor as actorNative,
 	type AnyActorDefinition,
@@ -119,31 +121,98 @@ const runnerNotImplemented = (
 		}),
 	);
 
-/**
- * Build the underlying rivetkit `use` map from collected entries.
- * Step 3 wires only the structural skeleton: action handlers throw
- * until per-instance scope + dispatch land in Step 4.
- */
-const buildUseMap = (
-	entries: ReadonlyArray<RegistryEntry>,
-): Record<string, AnyActorDefinition> => {
-	const use: Record<string, AnyActorDefinition> = {};
-	for (const entry of entries) {
-		const actions: Record<string, (...args: any[]) => any> = {};
-		for (const action of entry.actor.actions) {
-			const tag = action._tag;
-			actions[tag] = () => {
-				throw new Error(
-					`Action ${entry.actor._tag}.${tag}: handler dispatch not yet implemented (Step 4 wiring pending)`,
-				);
-			};
-		}
-		use[entry.actor._tag] = actorNative({
-			actions,
-			options: entry.actor.options,
-		} as Parameters<typeof actorNative>[0]);
+type ActorInstance = {
+	readonly handlers: Record<
+		string,
+		(req: {
+			readonly _tag: string;
+			readonly action: Action.AnyWithProps;
+			readonly payload: unknown;
+		}) => Effect.Effect<unknown, unknown>
+	>;
+	readonly scope: Scope.Closeable;
+};
+
+const buildNativeActor = (
+	entry: RegistryEntry,
+	instances: Map<string, ActorInstance>,
+	runHandler: <A>(effect: Effect.Effect<A, unknown, unknown>) => Promise<A>,
+): AnyActorDefinition => {
+	const actor = entry.actor;
+	const decoders = new Map<
+		string,
+		(v: unknown) => Effect.Effect<unknown, unknown, unknown>
+	>();
+	const encoders = new Map<
+		string,
+		(v: unknown) => Effect.Effect<unknown, unknown, unknown>
+	>();
+	for (const action of actor.actions) {
+		decoders.set(
+			action._tag,
+			Schema.decodeUnknownEffect(action.payloadSchema) as never,
+		);
+		encoders.set(
+			action._tag,
+			Schema.encodeUnknownEffect(action.successSchema) as never,
+		);
 	}
-	return use;
+
+	const actions: Record<
+		string,
+		(c: { actorId: string }, payload?: unknown) => Promise<unknown>
+	> = {};
+	for (const action of actor.actions) {
+		const tag = action._tag;
+		actions[tag] = async (c, payload) => {
+			const inst = instances.get(c.actorId);
+			if (!inst) {
+				throw new Error(
+					`actor ${actor._tag}/${c.actorId} has no handlers (onWake didn't run?)`,
+				);
+			}
+			const handler = inst.handlers[tag];
+			if (!handler) {
+				throw new Error(
+					`actor ${actor._tag} has no handler for action ${tag}`,
+				);
+			}
+			const decoded = await runHandler(decoders.get(tag)!(payload));
+			const result = await runHandler(
+				handler({ _tag: tag, action, payload: decoded }),
+			);
+			return await runHandler(encoders.get(tag)!(result));
+		};
+	}
+
+	return actorNative({
+		actions,
+		options: actor.options,
+		onWake: async (c: { actorId: string }) => {
+			const scope = await runHandler(Scope.make());
+			const handlers = await runHandler(
+				Effect.provideService(
+					entry.buildHandlers as Effect.Effect<
+						unknown,
+						never,
+						Scope.Scope
+					>,
+					Scope.Scope,
+					scope,
+				) as Effect.Effect<unknown, never, never>,
+			);
+			instances.set(c.actorId, {
+				handlers: handlers as ActorInstance["handlers"],
+				scope,
+			});
+		},
+		onSleep: async (c: { actorId: string }) => {
+			const inst = instances.get(c.actorId);
+			if (!inst) return;
+			instances.delete(c.actorId);
+			await runHandler(Scope.close(inst.scope, Exit.void));
+		},
+	} as Parameters<typeof actorNative>[0]);
 };
 
 /**
@@ -160,8 +229,31 @@ export class Runner extends Context.Service<Runner, RunnerShape>()(
 		Effect.gen(function* () {
 			const registry = yield* Registry;
 			const entries = yield* registry.entries;
+
+			// Snapshot the current Effect context so action callbacks
+			// (which run in rivetkit's plain Promise world) can run
+			// handler effects against the same services Runner.start
+			// was provided with.
+			const context = yield* Effect.context<never>();
+			const runHandler = <A>(
+				effect: Effect.Effect<A, unknown, unknown>,
+			): Promise<A> =>
+				Effect.runPromiseWith(context)(
+					effect as Effect.Effect<A, unknown, never>,
+				);
+
+			const instances = new Map<string, ActorInstance>();
+			const use: Record<string, AnyActorDefinition> = {};
+			for (const entry of entries) {
+				use[entry.actor._tag] = buildNativeActor(
+					entry,
+					instances,
+					runHandler,
+				);
+			}
+
 			const native = setupNative({
-				use: buildUseMap(entries),
+				use,
 				endpoint: registry.engineOptions.endpoint,
 				token: registry.engineOptions.token,
 				namespace: registry.engineOptions.namespace,
