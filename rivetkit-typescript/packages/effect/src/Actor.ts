@@ -2,6 +2,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Predicate from "effect/Predicate";
+import * as Ref from "effect/Ref";
 import type * as Scope from "effect/Scope";
 import type * as Action from "./Action";
 
@@ -18,8 +19,21 @@ export interface Options {
 	readonly icon?: string;
 }
 
+/**
+ * One actor registered with the `Registry`. The `buildHandlers`
+ * effect is run once per wake by the runner to construct
+ * per-instance state and handlers; the handlers themselves are not
+ * resolved at registration time.
+ */
+export interface RegistryEntry {
+	readonly actor: AnyWithProps;
+	readonly buildHandlers: Effect.Effect<unknown, never, unknown>;
+}
+
 export interface RegistryShape {
-	readonly _: unique symbol;
+	readonly engineOptions: EngineOptions;
+	readonly register: (entry: RegistryEntry) => Effect.Effect<void>;
+	readonly entries: Effect.Effect<ReadonlyArray<RegistryEntry>>;
 }
 
 export interface RunnerShape {
@@ -66,12 +80,24 @@ export interface RegistryOptions extends EngineOptions {}
 export class Registry extends Context.Service<Registry, RegistryShape>()(
 	"@rivetkit/effect/Actor/Registry",
 ) {
-	static layer(_options?: RegistryOptions): Layer.Layer<Registry> {
-		return Layer.sync(Registry, () => {
-			throw new Error(
-				"Registry.layer is not yet implemented. Engine wiring is pending.",
-			);
-		});
+	static layer(options: RegistryOptions = {}): Layer.Layer<Registry> {
+		const engineOptions: EngineOptions = {
+			endpoint: options.endpoint,
+			token: options.token,
+			namespace: options.namespace,
+		};
+		return Layer.effect(
+			Registry,
+			Effect.gen(function* () {
+				const ref = yield* Ref.make<ReadonlyArray<RegistryEntry>>([]);
+				return Registry.of({
+					engineOptions,
+					register: (entry) =>
+						Ref.update(ref, (xs) => [...xs, entry]),
+					entries: Ref.get(ref),
+				});
+			}),
+		);
 	}
 }
 
@@ -198,9 +224,19 @@ const identity = <A>(value: A): A => value;
 const Proto = {
 	[TypeId]: TypeId,
 	of: identity,
-	toLayer(this: AnyWithProps) {
-		throw new Error(
-			`Actor.toLayer for ${this._tag} is not yet implemented. Registry runtime wiring is pending.`,
+	toLayer(this: AnyWithProps, build: unknown) {
+		const self = this;
+		const buildHandlers = (
+			Effect.isEffect(build) ? build : Effect.succeed(build)
+		) as Effect.Effect<unknown, never, unknown>;
+		return Layer.effectDiscard(
+			Effect.gen(function* () {
+				const registry = yield* Registry;
+				yield* registry.register({
+					actor: self,
+					buildHandlers,
+				});
+			}),
 		);
 	},
 };
