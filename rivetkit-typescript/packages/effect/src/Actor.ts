@@ -27,6 +27,31 @@ export interface Options {
 }
 
 /**
+ * Per-instance identity carried inside the wake scope. An actor
+ * instance is addressable in two ways:
+ *
+ * - `(name, key)` — stable user-facing pair (e.g. "Counter", ["counter-123"])
+ * - `actorId` — opaque engine-assigned unique identifier
+ *
+ * Available inside `Actor.toLayer`'s build effect via
+ * `yield* Actor.CurrentAddress`.
+ */
+export interface Address {
+	readonly actorId: string;
+	readonly name: string;
+	readonly key: ReadonlyArray<string>;
+}
+
+/**
+ * Context tag for the current actor instance's `Address`. Provided
+ * once per wake when the build effect runs; capture it into a
+ * closure if action handlers need it.
+ */
+export class CurrentAddress extends Context.Service<CurrentAddress, Address>()(
+	"@rivetkit/effect/Actor/CurrentAddress",
+) {}
+
+/**
  * One actor registered with the `Registry`. The `buildHandlers`
  * effect is run once per wake by the runner to construct
  * per-instance state and handlers; the handlers themselves are not
@@ -188,18 +213,34 @@ const buildNativeActor = (
 	return actorNative({
 		actions,
 		options: actor.options,
-		onWake: async (c: { actorId: string }) => {
+		onWake: async (c: {
+			actorId: string;
+			name: string;
+			key: ReadonlyArray<string>;
+		}) => {
+			const address: Address = {
+				actorId: c.actorId,
+				name: c.name,
+				key: c.key,
+			};
 			const scope = await runHandler(Scope.make());
+			const built = entry.buildHandlers as Effect.Effect<
+				unknown,
+				never,
+				Scope.Scope | CurrentAddress
+			>;
+			const withAddress = Effect.provideService(
+				built,
+				CurrentAddress,
+				address,
+			);
+			const withScope = Effect.provideService(
+				withAddress,
+				Scope.Scope,
+				scope,
+			);
 			const handlers = await runHandler(
-				Effect.provideService(
-					entry.buildHandlers as Effect.Effect<
-						unknown,
-						never,
-						Scope.Scope
-					>,
-					Scope.Scope,
-					scope,
-				) as Effect.Effect<unknown, never, never>,
+				withScope as Effect.Effect<unknown, never, never>,
 			);
 			instances.set(c.actorId, {
 				handlers: handlers as ActorInstance["handlers"],
@@ -318,7 +359,7 @@ export interface Actor<
 	): Layer.Layer<
 		never,
 		never,
-		| Exclude<RX, Scope.Scope>
+		| Exclude<RX, Scope.Scope | CurrentAddress>
 		| HandlerServices<Handlers>
 		| Action.ServicesServer<Actions>
 		| Action.ServicesClient<Actions>

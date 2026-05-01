@@ -1,4 +1,5 @@
 import { Effect, Ref } from "effect"
+import { Actor } from "@rivetkit/effect"
 import { Counter, CounterOverflowError } from "./api.ts"
 
 // --- Actor Implementation ---
@@ -11,6 +12,13 @@ import { Counter, CounterOverflowError } from "./api.ts"
 export const CounterLive = Counter.toLayer(
 	// Wake scope (runs each wake, finalizers run on sleep)
 	Effect.gen(function* () {
+		// Per-instance identity. (name, key) is the user-facing
+		// pair; actorId is the engine-assigned opaque id.
+		const address = yield* Actor.CurrentAddress
+		yield* Effect.log(
+			`waking ${address.name}/${address.key.join(",")} actorId=${address.actorId}`,
+		)
+
 		// In-memory per-wake state. Resets on every wake; this v1
 		// has no persistence. Replace with a persisted state ref
 		// once Actor.State lands.
@@ -18,7 +26,11 @@ export const CounterLive = Counter.toLayer(
 
 		yield* Effect.addFinalizer(() =>
 			Ref.get(count).pipe(
-				Effect.flatMap((n) => Effect.log(`sleeping count=${n}`)),
+				Effect.flatMap((n) =>
+					Effect.log(
+						`sleeping ${address.name}/${address.key.join(",")} count=${n}`,
+					),
+				),
 			),
 		)
 
