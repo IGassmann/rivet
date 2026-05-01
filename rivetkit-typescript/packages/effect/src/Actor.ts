@@ -1,3 +1,4 @@
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -20,6 +21,17 @@ const TypeId = "~@rivetkit/effect/Actor";
 
 export const isActor = (u: unknown): u is Actor<any, any> =>
 	Predicate.hasProperty(u, TypeId);
+
+/**
+ * Refinement that narrows `unknown` to an object with `key` set to a
+ * `string`. Composes `Predicate.hasProperty(key)` with
+ * `Predicate.isString` in one go.
+ */
+const hasStringProperty = <K extends PropertyKey>(
+	key: K,
+): Predicate.Refinement<unknown, { readonly [P in K]: string }> =>
+	(u): u is { readonly [P in K]: string } =>
+		Predicate.hasProperty(u, key) && Predicate.isString(u[key]);
 
 /**
  * Display options carried by an actor contract.
@@ -164,84 +176,59 @@ type ActorInstance = {
 const buildNativeActor = (
 	entry: RegistryEntry,
 	instances: Map<string, ActorInstance>,
-	runHandler: <A>(effect: Effect.Effect<A, unknown, unknown>) => Promise<A>,
+	services: Context.Context<any>,
 ): AnyActorDefinition => {
 	const actor = entry.actor;
-	const decoders = new Map<
-		string,
-		(v: unknown) => Effect.Effect<unknown, unknown, unknown>
-	>();
-	const encoders = new Map<
-		string,
-		(v: unknown) => Effect.Effect<unknown, unknown, unknown>
-	>();
-	for (const action of actor.actions) {
-		decoders.set(
-			action._tag,
-			Schema.decodeUnknownEffect(action.payloadSchema) as never,
-		);
-		encoders.set(
-			action._tag,
-			Schema.encodeUnknownEffect(action.successSchema) as never,
-		);
-	}
 
 	const actions: Record<
 		string,
 		(c: { actorId: string }, payload?: unknown) => Promise<unknown>
 	> = {};
 	for (const action of actor.actions) {
-		const tag = action._tag;
-		actions[tag] = async (c, payload) => {
+		const decodePayload = Schema.decodeUnknownEffect(action.payloadSchema);
+		const encodeSuccess = Schema.encodeUnknownEffect(action.successSchema);
+		const encodeError = Schema.encodeUnknownEffect(action.errorSchema);
+		actions[action._tag] = async (c, payload) => {
 			const inst = instances.get(c.actorId);
 			if (!inst) {
 				throw new Error(
 					`actor ${actor._tag}/${c.actorId} has no handlers (onWake didn't run?)`,
 				);
 			}
-			const handler = inst.handlers[tag];
+			const handler = inst.handlers[action._tag];
 			if (!handler) {
 				throw new Error(
-					`actor ${actor._tag} has no handler for action ${tag}`,
+					`actor ${actor._tag} has no handler for action ${action._tag}`,
 				);
 			}
-			const decoded = await runHandler(decoders.get(tag)!(payload));
-			// Wrap the handler so typed failures (matching `errorSchema`)
-			// are encoded and thrown across the wire as a rivetkit
-			// `UserError`. The error class's `_tag` becomes the wire
-			// `code`, the encoded shape rides in `metadata`. Failures that
-			// don't match the schema fall through and surface as a
-			// generic infra error.
-			const handlerEffect = handler({
-				_tag: tag,
-				action,
-				payload: decoded,
-			}).pipe(
-				Effect.catch((typedErr) =>
-					Schema.encodeUnknownEffect(action.errorSchema)(
-						typedErr,
-					).pipe(
-						Effect.matchEffect({
-							onSuccess: (encoded) =>
-								Effect.die(
-									new UserError(
-										(typedErr as { message?: string })
-											?.message ?? `${tag} failed`,
-										{
-											code:
-												(typedErr as { _tag?: string })
-													?._tag ?? tag,
-											metadata: encoded,
-										},
-									),
-								),
-							onFailure: () => Effect.fail(typedErr),
+
+			const pipeline = Effect.gen(function* () {
+				const decoded = yield* decodePayload(payload).pipe(Effect.orDie);
+				const result = yield* handler({
+					_tag: action._tag,
+					action,
+					payload: decoded,
+				}).pipe(
+					Effect.catch((expectedError) => Effect.gen(function*(){
+						const error = yield* encodeError(expectedError).pipe(Effect.orDie)
+						return yield* Effect.die(
+							new UserError(
+								hasStringProperty("message")(error) ? error.message : `${action._tag} failed`,
+								{
+									code: hasStringProperty("_tag")(error) ? error._tag : undefined,
+									metadata: error
+								},
+							),
+						)
 						}),
 					),
-				),
-			);
-			const result = await runHandler(handlerEffect);
-			return await runHandler(encoders.get(tag)!(result));
+				);
+				return yield* encodeSuccess(result).pipe(Effect.orDie);
+			});
+
+			const exit = await Effect.runPromiseExitWith(services)(pipeline);
+			if (Exit.isSuccess(exit)) return exit.value;
+			throw Cause.squash(exit.cause);
 		};
 	}
 
@@ -258,25 +245,25 @@ const buildNativeActor = (
 				name: c.name,
 				key: c.key,
 			};
-			const scope = await runHandler(Scope.make());
-			const built = entry.buildHandlers as Effect.Effect<
-				unknown,
-				never,
-				Scope.Scope | CurrentAddress
-			>;
-			const withAddress = Effect.provideService(
-				built,
-				CurrentAddress,
-				address,
-			);
-			const withScope = Effect.provideService(
-				withAddress,
-				Scope.Scope,
-				scope,
-			);
-			const handlers = await runHandler(
-				withScope as Effect.Effect<unknown, never, never>,
-			);
+			// Single fused effect: build the wake scope, then run
+			// `buildHandlers` in that scope with `CurrentAddress`
+			// provided. Keeping both pieces in one fiber means a
+			// `buildHandlers` failure shares its cause with the scope it
+			// would have owned.
+			const acquire = Effect.gen(function* () {
+				const scope = yield* Scope.make();
+				const built = entry.buildHandlers as Effect.Effect<
+					unknown,
+					never,
+					Scope.Scope | CurrentAddress
+				>;
+				const handlers = yield* (built.pipe(
+					Effect.provideService(CurrentAddress, address),
+					Effect.provideService(Scope.Scope, scope),
+				) as Effect.Effect<unknown, never, never>);
+				return { handlers, scope };
+			});
+			const { handlers, scope } = await Effect.runPromiseWith(services)(acquire);
 			instances.set(c.actorId, {
 				handlers: handlers as ActorInstance["handlers"],
 				scope,
@@ -286,7 +273,7 @@ const buildNativeActor = (
 			const inst = instances.get(c.actorId);
 			if (!inst) return;
 			instances.delete(c.actorId);
-			await runHandler(Scope.close(inst.scope, Exit.void));
+			await Effect.runPromiseWith(services)(Scope.close(inst.scope, Exit.void));
 		},
 	} as Parameters<typeof actorNative>[0]);
 };
@@ -310,21 +297,14 @@ export class Runner extends Context.Service<Runner, RunnerShape>()(
 			// (which run in rivetkit's plain Promise world) can run
 			// handler effects against the same services Runner.start
 			// was provided with.
-			const context = yield* Effect.context();
-			const runHandler = <A>(
-				effect: Effect.Effect<A, unknown, unknown>,
-			): Promise<A> =>
-				Effect.runPromiseWith(context)(
-					effect as Effect.Effect<A, unknown, never>,
-				);
-
+			const services = yield* Effect.context<any>();
 			const instances = new Map<string, ActorInstance>();
 			const use: Record<string, AnyActorDefinition> = {};
 			for (const entry of entries) {
 				use[entry.actor._tag] = buildNativeActor(
 					entry,
 					instances,
-					runHandler,
+					services,
 				);
 			}
 
