@@ -7,7 +7,11 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 portpicker.workspace = true
+reqwest.workspace = true
 rivet-config.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+testcontainers.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
 tracing.workspace = true

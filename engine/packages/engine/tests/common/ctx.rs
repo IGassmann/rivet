@@ -8,6 +8,7 @@ pub struct TestOpts {
 	pub timeout_secs: u64,
 	pub pegboard_outbound: bool,
 	pub auth_admin_token: Option<String>,
+	pub network_faults: bool,
 }
 
 impl TestOpts {
@@ -17,6 +18,7 @@ impl TestOpts {
 			timeout_secs: 10,
 			pegboard_outbound: false,
 			auth_admin_token: None,
+			network_faults: false,
 		}
 	}
 
@@ -34,6 +36,11 @@ impl TestOpts {
 		self.auth_admin_token = Some(token.into());
 		self
 	}
+
+	pub fn with_network_faults(mut self) -> Self {
+		self.network_faults = true;
+		self
+	}
 }
 
 impl Default for TestOpts {
@@ -43,6 +50,7 @@ impl Default for TestOpts {
 			timeout_secs: 10,
 			pegboard_outbound: false,
 			auth_admin_token: None,
+			network_faults: false,
 		}
 	}
 }
@@ -50,6 +58,7 @@ impl Default for TestOpts {
 pub struct TestCtx {
 	dcs: Vec<TestDatacenter>,
 	pub opts: TestOpts,
+	network_faults: Option<rivet_test_deps::ToxiproxyTestServer>,
 }
 
 pub struct TestDatacenter {
@@ -99,7 +108,17 @@ impl TestCtx {
 			futures_util::future::try_join_all(setup_futures).await?;
 		dcs.sort_by_key(|dc| dc.config.dc_label());
 
-		Ok(Self { dcs, opts })
+		let network_faults = if opts.network_faults {
+			Some(rivet_test_deps::ToxiproxyTestServer::start().await?)
+		} else {
+			None
+		};
+
+		Ok(Self {
+			dcs,
+			opts,
+			network_faults,
+		})
 	}
 
 	async fn setup_instance(
@@ -202,6 +221,12 @@ impl TestCtx {
 			.iter()
 			.find(|dc| dc.config.dc_label() == label)
 			.unwrap_or_else(|| panic!("No datacenter found with label {}", label))
+	}
+
+	pub fn network_faults(&self) -> &rivet_test_deps::ToxiproxyTestServer {
+		self.network_faults
+			.as_ref()
+			.expect("Network faults were not enabled. Use TestOpts::with_network_faults().")
 	}
 
 	pub async fn shutdown(self) {

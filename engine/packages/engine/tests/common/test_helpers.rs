@@ -1,8 +1,30 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, future::Future, str::FromStr};
 
 use serde_json::json;
 
 use super::TestDatacenter;
+
+pub async fn wait_with_poll<T, F, Fut>(
+	timeout: std::time::Duration,
+	poll_interval: std::time::Duration,
+	mut check: F,
+) -> Option<T>
+where
+	F: FnMut() -> Fut,
+	Fut: Future<Output = Option<T>>,
+{
+	tokio::time::timeout(timeout, async {
+		loop {
+			if let Some(value) = check().await {
+				break value;
+			}
+
+			tokio::time::sleep(poll_interval).await;
+		}
+	})
+	.await
+	.ok()
+}
 
 // Namespace helpers
 pub async fn setup_test_namespace(leader_dc: &TestDatacenter) -> (String, rivet_util::Id) {

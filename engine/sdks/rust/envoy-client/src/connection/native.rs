@@ -10,6 +10,7 @@ use vbare::OwnedVersionedData;
 
 use crate::context::{SharedContext, WsTxMessage};
 use crate::envoy::ToEnvoyMessage;
+use crate::handle::EnvoyHandle;
 use crate::utils::{BackoffOptions, calculate_backoff, parse_ws_close_reason};
 
 const STABLE_CONNECTION_MS: u64 = 60_000;
@@ -117,6 +118,10 @@ async fn single_connection(
 		has_token = shared.config.token.is_some(),
 		"websocket connected"
 	);
+	shared
+		.config
+		.callbacks
+		.on_connect(EnvoyHandle::from_shared(shared.clone()));
 
 	// Spawn write task
 	let shared2 = shared.clone();
@@ -196,6 +201,10 @@ async fn single_connection(
 		*guard = None;
 	}
 	write_handle.abort();
+	shared
+		.config
+		.callbacks
+		.on_disconnect(EnvoyHandle::from_shared(shared.clone()));
 
 	Ok(result)
 }

@@ -99,6 +99,10 @@ impl ActorStopHandle {
 
 /// Callbacks that the consumer of the envoy client must implement.
 pub trait EnvoyCallbacks: Send + Sync + 'static {
+	fn on_connect(&self, _handle: EnvoyHandle) {}
+
+	fn on_disconnect(&self, _handle: EnvoyHandle) {}
+
 	fn on_actor_start(
 		&self,
 		handle: EnvoyHandle,
