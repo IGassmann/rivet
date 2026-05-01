@@ -3,8 +3,9 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"dev": "tsx watch src/main.ts",
-		"start": "tsx src/main.ts",
+		"dev": "RIVET_RUN_ENGINE=1 tsx watch src/main.ts",
+		"start": "RIVET_RUN_ENGINE=1 tsx src/main.ts",
+		"client": "tsx src/client.ts",
 		"check-types": "tsc --noEmit"
 	},
 	"dependencies": {
