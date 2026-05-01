@@ -10,8 +10,11 @@ import {
 	actor as actorNative,
 	type AnyActorDefinition,
 	setup as setupNative,
+	UserError,
 } from "rivetkit";
 import type * as Action from "./Action";
+import { Client } from "./Client";
+import * as RivetError from "./RivetError";
 
 const TypeId = "~@rivetkit/effect/Actor";
 
@@ -203,9 +206,41 @@ const buildNativeActor = (
 				);
 			}
 			const decoded = await runHandler(decoders.get(tag)!(payload));
-			const result = await runHandler(
-				handler({ _tag: tag, action, payload: decoded }),
+			// Wrap the handler so typed failures (matching `errorSchema`)
+			// are encoded and thrown across the wire as a rivetkit
+			// `UserError`. The error class's `_tag` becomes the wire
+			// `code`, the encoded shape rides in `metadata`. Failures that
+			// don't match the schema fall through and surface as a
+			// generic infra error.
+			const handlerEffect = handler({
+				_tag: tag,
+				action,
+				payload: decoded,
+			}).pipe(
+				Effect.catch((typedErr) =>
+					Schema.encodeUnknownEffect(action.errorSchema)(
+						typedErr,
+					).pipe(
+						Effect.matchEffect({
+							onSuccess: (encoded) =>
+								Effect.die(
+									new UserError(
+										(typedErr as { message?: string })
+											?.message ?? `${tag} failed`,
+										{
+											code:
+												(typedErr as { _tag?: string })
+													?._tag ?? tag,
+											metadata: encoded,
+										},
+									),
+								),
+							onFailure: () => Effect.fail(typedErr),
+						}),
+					),
+				),
 			);
+			const result = await runHandler(handlerEffect);
 			return await runHandler(encoders.get(tag)!(result));
 		};
 	}
@@ -339,6 +374,30 @@ type HandlerServices<Handlers> = {
 export type ActorKey = string | ReadonlyArray<string>;
 
 /**
+ * A typed handle for one actor instance. Each action becomes a
+ * method that takes the action's payload-constructor input and
+ * returns an Effect with the action's success / typed error
+ * channels baked in.
+ */
+export type Handle<Actions extends Action.AnyWithProps> = {
+	readonly [A in Actions as Action.Tag<A>]: (
+		payload: Action.PayloadConstructor<A>,
+	) => Effect.Effect<
+		Action.Success<A>,
+		Action.Error<A> | RivetError.RivetError,
+		never
+	>;
+};
+
+/**
+ * Yielded by `Actor.client`. Address an actor instance by key, then
+ * dispatch typed action calls against the returned `Handle`.
+ */
+export interface TypedAccessor<Actions extends Action.AnyWithProps> {
+	readonly getOrCreate: (key: ActorKey) => Handle<Actions>;
+}
+
+/**
  * A Rivet Actor contract. It carries the action schemas and
  * display options, but no server implementation.
  */
@@ -364,6 +423,20 @@ export interface Actor<
 		| Action.ServicesServer<Actions>
 		| Action.ServicesClient<Actions>
 		| Registry
+	>;
+
+	/**
+	 * Effect-yielded typed accessor for this actor. Provide a
+	 * `Client.layer({ ... })` once at the program root; every
+	 * `yield* SomeActor.client` then dispatches through the same
+	 * transport. Per-call signatures are `Effect<Success, Error |
+	 * RivetError, never>` — schema services are pulled in at the
+	 * getter level via `Action.ServicesClient<Actions>`.
+	 */
+	readonly client: Effect.Effect<
+		TypedAccessor<Actions>,
+		never,
+		Client | Action.ServicesClient<Actions>
 	>;
 }
 
@@ -416,6 +489,77 @@ const Proto = {
 				});
 			}),
 		);
+	},
+	get client() {
+		const self = this as unknown as AnyWithProps;
+		return Effect.gen(function* () {
+			const client = yield* Client;
+			const actions = self.actions;
+			return {
+				getOrCreate: (key: ActorKey) => {
+					const handle: Record<
+						string,
+						(p: unknown) => Effect.Effect<unknown, unknown, never>
+					> = {};
+					for (const action of actions) {
+						const tag = action._tag;
+						handle[tag] = (payload) =>
+							Effect.gen(function* () {
+								const encoded = yield* Schema.encodeUnknownEffect(
+									action.payloadSchema,
+								)(payload);
+								const raw = yield* client
+									.callAction({
+										actorName: self._tag,
+										key,
+										actionName: tag,
+										encodedPayload: encoded,
+									})
+									.pipe(
+										// Try `errorSchema` first against the
+										// wire metadata. Fall back to wrapping
+										// the raw RivetError via `RivetErrorFromWire`.
+										Effect.catch((rivetErr) =>
+											Schema.decodeUnknownEffect(
+												action.errorSchema,
+											)(
+												(rivetErr as { metadata?: unknown })
+													.metadata,
+											).pipe(
+												Effect.matchEffect({
+													onSuccess: (typed) =>
+														Effect.fail(typed),
+													onFailure: () =>
+														Schema.decodeUnknownEffect(
+															RivetError.RivetErrorFromWire,
+														)({
+															group: rivetErr.group,
+															code: rivetErr.code,
+															message:
+																rivetErr.message,
+															metadata: (
+																rivetErr as {
+																	metadata?: unknown;
+																}
+															).metadata,
+														}).pipe(
+															Effect.flatMap(
+																Effect.fail,
+															),
+														),
+												}),
+											),
+										),
+									);
+								return yield* Schema.decodeUnknownEffect(
+									action.successSchema,
+								)(raw);
+							}) as Effect.Effect<unknown, unknown, never>;
+					}
+					return handle as Handle<Action.AnyWithProps>;
+				},
+			};
+		});
 	},
 };
 
