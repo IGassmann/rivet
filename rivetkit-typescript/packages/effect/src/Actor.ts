@@ -4,6 +4,11 @@ import * as Layer from "effect/Layer";
 import * as Predicate from "effect/Predicate";
 import * as Ref from "effect/Ref";
 import type * as Scope from "effect/Scope";
+import {
+	actor as actorNative,
+	type AnyActorDefinition,
+	setup as setupNative,
+} from "rivetkit";
 import type * as Action from "./Action";
 
 const TypeId = "~@rivetkit/effect/Actor";
@@ -37,7 +42,7 @@ export interface RegistryShape {
 }
 
 export interface RunnerShape {
-	readonly _: unique symbol;
+	readonly mode: "start" | "serve" | "handler" | "startEnvoy" | "test";
 }
 
 /**
@@ -102,7 +107,7 @@ export class Registry extends Context.Service<Registry, RegistryShape>()(
 }
 
 const runnerNotImplemented = (
-	mode: string,
+	mode: RunnerShape["mode"],
 ): Layer.Layer<Runner, never, Registry> =>
 	Layer.effect(
 		Runner,
@@ -115,6 +120,33 @@ const runnerNotImplemented = (
 	);
 
 /**
+ * Build the underlying rivetkit `use` map from collected entries.
+ * Step 3 wires only the structural skeleton: action handlers throw
+ * until per-instance scope + dispatch land in Step 4.
+ */
+const buildUseMap = (
+	entries: ReadonlyArray<RegistryEntry>,
+): Record<string, AnyActorDefinition> => {
+	const use: Record<string, AnyActorDefinition> = {};
+	for (const entry of entries) {
+		const actions: Record<string, (...args: any[]) => any> = {};
+		for (const action of entry.actor.actions) {
+			const tag = action._tag;
+			actions[tag] = () => {
+				throw new Error(
+					`Action ${entry.actor._tag}.${tag}: handler dispatch not yet implemented (Step 4 wiring pending)`,
+				);
+			};
+		}
+		use[entry.actor._tag] = actorNative({
+			actions,
+			options: entry.actor.options,
+		} as Parameters<typeof actorNative>[0]);
+	}
+	return use;
+};
+
+/**
  * Service that selects how the registered actors are served. Each
  * static field is a `Layer` for a specific mode mirroring the
  * non-Effect TS SDK: `start`, `serve`, `handler`, `startEnvoy`, plus a
@@ -123,8 +155,21 @@ const runnerNotImplemented = (
 export class Runner extends Context.Service<Runner, RunnerShape>()(
 	"@rivetkit/effect/Actor/Runner",
 ) {
-	static start: Layer.Layer<Runner, never, Registry> =
-		runnerNotImplemented("start");
+	static start: Layer.Layer<Runner, never, Registry> = Layer.effect(
+		Runner,
+		Effect.gen(function* () {
+			const registry = yield* Registry;
+			const entries = yield* registry.entries;
+			const native = setupNative({
+				use: buildUseMap(entries),
+				endpoint: registry.engineOptions.endpoint,
+				token: registry.engineOptions.token,
+				namespace: registry.engineOptions.namespace,
+			});
+			yield* Effect.sync(() => native.start());
+			return Runner.of({ mode: "start" });
+		}),
+	);
 	static serve: Layer.Layer<Runner, never, Registry> =
 		runnerNotImplemented("serve");
 	static handler: Layer.Layer<Runner, never, Registry> =
