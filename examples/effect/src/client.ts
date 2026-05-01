@@ -1,19 +1,6 @@
-// Effect-flavored client driving the same server as `pnpm start`.
-// Run alongside the server:
-//
-//   # terminal A — start the server (auto-spawns local engine)
-//   RIVET_RUN_ENGINE=1 \
-//   RIVET_ENGINE_BINARY=$(git rev-parse --show-toplevel)/target/debug/rivet-engine \
-//   pnpm start
-//
-//   # terminal B — drive the Effect client
-//   pnpm client
-//
-// For raw-transport diagnostics (no Effect), see `client-raw.ts`
-// (`pnpm client:raw`).
 import { Effect } from "effect"
 import { Client } from "@rivetkit/effect"
-import { Counter } from "./actors/counter/api.ts"
+import { Counter /*, IncrementBy */ } from "./actors/counter/api.ts"
 
 const program = Effect.gen(function* () {
 	const counterClient = yield* Counter.client
@@ -24,6 +11,15 @@ const program = Effect.gen(function* () {
 
 	const total = yield* counter.GetCount()
 	yield* Effect.log(`GetCount -> ${total}`)
+
+	// const newCount = yield* counter.send(IncrementBy({ amount: 3 }))
+	// yield* Effect.log(`IncrementBy(3) -> ${newCount}`)
+	//
+	// // subscribe returns a Stream typed from the event schema.
+	// yield* counter.subscribe("countChanged").pipe(
+	// 	Stream.take(3),
+	// 	Stream.runForEach((n) => Effect.log(`countChanged: ${n}`)),
+	// )
 
 	// Trigger overflow (limit: 20). The typed CounterOverflowError
 	// round-trips through a UserError on the wire and decodes back
