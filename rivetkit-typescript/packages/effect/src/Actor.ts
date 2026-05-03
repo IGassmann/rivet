@@ -7,12 +7,7 @@ import * as Predicate from "effect/Predicate";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
-import {
-	actor as actorNative,
-	type AnyActorDefinition,
-	setup as setupNative,
-	UserError,
-} from "rivetkit";
+import * as Rivetkit from "rivetkit";
 import type * as Action from "./Action";
 import { Client } from "./Client";
 import * as RivetError from "./RivetError";
@@ -177,7 +172,7 @@ const buildNativeActor = (
 	entry: RegistryEntry,
 	instances: Map<string, ActorInstance>,
 	services: Context.Context<any>,
-): AnyActorDefinition => {
+): Rivetkit.AnyActorDefinition => {
 	const actor = entry.actor;
 
 	const actions: Record<
@@ -212,7 +207,7 @@ const buildNativeActor = (
 					Effect.catch((expectedError) => Effect.gen(function*(){
 						const error = yield* encodeError(expectedError).pipe(Effect.orDie)
 						return yield* Effect.die(
-							new UserError(
+							new Rivetkit.UserError(
 								hasStringProperty("message")(error) ? error.message : `${action._tag} failed`,
 								{
 									code: hasStringProperty("_tag")(error) ? error._tag : undefined,
@@ -232,7 +227,7 @@ const buildNativeActor = (
 		};
 	}
 
-	return actorNative({
+	return Rivetkit.actor({
 		actions,
 		options: actor.options,
 		onWake: async (c: {
@@ -275,7 +270,7 @@ const buildNativeActor = (
 			instances.delete(c.actorId);
 			await Effect.runPromiseWith(services)(Scope.close(inst.scope, Exit.void));
 		},
-	} as Parameters<typeof actorNative>[0]);
+	} as Parameters<typeof Rivetkit.actor>[0]);
 };
 
 /**
@@ -299,7 +294,7 @@ export class Runner extends Context.Service<Runner, RunnerShape>()(
 			// was provided with.
 			const services = yield* Effect.context<any>();
 			const instances = new Map<string, ActorInstance>();
-			const use: Record<string, AnyActorDefinition> = {};
+			const use: Record<string, Rivetkit.AnyActorDefinition> = {};
 			for (const entry of entries) {
 				use[entry.actor._tag] = buildNativeActor(
 					entry,
@@ -308,7 +303,7 @@ export class Runner extends Context.Service<Runner, RunnerShape>()(
 				);
 			}
 
-			const native = setupNative({
+			const native = Rivetkit.setup({
 				use,
 				endpoint: registry.engineOptions.endpoint,
 				token: registry.engineOptions.token,

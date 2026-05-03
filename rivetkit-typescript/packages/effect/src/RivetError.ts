@@ -1,10 +1,6 @@
 import * as Schema from "effect/Schema";
 import * as Getter from "effect/SchemaGetter";
-import {
-	RivetError as RivetErrorClass,
-	type RivetErrorLike,
-	type RivetErrorOptions,
-} from "rivetkit";
+import * as Rivetkit from "rivetkit";
 
 /**
  * The cross-boundary Rivet error. Wraps the underlying
@@ -17,14 +13,14 @@ import {
  */
 export class RivetError extends Schema.TaggedErrorClass<RivetError>()(
 	"RivetError",
-	{ error: Schema.instanceOf(RivetErrorClass) },
+	{ error: Schema.instanceOf(Rivetkit.RivetError) },
 ) {}
 
 // On-the-wire envelope: the subset of rivetkit's `RivetErrorLike` that
 // crosses the action boundary. `Pick`ing here anchors the codec
 // against drift in the canonical wire shape.
 type WirePayload = Pick<
-	RivetErrorLike,
+	Rivetkit.RivetErrorLike,
 	"group" | "code" | "message" | "metadata"
 >;
 
@@ -45,9 +41,9 @@ export const RivetErrorFromWire = Wire.pipe(
 		decode: Getter.transform(
 			({ group, code, message, metadata }) =>
 				new RivetError({
-					error: new RivetErrorClass(group, code, message, {
+					error: new Rivetkit.RivetError(group, code, message, {
 						metadata,
-					} satisfies RivetErrorOptions),
+					} satisfies Rivetkit.RivetErrorOptions),
 				}),
 		),
 		encode: Getter.transform((e: RivetError) => {

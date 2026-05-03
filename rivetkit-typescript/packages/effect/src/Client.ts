@@ -1,8 +1,8 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import { createClient } from "rivetkit/client";
-import { RivetError as NativeRivetError } from "rivetkit";
+import * as Rivetkit from "rivetkit";
+import * as RivetkitClient from "rivetkit/client";
 
 /**
  * Connection options for the Rivet Engine client transport. Mirrors
@@ -41,7 +41,7 @@ export interface ClientShape {
 		readonly key: string | ReadonlyArray<string>;
 		readonly actionName: string;
 		readonly encodedPayload: unknown;
-	}) => Effect.Effect<unknown, NativeRivetError>;
+	}) => Effect.Effect<unknown, Rivetkit.RivetError>;
 }
 
 /**
@@ -56,7 +56,7 @@ export class Client extends Context.Service<Client, ClientShape>()(
 		return Layer.effect(
 			Client,
 			Effect.sync(() => {
-				const native = createClient<any>(options) as any;
+				const native = RivetkitClient.createClient<any>(options) as any;
 				const callAction: ClientShape["callAction"] = ({
 					actorName,
 					key,
@@ -70,9 +70,9 @@ export class Client extends Context.Service<Client, ClientShape>()(
 								args: [encodedPayload],
 							}),
 						catch: (cause) =>
-							cause instanceof NativeRivetError
+							cause instanceof Rivetkit.RivetError
 								? cause
-								: new NativeRivetError(
+								: new Rivetkit.RivetError(
 										"client",
 										"unknown",
 										cause instanceof Error
