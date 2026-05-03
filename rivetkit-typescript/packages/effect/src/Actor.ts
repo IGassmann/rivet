@@ -14,24 +14,12 @@ import * as RivetkitClient from "rivetkit/client";
 import type * as Action from "./Action";
 import { Client, type ClientService } from "./Client";
 import * as RivetError from "./RivetError";
+import { hasStringProperty } from "./utils";
 
 const TypeId = "~@rivetkit/effect/Actor";
 
 export const isActor = (u: unknown): u is Actor<any, any> =>
 	Predicate.hasProperty(u, TypeId);
-
-// TODO: Move into differentfile
-/**
- * Refinement that narrows `unknown` to an object with `key` set to a
- * `string`. Composes `Predicate.hasProperty(key)` with
- * `Predicate.isString` in one go.
- */
-const hasStringProperty =
-	<K extends PropertyKey>(
-		key: K,
-	): Predicate.Refinement<unknown, { readonly [P in K]: string }> =>
-	(u): u is { readonly [P in K]: string } =>
-		Predicate.hasProperty(u, key) && Predicate.isString(u[key]);
 
 export type GlobalActorOptionsInput = Pick<
 	NonNullable<Rivetkit.GlobalActorOptionsInput>,
