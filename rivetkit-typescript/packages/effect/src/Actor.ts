@@ -62,12 +62,6 @@ export interface RegistryEntry {
 	readonly buildHandlers: Effect.Effect<unknown, never, unknown>;
 }
 
-export interface RegistryShape {
-	readonly options: RegistryOptions;
-	readonly register: (entry: RegistryEntry) => Effect.Effect<void>;
-	readonly entries: Effect.Effect<ReadonlyArray<RegistryEntry>>;
-}
-
 export interface RunnerShape {
 	readonly mode: "start" | "test";
 }
@@ -92,7 +86,11 @@ export type RegistryOptions = Pick<
  * materialize the underlying rivetkit registry from the collected
  * entries).
  */
-export class Registry extends Context.Service<Registry, RegistryShape>()(
+export class Registry extends Context.Service<Registry, {
+	readonly options: RegistryOptions;
+	readonly register: (entry: RegistryEntry) => Effect.Effect<void>;
+	readonly entries: Effect.Effect<ReadonlyArray<RegistryEntry>>;
+}>()(
 	"@rivetkit/effect/Actor/Registry",
 ) {
 	static layer(options: RegistryOptions = {}) {
