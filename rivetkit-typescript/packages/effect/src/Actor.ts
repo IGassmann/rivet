@@ -49,20 +49,21 @@ export interface Options {
  * Available inside `Actor.toLayer`'s build effect via
  * `yield* Actor.CurrentAddress`.
  */
-export interface Address {
+export interface ActorAddress {
 	readonly actorId: string;
 	readonly name: string;
 	readonly key: ReadonlyArray<string>;
 }
 
 /**
- * Context tag for the current actor instance's `Address`. Provided
+ * Context tag for the current actor instance's address. Provided
  * once per wake when the build effect runs; capture it into a
  * closure if action handlers need it.
  */
-export class CurrentAddress extends Context.Service<CurrentAddress, Address>()(
-	"@rivetkit/effect/Actor/CurrentAddress",
-) {}
+export class CurrentAddress extends Context.Service<
+	CurrentAddress,
+	ActorAddress
+>()("@rivetkit/effect/Actor/CurrentAddress") {}
 
 /**
  * One actor registered with the `Registry`. The `buildHandlers`
