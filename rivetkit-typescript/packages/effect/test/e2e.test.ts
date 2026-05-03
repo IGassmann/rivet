@@ -145,4 +145,12 @@ layer(TestLayer)("end-to-end", (it) => {
 	);
 
 	it.todo("fires the wake-scope finalizer on sleep");
+
+	it.todo("surfaces an error thrown inside an actor's build effect");
+
+	it.todo(
+		"runs encoding/decoding services for an action's payload, success, and error",
+	);
+
+	it.todo("propagates Effect tracing spans end-to-end");
 });
