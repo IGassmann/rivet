@@ -9,6 +9,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const env = {
 	...defaultConfig.test?.env,
 	RIVET_ENGINE_BINARY: join(here, "../../../target/debug/rivet-engine"),
+	// The shared vitest base sets RIVET_LOG_LEVEL=DEBUG, which floods the
+	// terminal with engine + runtime logs. Keep this suite quiet.
+	RIVET_LOG_LEVEL: "ERROR",
 };
 
 export default defineConfig({
