@@ -79,7 +79,7 @@ export interface RegistryShape {
 }
 
 export interface RunnerShape {
-	readonly mode: "start" | "serve" | "handler" | "startEnvoy" | "test";
+	readonly mode: "start" | "serve" | "handler" | "startEnvoy";
 }
 
 /**
@@ -269,8 +269,8 @@ const toRivetkitActor = (
 /**
  * Service that selects how the registered actors are served. Each
  * static field is a `Layer` for a specific mode mirroring the
- * non-Effect TS SDK: `start`, `serve`, `handler`, `startEnvoy`, plus a
- * `test` mode for in-process testing. Each requires `Registry`.
+ * non-Effect TS SDK: `start`, `serve`, `handler`, and `startEnvoy`.
+ * Each requires `Registry`.
  */
 export class Runner extends Context.Service<Runner, RunnerShape>()(
 	"@rivetkit/effect/Actor/Runner",
@@ -310,8 +310,6 @@ export class Runner extends Context.Service<Runner, RunnerShape>()(
 		runnerNotImplemented("handler");
 	static startEnvoy: Layer.Layer<Runner, never, Registry> =
 		runnerNotImplemented("startEnvoy");
-	static test: Layer.Layer<Runner, never, Registry> =
-		runnerNotImplemented("test");
 }
 
 export type ActionRequest<A extends Action.AnyWithProps> =
