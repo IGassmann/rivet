@@ -319,9 +319,19 @@ export class Runner extends Context.Service<Runner, {
 				// expose a shutdown method; only the SIGINT handler can drive the
 				// inner .shutdown(). Disposing the client is the only cleanup we
 				// can do cleanly today.
+				//
+				// When the engine was auto-spawned, propagate its resolved
+				// endpoint to the client so `createClient` doesn't fall back
+				// to its (warning-emitting) default.
+				const resolvedEndpoint =
+					rivetkitRegistry.parseConfig().endpoint;
 				const rivetkitClient = yield* Effect.acquireRelease(
 					Effect.sync(() =>
-						RivetkitClient.createClient(registry.options),
+						RivetkitClient.createClient({
+							...registry.options,
+							endpoint:
+								registry.options.endpoint ?? resolvedEndpoint,
+						}),
 					),
 					(c) => Effect.promise(() => c.dispose()),
 				);
