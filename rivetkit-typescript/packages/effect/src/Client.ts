@@ -41,9 +41,7 @@ export class Client extends Context.Service<
 		return Layer.effect(
 			Client,
 			Effect.sync(() => {
-				const rivetkitClient = RivetkitClient.createClient<any>(
-					options,
-				) as any;
+				const rivetkitClient = RivetkitClient.createClient(options);
 				const callAction: ClientService["callAction"] = ({
 					actorName,
 					key,
