@@ -46,11 +46,10 @@ export type GlobalActorOptionsInput = Pick<
  * Available inside `Actor.toLayer`'s build effect via
  * `yield* Actor.CurrentAddress`.
  */
-export interface ActorAddress {
-	readonly actorId: string;
-	readonly name: string;
-	readonly key: Rivetkit.ActorKey;
-}
+export type ActorAddress = Pick<
+	Rivetkit.ActorContext<any, any, any, any, any, any, any, any>,
+	"actorId" | "name" | "key"
+>;
 
 /**
  * Context tag for the current actor instance's address. Provided

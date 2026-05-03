@@ -1,6 +1,7 @@
 import { Context, Effect, Layer } from "effect";
 import * as Rivetkit from "rivetkit";
 import * as RivetkitClient from "rivetkit/client";
+import type { ActorKeyParam } from "./Actor";
 
 /**
  * Connection options for the Rivet Engine client transport. Mirrors
@@ -23,7 +24,7 @@ export interface ClientShape {
 	 */
 	readonly callAction: (params: {
 		readonly actorName: string;
-		readonly key: string | ReadonlyArray<string>;
+		readonly key: ActorKeyParam;
 		readonly actionName: string;
 		readonly encodedPayload: unknown;
 	}) => Effect.Effect<unknown, Rivetkit.RivetError>;
