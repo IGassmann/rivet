@@ -62,10 +62,6 @@ export interface RegistryEntry {
 	readonly buildHandlers: Effect.Effect<unknown, never, unknown>;
 }
 
-export interface RunnerShape {
-	readonly mode: "start" | "test";
-}
-
 /**
  * Connection options for the Rivet Engine. Mirrors the
  * `(endpoint, token, namespace)` subset of rivetkit's
@@ -246,7 +242,9 @@ const toRivetkitActor = (
  * static field is a `Layer` for a specific mode mirroring the
  * non-Effect TS SDK: `start`. Each requires `Registry`.
  */
-export class Runner extends Context.Service<Runner, RunnerShape>()(
+export class Runner extends Context.Service<Runner, {
+	readonly mode: "start" | "test";
+}>()(
 	"@rivetkit/effect/Actor/Runner",
 ) {
 	static start = Layer.effect(
