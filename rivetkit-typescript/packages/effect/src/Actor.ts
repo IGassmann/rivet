@@ -171,7 +171,7 @@ type ActorInstance = {
 	readonly scope: Scope.Closeable;
 };
 
-const buildNativeActor = (
+const toRivetkitActor = (
 	entry: RegistryEntry,
 	instances: Map<string, ActorInstance>,
 	services: Context.Context<any>,
@@ -311,20 +311,20 @@ export class Runner extends Context.Service<Runner, RunnerShape>()(
 			const instances = new Map<string, ActorInstance>();
 			const use: Record<string, Rivetkit.AnyActorDefinition> = {};
 			for (const entry of entries) {
-				use[entry.actor._tag] = buildNativeActor(
+				use[entry.actor._tag] = toRivetkitActor(
 					entry,
 					instances,
 					services,
 				);
 			}
 
-			const native = Rivetkit.setup({
+			const rivetkitRegistry = Rivetkit.setup({
 				use,
 				endpoint: registry.engineOptions.endpoint,
 				token: registry.engineOptions.token,
 				namespace: registry.engineOptions.namespace,
 			});
-			yield* Effect.sync(() => native.start());
+			yield* Effect.sync(() => rivetkitRegistry.start());
 			return Runner.of({ mode: "start" });
 		}),
 	);

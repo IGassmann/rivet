@@ -54,7 +54,9 @@ export class Client extends Context.Service<Client, ClientShape>()(
 		return Layer.effect(
 			Client,
 			Effect.sync(() => {
-				const native = RivetkitClient.createClient<any>(options) as any;
+				const rivetkitClient = RivetkitClient.createClient<any>(
+					options,
+				) as any;
 				const callAction: ClientShape["callAction"] = ({
 					actorName,
 					key,
@@ -63,7 +65,7 @@ export class Client extends Context.Service<Client, ClientShape>()(
 				}) =>
 					Effect.tryPromise({
 						try: () =>
-							native[actorName].getOrCreate(key).action({
+							rivetkitClient[actorName].getOrCreate(key).action({
 								name: actionName,
 								args: [encodedPayload],
 							}),
