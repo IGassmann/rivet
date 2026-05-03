@@ -117,11 +117,15 @@ type ActorInstance = {
 	readonly scope: Scope.Closeable;
 };
 
-const toRivetkitActor = (
+const toRivetkitActor = Effect.fnUntraced(function* (
 	entry: RegistryEntry,
 	instances: Map<string, ActorInstance>,
-	services: Context.Context<any>,
-): Rivetkit.AnyActorDefinition => {
+) {
+	// Snapshot the current Effect context so action callbacks
+	// (which run in rivetkit's plain Promise world) can run
+	// handler effects against the same services the Runner layer
+	// was provided with.
+	const services = yield* Effect.context<any>();
 	const actor = entry.actor;
 
 	const actions: Record<
@@ -235,7 +239,29 @@ const toRivetkitActor = (
 			);
 		},
 	});
-};
+});
+
+/**
+ * Build the underlying rivetkit registry from the collected `Registry`
+ * entries. The returned registry is configured but not started; callers
+ * apply mode-specific config (test flags, engine spawn) and then invoke
+ * `.start()` themselves.
+ */
+const toRivetkitRegistry = Effect.fnUntraced(function* (
+	registry: Registry["Service"],
+) {
+	const entries = yield* registry.entries;
+	const instances = new Map<string, ActorInstance>();
+	const use: Record<string, Rivetkit.AnyActorDefinition> = {};
+	for (const entry of entries) {
+		use[entry.actor._tag] = yield* toRivetkitActor(entry, instances);
+	}
+
+	return Rivetkit.setup({
+		use,
+		...registry.options,
+	});
+});
 
 /**
  * Service that selects how the registered actors are served. Each
@@ -251,27 +277,7 @@ export class Runner extends Context.Service<Runner, {
 		Runner,
 		Effect.gen(function* () {
 			const registry = yield* Registry;
-			const entries = yield* registry.entries;
-
-			// Snapshot the current Effect context so action callbacks
-			// (which run in rivetkit's plain Promise world) can run
-			// handler effects against the same services Runner.start
-			// was provided with.
-			const services = yield* Effect.context<any>();
-			const instances = new Map<string, ActorInstance>();
-			const use: Record<string, Rivetkit.AnyActorDefinition> = {};
-			for (const entry of entries) {
-				use[entry.actor._tag] = toRivetkitActor(
-					entry,
-					instances,
-					services,
-				);
-			}
-
-			const rivetkitRegistry = Rivetkit.setup({
-				use,
-				...registry.options,
-			});
+			const rivetkitRegistry = yield* toRivetkitRegistry(registry);
 			yield* Effect.sync(() => rivetkitRegistry.start());
 			return Runner.of({ mode: "start" });
 		}),
@@ -292,23 +298,7 @@ export class Runner extends Context.Service<Runner, {
 		Layer.effectContext(
 			Effect.gen(function* () {
 				const registry = yield* Registry;
-				const entries = yield* registry.entries;
-
-				const services = yield* Effect.context<any>();
-				const instances = new Map<string, ActorInstance>();
-				const use: Record<string, Rivetkit.AnyActorDefinition> = {};
-				for (const entry of entries) {
-					use[entry.actor._tag] = toRivetkitActor(
-						entry,
-						instances,
-						services,
-					);
-				}
-
-				const rivetkitRegistry = Rivetkit.setup({
-					use,
-					...registry.options,
-				});
+				const rivetkitRegistry = yield* toRivetkitRegistry(registry);
 				rivetkitRegistry.config.test = {
 					...rivetkitRegistry.config.test,
 					enabled: true,
@@ -322,7 +312,7 @@ export class Runner extends Context.Service<Runner, {
 				if (registry.options.endpoint === undefined) {
 					rivetkitRegistry.config.startEngine = true;
 				}
-				rivetkitRegistry.start();
+				yield* Effect.sync(() => rivetkitRegistry.start());
 
 				// The rivetkitRegistry itself is leaked until process exit (matches
 				// setupTest's behavior). The public Rivetkit.Registry doesn't
