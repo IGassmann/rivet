@@ -1,5 +1,4 @@
-import * as Predicate from "effect/Predicate";
-import * as Schema from "effect/Schema";
+import { Predicate, Schema } from "effect";
 import { RivetErrorFromWire } from "./RivetError";
 
 const TypeId = "~@rivetkit/effect/Action";

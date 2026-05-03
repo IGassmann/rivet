@@ -1,5 +1,4 @@
-import * as Schema from "effect/Schema";
-import * as Getter from "effect/SchemaGetter";
+import { Schema, SchemaGetter } from "effect";
 import * as Rivetkit from "rivetkit";
 
 /**
@@ -38,7 +37,7 @@ const Wire = Schema.Struct({
  */
 export const RivetErrorFromWire = Wire.pipe(
 	Schema.decodeTo(Schema.instanceOf(RivetError), {
-		decode: Getter.transform(
+		decode: SchemaGetter.transform(
 			({ group, code, message, metadata }) =>
 				new RivetError({
 					error: new Rivetkit.RivetError(group, code, message, {
@@ -46,7 +45,7 @@ export const RivetErrorFromWire = Wire.pipe(
 					} satisfies Rivetkit.RivetErrorOptions),
 				}),
 		),
-		encode: Getter.transform((e: RivetError) => {
+		encode: SchemaGetter.transform((e: RivetError) => {
 			const out: WirePayload = {
 				group: e.error.group,
 				code: e.error.code,

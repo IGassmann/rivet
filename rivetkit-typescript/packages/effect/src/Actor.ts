@@ -1,12 +1,14 @@
-import * as Cause from "effect/Cause";
-import * as Context from "effect/Context";
-import * as Effect from "effect/Effect";
-import * as Exit from "effect/Exit";
-import * as Layer from "effect/Layer";
-import * as Predicate from "effect/Predicate";
-import * as Ref from "effect/Ref";
-import * as Schema from "effect/Schema";
-import * as Scope from "effect/Scope";
+import {
+	Cause,
+	Context,
+	Effect,
+	Exit,
+	Layer,
+	Predicate,
+	Ref,
+	Schema,
+	Scope,
+} from "effect";
 import * as Rivetkit from "rivetkit";
 import type * as Action from "./Action";
 import { Client } from "./Client";
