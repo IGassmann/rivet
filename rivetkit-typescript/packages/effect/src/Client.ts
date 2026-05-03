@@ -4,27 +4,14 @@ import * as RivetkitClient from "rivetkit/client";
 
 /**
  * Connection options for the Rivet Engine client transport. Mirrors
- * `EngineOptions` on the server side: an optional endpoint (with URL
- * auth syntax for namespace and token), plus standalone `token` and
- * `namespace` fields. All fields are optional and fall back to the
- * matching `RIVET_*` environment variables.
+ * the `(endpoint, token, namespace)` subset of rivetkit's
+ * `ClientConfigInput` — the only fields the Effect SDK currently
+ * surfaces and forwards.
  */
-export interface ClientOptions {
-	/**
-	 * Endpoint URL of the Rivet Engine.
-	 *
-	 * Supports URL auth syntax for namespace and token:
-	 * - `https://namespace:token@api.rivet.dev`
-	 * - `https://namespace@api.rivet.dev`
-	 *
-	 * Falls back to `RIVET_ENDPOINT`, then `http://localhost:6420`.
-	 */
-	readonly endpoint?: string;
-	/** Auth token. Falls back to `RIVET_TOKEN`. */
-	readonly token?: string;
-	/** Namespace. Falls back to `RIVET_NAMESPACE`, then `"default"`. */
-	readonly namespace?: string;
-}
+export type ClientOptions = Pick<
+	RivetkitClient.ClientConfigInput,
+	"endpoint" | "token" | "namespace"
+>;
 
 export interface ClientShape {
 	/**

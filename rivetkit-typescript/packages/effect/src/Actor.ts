@@ -31,13 +31,10 @@ const hasStringProperty =
 	(u): u is { readonly [P in K]: string } =>
 		Predicate.hasProperty(u, key) && Predicate.isString(u[key]);
 
-/**
- * Display options carried by an actor contract.
- */
-export interface Options {
-	readonly name?: string;
-	readonly icon?: string;
-}
+export type GlobalActorOptionsInput = Pick<
+	NonNullable<Rivetkit.GlobalActorOptionsInput>,
+	"name" | "icon"
+>;
 
 /**
  * Per-instance identity carried inside the wake scope. An actor
@@ -52,7 +49,7 @@ export interface Options {
 export interface ActorAddress {
 	readonly actorId: string;
 	readonly name: string;
-	readonly key: ReadonlyArray<string>;
+	readonly key: Rivetkit.ActorKey;
 }
 
 /**
@@ -77,7 +74,7 @@ export interface RegistryEntry {
 }
 
 export interface RegistryShape {
-	readonly engineOptions: EngineOptions;
+	readonly options: RegistryOptions;
 	readonly register: (entry: RegistryEntry) => Effect.Effect<void>;
 	readonly entries: Effect.Effect<ReadonlyArray<RegistryEntry>>;
 }
@@ -87,33 +84,16 @@ export interface RunnerShape {
 }
 
 /**
- * Connection options for the Rivet Engine.
- *
- * Mirrors the engine wiring used by the non-Effect TS SDK: an optional
- * endpoint (with URL-auth syntax for namespace and token), plus
- * standalone `token` and `namespace` fields. All fields are optional
- * and fall back to the matching `RIVET_*` environment variables.
+ * Connection options for the Rivet Engine. Mirrors the
+ * `(endpoint, token, namespace)` subset of rivetkit's
+ * `RegistryConfigInput`. All fields are optional and fall back to the
+ * matching `RIVET_*` environment variables (see the canonical schema
+ * for the exact resolution order).
  */
-export interface EngineOptions {
-	/**
-	 * Endpoint URL of the Rivet Engine.
-	 *
-	 * Supports URL auth syntax for namespace and token:
-	 * - `https://namespace:token@api.rivet.dev`
-	 * - `https://namespace@api.rivet.dev`
-	 *
-	 * Falls back to `RIVET_ENDPOINT`.
-	 */
-	readonly endpoint?: string;
-	/** Auth token. Falls back to `RIVET_TOKEN`. */
-	readonly token?: string;
-	/**
-	 * Namespace. Falls back to `RIVET_NAMESPACE`, then `"default"`.
-	 */
-	readonly namespace?: string;
-}
-
-export interface RegistryOptions extends EngineOptions {}
+export type RegistryOptions = Pick<
+	Rivetkit.RegistryConfigInput<Rivetkit.RegistryActors>,
+	"endpoint" | "token" | "namespace"
+>;
 
 /**
  * Service collecting actor defs/builders together with the engine
@@ -127,17 +107,12 @@ export class Registry extends Context.Service<Registry, RegistryShape>()(
 	"@rivetkit/effect/Actor/Registry",
 ) {
 	static layer(options: RegistryOptions = {}): Layer.Layer<Registry> {
-		const engineOptions: EngineOptions = {
-			endpoint: options.endpoint,
-			token: options.token,
-			namespace: options.namespace,
-		};
 		return Layer.effect(
 			Registry,
 			Effect.gen(function* () {
 				const ref = yield* Ref.make<ReadonlyArray<RegistryEntry>>([]);
 				return Registry.of({
-					engineOptions,
+					options,
 					register: (entry) =>
 						Ref.update(ref, (xs) => [...xs, entry]),
 					entries: Ref.get(ref),
@@ -181,7 +156,10 @@ const toRivetkitActor = (
 
 	const actions: Record<
 		string,
-		(c: { actorId: string }, payload?: unknown) => Promise<unknown>
+		(
+			c: Pick<ActorAddress, "actorId">,
+			payload?: unknown,
+		) => Promise<unknown>
 	> = {};
 	for (const action of actor.actions) {
 		const decodePayload = Schema.decodeUnknownEffect(action.payloadSchema);
@@ -243,12 +221,10 @@ const toRivetkitActor = (
 	return Rivetkit.actor({
 		actions,
 		options: actor.options,
-		onWake: async (c: {
-			actorId: string;
-			name: string;
-			key: ReadonlyArray<string>;
-		}) => {
-			const address: Address = {
+		onWake: async (
+			c: Rivetkit.WakeContextOf<Rivetkit.AnyActorDefinition>,
+		) => {
+			const address: ActorAddress = {
 				actorId: c.actorId,
 				name: c.name,
 				key: c.key,
@@ -278,7 +254,9 @@ const toRivetkitActor = (
 				scope,
 			});
 		},
-		onSleep: async (c: { actorId: string }) => {
+		onSleep: async (
+			c: Rivetkit.SleepContextOf<Rivetkit.AnyActorDefinition>,
+		) => {
 			const inst = instances.get(c.actorId);
 			if (!inst) return;
 			instances.delete(c.actorId);
@@ -286,7 +264,7 @@ const toRivetkitActor = (
 				Scope.close(inst.scope, Exit.void),
 			);
 		},
-	} as Parameters<typeof Rivetkit.actor>[0]);
+	});
 };
 
 /**
@@ -321,9 +299,7 @@ export class Runner extends Context.Service<Runner, RunnerShape>()(
 
 			const rivetkitRegistry = Rivetkit.setup({
 				use,
-				endpoint: registry.engineOptions.endpoint,
-				token: registry.engineOptions.token,
-				namespace: registry.engineOptions.namespace,
+				...registry.options,
 			});
 			yield* Effect.sync(() => rivetkitRegistry.start());
 			return Runner.of({ mode: "start" });
@@ -367,7 +343,7 @@ type HandlerServices<Handlers> = {
 		: never;
 }[keyof Handlers];
 
-export type ActorKey = string | ReadonlyArray<string>;
+export type ActorKeyParam = string | Rivetkit.ActorKey;
 
 /**
  * A typed handle for one actor instance. Each action becomes a
@@ -380,8 +356,7 @@ export type Handle<Actions extends Action.AnyWithProps> = {
 		payload: Action.PayloadConstructor<A>,
 	) => Effect.Effect<
 		Action.Success<A>,
-		Action.Error<A> | RivetError.RivetError,
-		never
+		Action.Error<A> | RivetError.RivetError
 	>;
 };
 
@@ -390,7 +365,7 @@ export type Handle<Actions extends Action.AnyWithProps> = {
  * dispatch typed action calls against the returned `Handle`.
  */
 export interface TypedAccessor<Actions extends Action.AnyWithProps> {
-	readonly getOrCreate: (key: ActorKey) => Handle<Actions>;
+	readonly getOrCreate: (key: ActorKeyParam) => Handle<Actions>;
 }
 
 /**
@@ -405,7 +380,7 @@ export interface Actor<
 	readonly _tag: Name;
 	readonly key: string;
 	readonly actions: ReadonlyArray<Actions>;
-	readonly options: Options;
+	readonly options: GlobalActorOptionsInput;
 
 	of<Handlers extends ActionHandlers<Actions>>(handlers: Handlers): Handlers;
 
@@ -494,10 +469,10 @@ const Proto = {
 			const client = yield* Client;
 			const actions = self.actions;
 			return {
-				getOrCreate: (key: ActorKey) => {
+				getOrCreate: (key: ActorKeyParam) => {
 					const handle: Record<
 						string,
-						(p: unknown) => Effect.Effect<unknown, unknown, never>
+						(p: unknown) => Effect.Effect<unknown, unknown>
 					> = {};
 					for (const action of actions) {
 						const tag = action._tag;
@@ -571,7 +546,7 @@ const makeProto = <
 >(options: {
 	readonly _tag: Name;
 	readonly actions: ReadonlyArray<Actions>;
-	readonly options: Options;
+	readonly options: GlobalActorOptionsInput;
 }): Actor<Name, Actions> => {
 	const key = `@rivetkit/effect/Actor/${options._tag}`;
 	return Object.assign(Object.create(Proto), {
@@ -590,7 +565,7 @@ export const make = <
 	name: Name,
 	options?: {
 		readonly actions?: Actions;
-		readonly options?: Options;
+		readonly options?: GlobalActorOptionsInput;
 	},
 ): Actor<Name, Actions[number]> => {
 	return makeProto({
