@@ -24,9 +24,10 @@ export const isActor = (u: unknown): u is Actor<any, any> =>
  * `string`. Composes `Predicate.hasProperty(key)` with
  * `Predicate.isString` in one go.
  */
-const hasStringProperty = <K extends PropertyKey>(
-	key: K,
-): Predicate.Refinement<unknown, { readonly [P in K]: string }> =>
+const hasStringProperty =
+	<K extends PropertyKey>(
+		key: K,
+	): Predicate.Refinement<unknown, { readonly [P in K]: string }> =>
 	(u): u is { readonly [P in K]: string } =>
 		Predicate.hasProperty(u, key) && Predicate.isString(u[key]);
 
@@ -200,23 +201,32 @@ const buildNativeActor = (
 			}
 
 			const pipeline = Effect.gen(function* () {
-				const decoded = yield* decodePayload(payload).pipe(Effect.orDie);
+				const decoded = yield* decodePayload(payload).pipe(
+					Effect.orDie,
+				);
 				const result = yield* handler({
 					_tag: action._tag,
 					action,
 					payload: decoded,
 				}).pipe(
-					Effect.catch((expectedError) => Effect.gen(function*(){
-						const error = yield* encodeError(expectedError).pipe(Effect.orDie)
-						return yield* Effect.die(
-							new Rivetkit.UserError(
-								hasStringProperty("message")(error) ? error.message : `${action._tag} failed`,
-								{
-									code: hasStringProperty("_tag")(error) ? error._tag : undefined,
-									metadata: error
-								},
-							),
-						)
+					Effect.catch((expectedError) =>
+						Effect.gen(function* () {
+							const error = yield* encodeError(
+								expectedError,
+							).pipe(Effect.orDie);
+							return yield* Effect.die(
+								new Rivetkit.UserError(
+									hasStringProperty("message")(error)
+										? error.message
+										: `${action._tag} failed`,
+									{
+										code: hasStringProperty("_tag")(error)
+											? error._tag
+											: undefined,
+										metadata: error,
+									},
+								),
+							);
 						}),
 					),
 				);
@@ -254,13 +264,14 @@ const buildNativeActor = (
 					never,
 					Scope.Scope | CurrentAddress
 				>;
-				const handlers = yield* (built.pipe(
+				const handlers = yield* built.pipe(
 					Effect.provideService(CurrentAddress, address),
 					Effect.provideService(Scope.Scope, scope),
-				) as Effect.Effect<unknown, never, never>);
+				) as Effect.Effect<unknown, never, never>;
 				return { handlers, scope };
 			});
-			const { handlers, scope } = await Effect.runPromiseWith(services)(acquire);
+			const { handlers, scope } =
+				await Effect.runPromiseWith(services)(acquire);
 			instances.set(c.actorId, {
 				handlers: handlers as ActorInstance["handlers"],
 				scope,
@@ -270,7 +281,9 @@ const buildNativeActor = (
 			const inst = instances.get(c.actorId);
 			if (!inst) return;
 			instances.delete(c.actorId);
-			await Effect.runPromiseWith(services)(Scope.close(inst.scope, Exit.void));
+			await Effect.runPromiseWith(services)(
+				Scope.close(inst.scope, Exit.void),
+			);
 		},
 	} as Parameters<typeof Rivetkit.actor>[0]);
 };
@@ -326,7 +339,12 @@ export class Runner extends Context.Service<Runner, RunnerShape>()(
 }
 
 export type ActionRequest<A extends Action.AnyWithProps> =
-	A extends Action.Action<infer Tag, infer Payload, infer _Success, infer _Error>
+	A extends Action.Action<
+		infer Tag,
+		infer Payload,
+		infer _Success,
+		infer _Error
+	>
 		? {
 				readonly _tag: Tag;
 				readonly action: A;
@@ -433,19 +451,21 @@ export interface AnyWithProps extends Actor<string, Action.AnyWithProps> {}
 
 export type Name<A> = A extends Actor<infer _Name, any> ? _Name : never;
 
-export type Actions<A> = A extends Actor<any, infer _Actions> ? _Actions : never;
+export type Actions<A> =
+	A extends Actor<any, infer _Actions> ? _Actions : never;
 
-export type Services<A> = A extends Actor<any, infer _Actions>
-	? Action.Services<_Actions>
-	: never;
+export type Services<A> =
+	A extends Actor<any, infer _Actions> ? Action.Services<_Actions> : never;
 
-export type ClientServices<A> = A extends Actor<any, infer _Actions>
-	? Action.ServicesClient<_Actions>
-	: never;
+export type ClientServices<A> =
+	A extends Actor<any, infer _Actions>
+		? Action.ServicesClient<_Actions>
+		: never;
 
-export type ServerServices<A> = A extends Actor<any, infer _Actions>
-	? Action.ServicesServer<_Actions>
-	: never;
+export type ServerServices<A> =
+	A extends Actor<any, infer _Actions>
+		? Action.ServicesServer<_Actions>
+		: never;
 
 const identity = <A>(value: A): A => value;
 
@@ -482,9 +502,10 @@ const Proto = {
 						const tag = action._tag;
 						handle[tag] = (payload) =>
 							Effect.gen(function* () {
-								const encoded = yield* Schema.encodeUnknownEffect(
-									action.payloadSchema,
-								)(payload);
+								const encoded =
+									yield* Schema.encodeUnknownEffect(
+										action.payloadSchema,
+									)(payload);
 								const raw = yield* client
 									.callAction({
 										actorName: self._tag,
@@ -500,8 +521,11 @@ const Proto = {
 											Schema.decodeUnknownEffect(
 												action.errorSchema,
 											)(
-												(rivetErr as { metadata?: unknown })
-													.metadata,
+												(
+													rivetErr as {
+														metadata?: unknown;
+													}
+												).metadata,
 											).pipe(
 												Effect.matchEffect({
 													onSuccess: (typed) =>
