@@ -14,30 +14,29 @@ export type ClientOptions = Pick<
 	"endpoint" | "token" | "namespace"
 >;
 
-export interface ClientShape {
-	/**
-	 * Generic action dispatch. Returns the raw, undecoded result from
-	 * the wire. On rejection from the underlying transport, surfaces
-	 * the rivetkit `RivetError` instance via `Effect.fail` — the
-	 * caller decides whether to decode `metadata` as a typed error or
-	 * wrap it through the wire codec.
-	 */
-	readonly callAction: (params: {
-		readonly actorName: string;
-		readonly key: ActorKeyParam;
-		readonly actionName: string;
-		readonly encodedPayload: unknown;
-	}) => Effect.Effect<unknown, Rivetkit.RivetError>;
-}
-
 /**
  * Service holding the rivetkit client transport. Provided once via
  * `Client.layer({ ... })`. Consumed by `Actor.client` to dispatch
  * action calls through a single shared transport.
  */
-export class Client extends Context.Service<Client, ClientShape>()(
-	"@rivetkit/effect/Client",
-) {
+export class Client extends Context.Service<
+	Client,
+	{
+		/**
+		 * Generic action dispatch. Returns the raw, undecoded result from
+		 * the wire. On rejection from the underlying transport, surfaces
+		 * the rivetkit `RivetError` instance via `Effect.fail` — the
+		 * caller decides whether to decode `metadata` as a typed error or
+		 * wrap it through the wire codec.
+		 */
+		readonly callAction: (params: {
+			readonly actorName: string;
+			readonly key: ActorKeyParam;
+			readonly actionName: string;
+			readonly encodedPayload: unknown;
+		}) => Effect.Effect<unknown, Rivetkit.RivetError>;
+	}
+>()("@rivetkit/effect/Client") {
 	static layer(options: ClientOptions = {}): Layer.Layer<Client> {
 		return Layer.effect(
 			Client,
@@ -45,7 +44,7 @@ export class Client extends Context.Service<Client, ClientShape>()(
 				const rivetkitClient = RivetkitClient.createClient<any>(
 					options,
 				) as any;
-				const callAction: ClientShape["callAction"] = ({
+				const callAction: ClientService["callAction"] = ({
 					actorName,
 					key,
 					actionName,
@@ -79,3 +78,5 @@ export class Client extends Context.Service<Client, ClientShape>()(
 		);
 	}
 }
+
+export type ClientService = Client["Service"];

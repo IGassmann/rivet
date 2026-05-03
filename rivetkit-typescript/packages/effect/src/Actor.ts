@@ -11,7 +11,7 @@ import {
 } from "effect";
 import * as Rivetkit from "rivetkit";
 import type * as Action from "./Action";
-import { Client } from "./Client";
+import { Client, type ClientService } from "./Client";
 import * as RivetError from "./RivetError";
 
 const TypeId = "~@rivetkit/effect/Actor";
