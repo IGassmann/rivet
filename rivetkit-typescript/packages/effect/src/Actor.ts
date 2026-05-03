@@ -121,19 +121,6 @@ export class Registry extends Context.Service<Registry, RegistryShape>()(
 	}
 }
 
-const runnerNotImplemented = (
-	mode: RunnerShape["mode"],
-): Layer.Layer<Runner, never, Registry> =>
-	Layer.effect(
-		Runner,
-		Effect.gen(function* () {
-			yield* Registry;
-			throw new Error(
-				`Runner.${mode} is not yet implemented. Server runtime wiring is pending.`,
-			);
-		}),
-	);
-
 type ActorInstance = {
 	readonly handlers: Record<
 		string,
@@ -269,8 +256,7 @@ const toRivetkitActor = (
 /**
  * Service that selects how the registered actors are served. Each
  * static field is a `Layer` for a specific mode mirroring the
- * non-Effect TS SDK: `start`, `serve`, `handler`, and `startEnvoy`.
- * Each requires `Registry`.
+ * non-Effect TS SDK: `start`. Each requires `Registry`.
  */
 export class Runner extends Context.Service<Runner, RunnerShape>()(
 	"@rivetkit/effect/Actor/Runner",
@@ -310,6 +296,7 @@ export class Runner extends Context.Service<Runner, RunnerShape>()(
 		runnerNotImplemented("handler");
 	static startEnvoy: Layer.Layer<Runner, never, Registry> =
 		runnerNotImplemented("startEnvoy");
+
 }
 
 export type ActionRequest<A extends Action.AnyWithProps> =
