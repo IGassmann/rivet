@@ -10,6 +10,7 @@ import {
 	Scope,
 } from "effect";
 import * as Rivetkit from "rivetkit";
+import * as RivetkitClient from "rivetkit/client";
 import type * as Action from "./Action";
 import { Client, type ClientService } from "./Client";
 import * as RivetError from "./RivetError";
@@ -19,6 +20,7 @@ const TypeId = "~@rivetkit/effect/Actor";
 export const isActor = (u: unknown): u is Actor<any, any> =>
 	Predicate.hasProperty(u, TypeId);
 
+// TODO: Move into differentfile
 /**
  * Refinement that narrows `unknown` to an object with `key` set to a
  * `string`. Composes `Predicate.hasProperty(key)` with
@@ -79,7 +81,7 @@ export interface RegistryShape {
 }
 
 export interface RunnerShape {
-	readonly mode: "start" | "serve" | "handler" | "startEnvoy";
+	readonly mode: "start" | "test";
 }
 
 /**
@@ -105,7 +107,7 @@ export type RegistryOptions = Pick<
 export class Registry extends Context.Service<Registry, RegistryShape>()(
 	"@rivetkit/effect/Actor/Registry",
 ) {
-	static layer(options: RegistryOptions = {}): Layer.Layer<Registry> {
+	static layer(options: RegistryOptions = {}) {
 		return Layer.effect(
 			Registry,
 			Effect.gen(function* () {
@@ -261,7 +263,7 @@ const toRivetkitActor = (
 export class Runner extends Context.Service<Runner, RunnerShape>()(
 	"@rivetkit/effect/Actor/Runner",
 ) {
-	static start: Layer.Layer<Runner, never, Registry> = Layer.effect(
+	static start = Layer.effect(
 		Runner,
 		Effect.gen(function* () {
 			const registry = yield* Registry;
@@ -290,13 +292,101 @@ export class Runner extends Context.Service<Runner, RunnerShape>()(
 			return Runner.of({ mode: "start" });
 		}),
 	);
-	static serve: Layer.Layer<Runner, never, Registry> =
-		runnerNotImplemented("serve");
-	static handler: Layer.Layer<Runner, never, Registry> =
-		runnerNotImplemented("handler");
-	static startEnvoy: Layer.Layer<Runner, never, Registry> =
-		runnerNotImplemented("startEnvoy");
 
+	/**
+	 * In-process test runtime. Boots the rivetkit registry against the
+	 * configured engine, waits for `/health` to answer, and provides
+	 * both `Runner` and `Client` from one Layer so consumers don't need
+	 * to wire `Client.layer` separately. Mirrors `Runner.start` plus
+	 * test-mode flags and a scoped client dispose. The registry itself
+	 * is leaked to process exit because the public rivetkit `Registry`
+	 * doesn't expose a public `shutdown()` today; only the SIGINT
+	 * handler can drive `#runShutdown`. This matches `setupTest`'s
+	 * existing behavior.
+	 */
+	static test: Layer.Layer<Runner | Client, never, Registry> =
+		Layer.effectContext(
+			Effect.gen(function* () {
+				const registry = yield* Registry;
+				const entries = yield* registry.entries;
+
+				const services = yield* Effect.context<any>();
+				const instances = new Map<string, ActorInstance>();
+				const use: Record<string, Rivetkit.AnyActorDefinition> = {};
+				for (const entry of entries) {
+					use[entry.actor._tag] = toRivetkitActor(
+						entry,
+						instances,
+						services,
+					);
+				}
+
+				const rivetkitRegistry = Rivetkit.setup({
+					use,
+					...registry.options,
+				});
+				rivetkitRegistry.config.test = {
+					...rivetkitRegistry.config.test,
+					enabled: true,
+				};
+				rivetkitRegistry.config.noWelcome = true;
+				// Auto-spawn the engine when no endpoint was provided, so
+				// `Runner.test` works out of the box without requiring the
+				// caller to start an engine externally. If the user wired an
+				// explicit endpoint via `Registry.layer({ endpoint: ... })`,
+				// honor it and skip the local spawn.
+				if (registry.options.endpoint === undefined) {
+					rivetkitRegistry.config.startEngine = true;
+				}
+				rivetkitRegistry.start();
+
+				// The rivetkitRegistry itself is leaked until process exit (matches
+				// setupTest's behavior). The public Rivetkit.Registry doesn't
+				// expose a shutdown method; only the SIGINT handler can drive the
+				// inner .shutdown(). Disposing the client is the only cleanup we
+				// can do cleanly today.
+				const rivetkitClient = yield* Effect.acquireRelease(
+					Effect.sync(() =>
+						RivetkitClient.createClient(registry.options),
+					),
+					(c) => Effect.promise(() => c.dispose()),
+				);
+
+				const callAction: ClientService["callAction"] = ({
+					actorName,
+					key,
+					actionName,
+					encodedPayload,
+				}) =>
+					Effect.tryPromise({
+						try: () =>
+							rivetkitClient[actorName].getOrCreate(key).action({
+								name: actionName,
+								args: [encodedPayload],
+							}),
+						catch: (cause) =>
+							cause instanceof Rivetkit.RivetError
+								? cause
+								: new Rivetkit.RivetError(
+										"client",
+										"unknown",
+										cause instanceof Error
+											? cause.message
+											: String(cause),
+										{
+											cause:
+												cause instanceof Error
+													? cause
+													: undefined,
+										},
+									),
+					});
+
+				return Context.make(Runner, Runner.of({ mode: "test" })).pipe(
+					Context.add(Client, Client.of({ callAction })),
+				);
+			}),
+		);
 }
 
 export type ActionRequest<A extends Action.AnyWithProps> =
