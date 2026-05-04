@@ -12,6 +12,7 @@ import {
 	Pinger,
 	PingerLive,
 	ScaledOverflowError,
+	Unregistered,
 } from "./fixtures/actor";
 
 const GreeterLive = Layer.succeed(
@@ -160,6 +161,34 @@ layer(TestLayer)("end-to-end", (it) => {
 			assert.strictEqual(incremented, 7);
 			assert.strictEqual(pong, "pong");
 		}),
+	);
+
+	it.effect(
+		"surfaces a call to an actor with no registered handler as a RivetError",
+		() =>
+			Effect.gen(function* () {
+				// `Unregistered` is defined in the fixtures module but its
+				// `*Live` layer is intentionally not provided, so the engine
+				// has no runner that can serve the actor. The engine logs
+				// the precise `not_registered: Actor factory 'Unregistered'
+				// is not registered.` reason but flattens it on the wire to
+				// a generic `guard/service_unavailable` — the same code a
+				// transient engine outage would surface as. Callers can't
+				// distinguish the two without an engine-side change.
+				const ghost = (yield* Unregistered.client).getOrCreate([
+					"t-unregistered",
+				]);
+				const exit = yield* ghost.Echo().pipe(Effect.flip, Effect.exit);
+				assert.isTrue(exit._tag === "Success");
+				if (exit._tag === "Success") {
+					assert.instanceOf(exit.value, RivetError.RivetError);
+					assert.strictEqual(exit.value.error.group, "guard");
+					assert.strictEqual(
+						exit.value.error.code,
+						"service_unavailable",
+					);
+				}
+			}),
 	);
 
 	it.todo("fires the wake-scope finalizer on sleep");

@@ -198,3 +198,13 @@ export const FailingActor = Actor.make("FailingBuild", {
 export const FailingActorLive = FailingActor.toLayer(
 	Effect.die("build effect failed"),
 );
+
+// --- Unregistered ---
+
+// Used solely to test the failure shape when calling an actor whose
+// `*Live` layer was never provided to the runner. No `UnregisteredLive`
+// is exported on purpose — the test relies on this actor being absent
+// from the registry at runtime.
+export const Echo = Action.make("Echo", { success: Schema.String });
+
+export const Unregistered = Actor.make("Unregistered", { actions: [Echo] });
