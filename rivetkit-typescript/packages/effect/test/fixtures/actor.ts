@@ -1,4 +1,11 @@
-import { Context, Effect, Ref, Schema, SchemaTransformation } from "effect";
+import {
+	Context,
+	Effect,
+	Ref,
+	Schema,
+	SchemaTransformation,
+	SubscriptionRef,
+} from "effect";
 import { Action, Actor } from "@rivetkit/effect";
 
 // --- Counter ---
@@ -122,7 +129,22 @@ export const Scale = Action.make("Scale", {
 	error: ScaledOverflowError,
 });
 
+export const PersistedTotal = Action.make("PersistedTotal", {
+	payload: { amount: Schema.Number },
+	success: Schema.Number,
+});
+
+export const PersistAndSleep = Action.make("PersistAndSleep", {
+	payload: { amount: Schema.Number },
+	success: Schema.Number,
+});
+
 export const Counter = Actor.make("Counter", {
+	state: Schema.Struct({
+		count: Schema.Number.pipe(
+			Schema.withConstructorDefault(Effect.succeed(0)),
+		),
+	}),
 	actions: [
 		Increment,
 		GetCount,
@@ -133,16 +155,22 @@ export const Counter = Actor.make("Counter", {
 		WakeGreeting,
 		Compute,
 		Scale,
+		PersistedTotal,
+		PersistAndSleep,
 	],
 });
 
 export const CounterLive = Counter.toLayer(
 	Effect.gen(function* () {
+		const state = yield* Counter.State;
 		const count = yield* Ref.make(0);
 		// Wake-scope yield of a non-built-in service. Resolved once per
 		// wake; the captured value is closed over by `WakeGreeting`.
 		const greeter = yield* Greeter;
 		const wakeGreeting = greeter.greet("on wake");
+
+		const sleep = yield* Actor.Sleep;
+
 		return Counter.of({
 			Increment: ({ payload }) =>
 				Effect.gen(function* () {
@@ -191,6 +219,19 @@ export const CounterLive = Counter.toLayer(
 					// the success path can't pass without the success
 					// and payload codec sites firing on both sides.
 					return payload.amount + 100;
+				}),
+			PersistedTotal: ({ payload }) =>
+				SubscriptionRef.updateAndGet(state, (s) => ({
+					count: s.count + payload.amount,
+				})).pipe(Effect.map((s) => s.count)),
+			PersistAndSleep: ({ payload }) =>
+				Effect.gen(function* () {
+					const { count } = yield* SubscriptionRef.updateAndGet(
+						state,
+						(s) => ({ count: s.count + payload.amount }),
+					);
+					yield* sleep;
+					return count;
 				}),
 		});
 	}),

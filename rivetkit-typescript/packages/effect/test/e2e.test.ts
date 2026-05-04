@@ -59,6 +59,50 @@ layer(TestLayer)("end-to-end", (it) => {
 		}),
 	);
 
+	it.effect("persists state across a sleep/wake cycle", () =>
+		Effect.gen(function* () {
+			const counter = (yield* Counter.client).getOrCreate([
+				"t-sleep-wake",
+			]);
+
+			// Bump the in-memory `Ref` so we can later assert that
+			// the wake actually rebuilt the actor (the ref resets
+			// to 0 on each wake).
+			yield* counter.Increment({ amount: 7 });
+
+			const beforeSleep = yield* counter.PersistAndSleep({
+				amount: 11,
+			});
+			assert.strictEqual(beforeSleep, 11);
+
+			// Give the engine a moment to process the sleep request
+			// and tear down the wake scope before the next call
+			// triggers a fresh wake. `Effect.promise` bypasses the
+			// suite's TestClock so real time actually elapses.
+			yield* Effect.promise(
+				() => new Promise((resolve) => setTimeout(resolve, 2000)),
+			);
+
+			// `count` is `Ref.make(0)` per wake; if the actor
+			// didn't sleep+rewake, we'd still see 7.
+			const inMemoryAfterWake = yield* counter.GetCount();
+			assert.strictEqual(
+				inMemoryAfterWake,
+				0,
+				"in-memory ref should be reset by a fresh wake",
+			);
+
+			// `+ 0` is a no-op increment whose return value is the
+			// freshly-loaded persisted total. Anything other than
+			// 11 means either the write didn't durably land before
+			// sleep or the load on wake didn't seed the ref.
+			const persistedAfterWake = yield* counter.PersistedTotal({
+				amount: 0,
+			});
+			assert.strictEqual(persistedAfterWake, 11);
+		}),
+	);
+
 	it.effect("isolates in-wake state across keys", () =>
 		Effect.gen(function* () {
 			const client = yield* Counter.client;

@@ -8,6 +8,8 @@ import {
 	Ref,
 	Schema,
 	Scope,
+	Stream,
+	SubscriptionRef,
 	Tracer,
 } from "effect";
 import * as Rivetkit from "rivetkit";
@@ -54,10 +56,15 @@ export class CurrentAddress extends Context.Service<
 >()("@rivetkit/effect/Actor/CurrentAddress") {}
 
 /**
- * Internal carrier for the per-wake sleep request. Provided
- * automatically by the SDK during `onWake`; consumers should yield
- * `Actor.Sleep` (the `Effect` below) rather than this tag directly.
+ * Internal carrier for the wake-scoped state ref. Yield via the actor's
+ * typed `State` getter (e.g. `yield* Counter.State`) instead of this tag
+ * directly; the tag erases the schema type to `unknown`.
  */
+export class CurrentState extends Context.Service<
+	CurrentState,
+	SubscriptionRef.SubscriptionRef<unknown>
+>()("@rivetkit/effect/Actor/CurrentState") {}
+
 export class Sleep extends Context.Service<Sleep, Effect.Effect<void>>()(
 	"@rivetkit/effect/Actor/Sleep",
 ) {}
@@ -229,9 +236,24 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 		};
 	}
 
+	// Schema.Void is the "no state declared" sentinel. Skipping
+	// `createState` is what disables rivetkit's state machinery on the
+	// underlying actor.
+	const hasState = actor.stateSchema !== Schema.Void;
+
 	return Rivetkit.actor({
 		actions,
 		options: actor.options,
+		// rivetkit invokes this once at create time and seeds c.state
+		// with the result. A SchemaError for a field without
+		// `withConstructorDefault` surfaces here, so the user fixes the
+		// schema instead of handling `undefined` on first wake.
+		...(hasState
+			? {
+					createState: () =>
+						(actor.stateSchema as Schema.Top).make({} as never),
+				}
+			: {}),
 		onWake: async (
 			c: Rivetkit.WakeContextOf<Rivetkit.AnyActorDefinition>,
 		) => {
@@ -247,6 +269,27 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 			// would have owned.
 			const acquire = Effect.gen(function* () {
 				const scope = yield* Scope.make();
+
+				const stateRef = yield* SubscriptionRef.make<unknown>(
+					hasState ? c.state : undefined,
+				);
+				if (hasState) {
+					// Mirror published changes back to c.state so
+					// rivetkit's throttled save loop and shutdown flush
+					// pick them up. The identity guard skips no-op
+					// updates; otherwise rivetkit re-encodes the value
+					// as CBOR and reschedules a save on every publish.
+					yield* SubscriptionRef.changes(stateRef).pipe(
+						Stream.drop(1),
+						Stream.runForEach((value) =>
+							Effect.sync(() => {
+								if (value !== c.state) c.state = value;
+							}),
+						),
+						Effect.forkIn(scope),
+					);
+				}
+
 				const built = entry.buildHandlers as Effect.Effect<
 					unknown,
 					never,
@@ -259,6 +302,7 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 						Sleep,
 						Effect.sync(() => c.sleep()),
 					),
+					Effect.provideService(CurrentState, stateRef),
 				) as Effect.Effect<unknown, never, never>;
 				return { handlers, scope };
 			});
@@ -478,12 +522,23 @@ export interface TypedAccessor<Actions extends Action.AnyWithProps> {
 export interface Actor<
 	Name extends string,
 	Actions extends Action.AnyWithProps = never,
+	State extends Schema.Top = typeof Schema.Void,
 > {
 	readonly [TypeId]: typeof TypeId;
 	readonly _tag: Name;
 	readonly key: string;
 	readonly actions: ReadonlyArray<Actions>;
 	readonly options: GlobalActorOptionsInput;
+	readonly stateSchema: State;
+	/**
+	 * Typed accessor for the wake-scoped state `SubscriptionRef`. Every
+	 * published change is mirrored back to rivetkit's persisted state.
+	 */
+	readonly State: Effect.Effect<
+		SubscriptionRef.SubscriptionRef<State["Type"]>,
+		never,
+		CurrentState
+	>;
 
 	of<Handlers extends ActionHandlers<Actions>>(handlers: Handlers): Handlers;
 
@@ -492,7 +547,7 @@ export interface Actor<
 	): Layer.Layer<
 		never,
 		never,
-		| Exclude<RX, Scope.Scope | CurrentAddress | Sleep>
+		| Exclude<RX, Scope.Scope | CurrentAddress | Sleep | CurrentState>
 		| HandlerServices<Handlers>
 		| Action.ServicesServer<Actions>
 		| Action.ServicesClient<Actions>
@@ -526,31 +581,39 @@ export interface Any {
 /**
  * Type-erased actor with all runtime properties available.
  */
-export interface AnyWithProps extends Actor<string, Action.AnyWithProps> {}
+export interface AnyWithProps
+	extends Actor<string, Action.AnyWithProps, Schema.Top> {}
 
-export type Name<A> = A extends Actor<infer _Name, any> ? _Name : never;
+export type Name<A> = A extends Actor<infer _Name, any, any> ? _Name : never;
 
 export type Actions<A> =
-	A extends Actor<any, infer _Actions> ? _Actions : never;
+	A extends Actor<any, infer _Actions, any> ? _Actions : never;
+
+export type State<A> = A extends Actor<any, any, infer _State> ? _State : never;
 
 export type Services<A> =
-	A extends Actor<any, infer _Actions> ? Action.Services<_Actions> : never;
+	A extends Actor<any, infer _Actions, any>
+		? Action.Services<_Actions>
+		: never;
 
 export type ClientServices<A> =
-	A extends Actor<any, infer _Actions>
+	A extends Actor<any, infer _Actions, any>
 		? Action.ServicesClient<_Actions>
 		: never;
 
 export type ServerServices<A> =
-	A extends Actor<any, infer _Actions>
+	A extends Actor<any, infer _Actions, any>
 		? Action.ServicesServer<_Actions>
 		: never;
 
 const identity = <A>(value: A): A => value;
 
+const StateAccessor = CurrentState.asEffect();
+
 const Proto = {
 	[TypeId]: TypeId,
 	of: identity,
+	State: StateAccessor,
 	toLayer(this: AnyWithProps, build: unknown) {
 		const self = this;
 		const buildHandlers = (
@@ -666,16 +729,18 @@ const Proto = {
 const makeProto = <
 	const Name extends string,
 	Actions extends Action.AnyWithProps,
+	State extends Schema.Top,
 >(options: {
 	readonly _tag: Name;
 	readonly actions: ReadonlyArray<Actions>;
 	readonly options: GlobalActorOptionsInput;
-}): Actor<Name, Actions> => {
+	readonly stateSchema: State;
+}): Actor<Name, Actions, State> => {
 	const key = `@rivetkit/effect/Actor/${options._tag}`;
 	return Object.assign(Object.create(Proto), {
 		...options,
 		key,
-	}) as Actor<Name, Actions>;
+	}) as Actor<Name, Actions, State>;
 };
 
 /**
@@ -684,16 +749,20 @@ const makeProto = <
 export const make = <
 	const Name extends string,
 	const Actions extends ReadonlyArray<Action.AnyWithProps> = readonly [],
+	State extends Schema.Top = typeof Schema.Void,
 >(
 	name: Name,
 	options?: {
 		readonly actions?: Actions;
 		readonly options?: GlobalActorOptionsInput;
+		readonly state?: State;
 	},
-): Actor<Name, Actions[number]> => {
+): Actor<Name, Actions[number], State> => {
+	const stateSchema = (options?.state ?? Schema.Void) as State;
 	return makeProto({
 		_tag: name,
 		actions: (options?.actions ?? []) as ReadonlyArray<Action.AnyWithProps>,
 		options: options?.options ?? {},
+		stateSchema,
 	}) as any;
 };
