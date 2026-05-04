@@ -6,8 +6,10 @@ import {
 	CounterLive,
 	CounterOverflowError,
 	Greeter,
+	Multiplier,
 	Pinger,
 	PingerLive,
+	ScaledOverflowError,
 } from "./fixtures/actor";
 
 const GreeterLive = Layer.succeed(
@@ -17,9 +19,21 @@ const GreeterLive = Layer.succeed(
 	}),
 );
 
+// `Multiplier` has to be in scope on both sides of the wire: the
+// `Counter`'s `Scale` action's codec consumes `Action.ServicesServer`
+// during registration, and the test body's `Counter.client` getter
+// consumes `Action.ServicesClient` for the same action.
+// `provideMerge` keeps it as a layer output so the test effect
+// itself sees it too.
+const MultiplierLive = Layer.succeed(
+	Multiplier,
+	Multiplier.of({ factor: 2 }),
+);
+
 const TestLayer = Runner.test.pipe(
 	Layer.provideMerge(Layer.mergeAll(CounterLive, PingerLive)),
 	Layer.provide(GreeterLive),
+	Layer.provideMerge(MultiplierLive),
 	Layer.provide(Registry.layer()),
 );
 
@@ -148,8 +162,38 @@ layer(TestLayer)("end-to-end", (it) => {
 
 	it.todo("surfaces an error thrown inside an actor's build effect");
 
-	it.todo(
+	it.effect(
 		"runs encoding/decoding services for an action's payload, success, and error",
+		() =>
+			Effect.gen(function* () {
+				const counter = (yield* Counter.client).getOrCreate([
+					"t-codec-services",
+				]);
+
+				// Success path. With `factor: 2` provided on both sides:
+				// payload encode 10 -> 5 (client divides), payload decode
+				// 5 -> 10 (server multiplies), handler returns 110, success
+				// encode 110 -> 55 (server divides), success decode 55 -> 110
+				// (client multiplies). A wrong final value would mean one
+				// of those four codec sites failed to resolve `Multiplier`.
+				assert.strictEqual(yield* counter.Scale({ amount: 10 }), 110);
+
+				// Error path. The handler short-circuits with a
+				// `ScaledOverflowError({ limit: 30 })`. The error's `limit`
+				// flows through the same service-dependent schema: server
+				// encode 30 -> 15, client decode 15 -> 30. A factor mismatch
+				// or an unprovided service on either side would surface as
+				// a numeric mismatch on `exit.value.limit`.
+				const exit = yield* counter
+					.Scale({ amount: 40 })
+					.pipe(Effect.flip, Effect.exit);
+				assert.isTrue(exit._tag === "Success");
+				if (exit._tag === "Success") {
+					assert.instanceOf(exit.value, ScaledOverflowError);
+					assert.strictEqual(exit.value.limit, 30);
+					assert.match(exit.value.message, /exceed limit 30/);
+				}
+			}),
 	);
 
 	it.todo("propagates Effect tracing spans end-to-end");

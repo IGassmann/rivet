@@ -62,8 +62,67 @@ export const WakeGreeting = Action.make("WakeGreeting", {
 	success: Schema.String,
 });
 
+// Service that the codec schema below depends on. Yielding it from
+// inside a `transformOrFail` puts `Multiplier` into the schema's
+// `DecodingServices` / `EncodingServices`, which in turn surfaces in
+// `Action.ServicesServer` / `Action.ServicesClient` for any action
+// referencing the codec.
+export class Multiplier extends Context.Service<
+	Multiplier,
+	{ readonly factor: number }
+>()("test/Multiplier") {}
+
+// A `Number` schema whose decode multiplies by the live factor and whose
+// encode divides by it. With the same factor on both ends, values
+// round-trip; the test would fail if any codec site failed to resolve
+// `Multiplier`.
+const ScaledNumber = Schema.Number.pipe(
+	Schema.decodeTo(
+		Schema.Number,
+		SchemaTransformation.transformOrFail({
+			decode: (n: number) =>
+				Effect.gen(function* () {
+					const m = yield* Multiplier;
+					return n * m.factor;
+				}),
+			encode: (n: number) =>
+				Effect.gen(function* () {
+					const m = yield* Multiplier;
+					return n / m.factor;
+				}),
+		}),
+	),
+);
+
+export class ScaledOverflowError extends Schema.TaggedErrorClass<ScaledOverflowError>()(
+	"ScaledOverflowError",
+	{
+		limit: ScaledNumber,
+		message: Schema.String,
+	},
+) {}
+
+// Every channel of this action — payload, success, error — references
+// `ScaledNumber`, so a successful round-trip proves all six codec sites
+// (payload encode + decode, success encode + decode, error encode +
+// decode) resolved their schema services.
+export const Scale = Action.make("Scale", {
+	payload: { amount: ScaledNumber },
+	success: ScaledNumber,
+	error: ScaledOverflowError,
+});
+
 export const Counter = Actor.make("Counter", {
-	actions: [Increment, GetCount, Crash, EchoDate, Tags, Greet, WakeGreeting],
+	actions: [
+		Increment,
+		GetCount,
+		Crash,
+		EchoDate,
+		Tags,
+		Greet,
+		WakeGreeting,
+		Scale,
+	],
 });
 
 export const CounterLive = Counter.toLayer(
@@ -100,6 +159,20 @@ export const CounterLive = Counter.toLayer(
 					return g.greet(payload.name);
 				}),
 			WakeGreeting: () => Effect.succeed(wakeGreeting),
+			Scale: ({ payload }) =>
+				Effect.gen(function* () {
+					if (payload.amount > 30) {
+						return yield* new ScaledOverflowError({
+							limit: 30,
+							message: `amount ${payload.amount} would exceed limit 30`,
+						});
+					}
+					// +100 makes the round-trip non-tautological: the
+					// test asserts on a value the client never sent, so
+					// the success path can't pass without the success
+					// and payload codec sites firing on both sides.
+					return payload.amount + 100;
+				}),
 		});
 	}),
 );
