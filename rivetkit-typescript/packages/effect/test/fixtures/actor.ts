@@ -188,3 +188,13 @@ export const Pinger = Actor.make("Pinger", { actions: [Ping] });
 export const PingerLive = Pinger.toLayer({
 	Ping: () => Effect.succeed("pong"),
 });
+
+// --- FailingActor ---
+
+export const FailingActor = Actor.make("FailingBuild", {
+	actions: [Ping],
+});
+
+export const FailingActorLive = FailingActor.toLayer(
+	Effect.die("build effect failed"),
+);

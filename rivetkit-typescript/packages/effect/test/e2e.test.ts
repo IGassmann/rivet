@@ -5,6 +5,8 @@ import {
 	Counter,
 	CounterLive,
 	CounterOverflowError,
+	FailingActor,
+	FailingActorLive,
 	Greeter,
 	Multiplier,
 	Pinger,
@@ -31,7 +33,9 @@ const MultiplierLive = Layer.succeed(
 );
 
 const TestLayer = Runner.test.pipe(
-	Layer.provideMerge(Layer.mergeAll(CounterLive, PingerLive)),
+	Layer.provideMerge(
+		Layer.mergeAll(CounterLive, PingerLive, FailingActorLive),
+	),
 	Layer.provide(GreeterLive),
 	Layer.provideMerge(MultiplierLive),
 	Layer.provide(Registry.layer()),
@@ -160,7 +164,21 @@ layer(TestLayer)("end-to-end", (it) => {
 
 	it.todo("fires the wake-scope finalizer on sleep");
 
-	it.todo("surfaces an error thrown inside an actor's build effect");
+	it.effect("surfaces an error thrown inside an actor's build effect", () =>
+		Effect.gen(function* () {
+			// `getOrCreate` only builds a typed proxy on the client and
+			// rivetkit's wake is lazy on first action, so the build
+			// defect surfaces on `.Ping()`, not here.
+			const failing = (yield* FailingActor.client).getOrCreate([
+				"t-build-error",
+			]);
+			const exit = yield* failing.Ping().pipe(Effect.flip, Effect.exit);
+			assert.isTrue(exit._tag === "Success");
+			if (exit._tag === "Success") {
+				assert.instanceOf(exit.value, RivetError.RivetError);
+			}
+		}),
+	);
 
 	it.effect(
 		"runs encoding/decoding services for an action's payload, success, and error",
