@@ -62,6 +62,16 @@ export const WakeGreeting = Action.make("WakeGreeting", {
 	success: Schema.String,
 });
 
+// An action whose handler emits its own user-defined sub-span. The
+// tracing test asserts the sub-span lands as a child of the SDK's
+// server-side span, which itself is a child of the SDK's client-side
+// span — proof that user spans nest correctly under the SDK's wire
+// propagation.
+export const Compute = Action.make("Compute", {
+	payload: { n: Schema.Number },
+	success: Schema.Number,
+});
+
 // Service that the codec schema below depends on. Yielding it from
 // inside a `transformOrFail` puts `Multiplier` into the schema's
 // `DecodingServices` / `EncodingServices`, which in turn surfaces in
@@ -121,6 +131,7 @@ export const Counter = Actor.make("Counter", {
 		Tags,
 		Greet,
 		WakeGreeting,
+		Compute,
 		Scale,
 	],
 });
@@ -159,6 +170,14 @@ export const CounterLive = Counter.toLayer(
 					return g.greet(payload.name);
 				}),
 			WakeGreeting: () => Effect.succeed(wakeGreeting),
+			// User-defined sub-span. The SDK already wraps the handler
+			// in a server-side span; the inner `withSpan("step.double")`
+			// nests under it, demonstrating that hand-written spans
+			// inside a handler join the caller's trace transparently.
+			Compute: ({ payload }) =>
+				Effect.succeed(payload.n * 2).pipe(
+					Effect.withSpan("step.double"),
+				),
 			Scale: ({ payload }) =>
 				Effect.gen(function* () {
 					if (payload.amount > 30) {

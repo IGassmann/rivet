@@ -14,6 +14,7 @@ import {
 	ScaledOverflowError,
 	Unregistered,
 } from "./fixtures/actor";
+import { TestTracer } from "./fixtures/tracer";
 
 const GreeterLive = Layer.succeed(
 	Greeter,
@@ -28,10 +29,7 @@ const GreeterLive = Layer.succeed(
 // consumes `Action.ServicesClient` for the same action.
 // `provideMerge` keeps it as a layer output so the test effect
 // itself sees it too.
-const MultiplierLive = Layer.succeed(
-	Multiplier,
-	Multiplier.of({ factor: 2 }),
-);
+const MultiplierLive = Layer.succeed(Multiplier, Multiplier.of({ factor: 2 }));
 
 const TestLayer = Runner.test.pipe(
 	Layer.provideMerge(
@@ -39,6 +37,7 @@ const TestLayer = Runner.test.pipe(
 	),
 	Layer.provide(GreeterLive),
 	Layer.provideMerge(MultiplierLive),
+	Layer.provideMerge(TestTracer.layer()),
 	Layer.provide(Registry.layer()),
 );
 
@@ -73,20 +72,23 @@ layer(TestLayer)("end-to-end", (it) => {
 		}),
 	);
 
-	it.effect("surfaces an expected handler error back into the original error", () =>
-		Effect.gen(function* () {
-			const counter = (yield* Counter.client).getOrCreate(["t-expected-error"]);
-			const exit = yield* counter.Increment({ amount: 100 }).pipe(
-				Effect.flip,
-				Effect.exit,
-			);
-			assert.isTrue(exit._tag === "Success");
-			if (exit._tag === "Success") {
-				assert.instanceOf(exit.value, CounterOverflowError);
-				assert.strictEqual(exit.value.limit, 20);
-				assert.match(exit.value.message, /exceed limit 20/);
-			}
-		}),
+	it.effect(
+		"surfaces an expected handler error back into the original error",
+		() =>
+			Effect.gen(function* () {
+				const counter = (yield* Counter.client).getOrCreate([
+					"t-expected-error",
+				]);
+				const exit = yield* counter
+					.Increment({ amount: 100 })
+					.pipe(Effect.flip, Effect.exit);
+				assert.isTrue(exit._tag === "Success");
+				if (exit._tag === "Success") {
+					assert.instanceOf(exit.value, CounterOverflowError);
+					assert.strictEqual(exit.value.limit, 20);
+					assert.match(exit.value.message, /exceed limit 20/);
+				}
+			}),
 	);
 
 	it.effect("surfaces an unexpected handler error as a RivetError", () =>
@@ -112,7 +114,9 @@ layer(TestLayer)("end-to-end", (it) => {
 
 	it.effect("round-trips a custom Schema.transform", () =>
 		Effect.gen(function* () {
-			const counter = (yield* Counter.client).getOrCreate(["t-transform"]);
+			const counter = (yield* Counter.client).getOrCreate([
+				"t-transform",
+			]);
 			// `tags` rides the wire as the encoded CSV string and decodes
 			// back to a string array on the server. If the transform
 			// didn't fire, `payload.tags.length` would be the byte length
@@ -243,5 +247,47 @@ layer(TestLayer)("end-to-end", (it) => {
 			}),
 	);
 
-	it.todo("propagates Effect tracing spans end-to-end");
+	it.effect("propagates Effect tracing spans end-to-end", () =>
+		Effect.gen(function* () {
+			const tracer = yield* TestTracer;
+			yield* tracer.clear;
+			const counter = (yield* Counter.client).getOrCreate(["t-tracing"]);
+			// Wrapping the call in `Effect.withSpan("client-call")`
+			// makes that span the active parent. The SDK then opens
+			// `Counter/Compute` (kind=client) under it, ships the IDs
+			// over the wire, and on the server opens another
+			// `Counter/Compute` (kind=server) parented to the client
+			// span via `externalSpan`. The handler itself wraps its
+			// work in `Effect.withSpan("step.double")`, which nests
+			// under the SDK's server span — proving user-defined
+			// sub-spans join the propagated trace.
+			const clientTraceId = yield* Effect.gen(function* () {
+				const clientSpan = yield* Effect.currentSpan;
+				const doubled = yield* counter.Compute({ n: 21 });
+				assert.strictEqual(doubled, 42);
+				return clientSpan.traceId;
+			}).pipe(Effect.withSpan("client-call"));
+
+			const spans = yield* tracer.spans;
+			const onTrace = spans.filter((s) => s.traceId === clientTraceId);
+			assert.deepStrictEqual(
+				onTrace.map((s) => s.name),
+				[
+					"client-call",
+					"Counter/Compute",
+					"Counter/Compute",
+					"step.double",
+				],
+			);
+			// Each span (after the root) is parented to the prior one,
+			// proving the chain is intact across the wire boundary.
+			for (let i = 1; i < onTrace.length; i++) {
+				const parent = onTrace[i].parent;
+				assert.strictEqual(parent._tag, "Some");
+				if (parent._tag === "Some") {
+					assert.strictEqual(parent.value.spanId, onTrace[i - 1].spanId);
+				}
+			}
+		}),
+	);
 });

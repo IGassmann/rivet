@@ -2,17 +2,28 @@ import { Context, Effect, Layer } from "effect";
 import * as Rivetkit from "rivetkit";
 import * as RivetkitClient from "rivetkit/client";
 import type { ActorKeyParam } from "./Actor";
+import type { TraceMeta } from "./internal/tracing";
 
 /**
  * Connection options for the Rivet Engine client transport. Mirrors
  * the `(endpoint, token, namespace)` subset of rivetkit's
- * `ClientConfigInput` — the only fields the Effect SDK currently
- * surfaces and forwards.
+ * `ClientConfigInput`.
  */
 export type ClientOptions = Pick<
 	RivetkitClient.ClientConfigInput,
 	"endpoint" | "token" | "namespace"
 >;
+
+/**
+ * Per-call metadata envelope shipped as `args[1]` alongside the encoded
+ * payload. The SDK currently uses it for trace propagation (`trace`),
+ * but it's intentionally extensible so future cross-cutting concerns —
+ * idempotency keys, deadlines, custom headers — can land as additional
+ * optional fields without changing the wire shape.
+ */
+export interface ActionMeta {
+	readonly trace?: TraceMeta;
+}
 
 /**
  * Service holding the rivetkit client transport. Provided once via
@@ -28,12 +39,17 @@ export class Client extends Context.Service<
 		 * the rivetkit `RivetError` instance via `Effect.fail` — the
 		 * caller decides whether to decode `metadata` as a typed error or
 		 * wrap it through the wire codec.
+		 *
+		 * `meta`, when provided, rides the wire as the second positional
+		 * `args` entry. It's a generic envelope (`ActionMeta`) so the SDK
+		 * can grow cross-cutting fields without changing the wire shape.
 		 */
 		readonly callAction: (params: {
 			readonly actorName: string;
 			readonly key: ActorKeyParam;
 			readonly actionName: string;
 			readonly encodedPayload: unknown;
+			readonly meta?: ActionMeta;
 		}) => Effect.Effect<unknown, Rivetkit.RivetError>;
 	}
 >()("@rivetkit/effect/Client") {
@@ -47,12 +63,15 @@ export class Client extends Context.Service<
 					key,
 					actionName,
 					encodedPayload,
+					meta,
 				}) =>
 					Effect.tryPromise({
 						try: () =>
 							rivetkitClient[actorName].getOrCreate(key).action({
 								name: actionName,
-								args: [encodedPayload],
+								args: meta
+									? [encodedPayload, meta]
+									: [encodedPayload],
 							}),
 						catch: (cause) =>
 							cause instanceof Rivetkit.RivetError

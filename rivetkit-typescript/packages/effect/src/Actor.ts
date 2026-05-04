@@ -8,11 +8,13 @@ import {
 	Ref,
 	Schema,
 	Scope,
+	Tracer,
 } from "effect";
 import * as Rivetkit from "rivetkit";
 import * as RivetkitClient from "rivetkit/client";
 import type * as Action from "./Action";
-import { Client, type ClientService } from "./Client";
+import { Client, type ActionMeta, type ClientService } from "./Client";
+import { readTraceMeta, rpcSystem } from "./internal/tracing";
 import * as RivetError from "./RivetError";
 import { hasStringProperty } from "./utils";
 
@@ -82,13 +84,14 @@ export type RegistryOptions = Pick<
  * materialize the underlying rivetkit registry from the collected
  * entries).
  */
-export class Registry extends Context.Service<Registry, {
-	readonly options: RegistryOptions;
-	readonly register: (entry: RegistryEntry) => Effect.Effect<void>;
-	readonly entries: Effect.Effect<ReadonlyArray<RegistryEntry>>;
-}>()(
-	"@rivetkit/effect/Actor/Registry",
-) {
+export class Registry extends Context.Service<
+	Registry,
+	{
+		readonly options: RegistryOptions;
+		readonly register: (entry: RegistryEntry) => Effect.Effect<void>;
+		readonly entries: Effect.Effect<ReadonlyArray<RegistryEntry>>;
+	}
+>()("@rivetkit/effect/Actor/Registry") {
 	static layer(options: RegistryOptions = {}) {
 		return Layer.effect(
 			Registry,
@@ -133,13 +136,14 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 		(
 			c: Pick<ActorAddress, "actorId">,
 			payload?: unknown,
+			meta?: unknown,
 		) => Promise<unknown>
 	> = {};
 	for (const action of actor.actions) {
 		const decodePayload = Schema.decodeUnknownEffect(action.payloadSchema);
 		const encodeSuccess = Schema.encodeUnknownEffect(action.successSchema);
 		const encodeError = Schema.encodeUnknownEffect(action.errorSchema);
-		actions[action._tag] = async (c, payload) => {
+		actions[action._tag] = async (c, payload, meta) => {
 			const inst = instances.get(c.actorId);
 			if (!inst) {
 				throw new Error(
@@ -153,38 +157,62 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 				);
 			}
 
-			const pipeline = Effect.gen(function* () {
-				const decoded = yield* decodePayload(payload).pipe(
-					Effect.orDie,
-				);
-				const result = yield* handler({
-					_tag: action._tag,
-					action,
-					payload: decoded,
-				}).pipe(
-					Effect.catch((expectedError) =>
-						Effect.gen(function* () {
-							const error = yield* encodeError(
-								expectedError,
-							).pipe(Effect.orDie);
-							return yield* Effect.die(
-								new Rivetkit.UserError(
-									hasStringProperty("message")(error)
-										? error.message
-										: `${action._tag} failed`,
-									{
-										code: hasStringProperty("_tag")(error)
-											? error._tag
-											: undefined,
-										metadata: error,
-									},
-								),
-							);
-						}),
-					),
-				);
-				return yield* encodeSuccess(result).pipe(Effect.orDie);
-			});
+			let pipeline: Effect.Effect<unknown, never, unknown> = Effect.gen(
+				function* () {
+					const decoded = yield* decodePayload(payload).pipe(
+						Effect.orDie,
+					);
+					const result = yield* handler({
+						_tag: action._tag,
+						action,
+						payload: decoded,
+					}).pipe(
+						Effect.catch((expectedError) =>
+							Effect.gen(function* () {
+								const error = yield* encodeError(
+									expectedError,
+								).pipe(Effect.orDie);
+								return yield* Effect.die(
+									new Rivetkit.UserError(
+										hasStringProperty("message")(error)
+											? error.message
+											: `${action._tag} failed`,
+										{
+											code: hasStringProperty("_tag")(
+												error,
+											)
+												? error._tag
+												: undefined,
+											metadata: error,
+										},
+									),
+								);
+							}),
+						),
+					);
+					return yield* encodeSuccess(result).pipe(Effect.orDie);
+				},
+			);
+
+			// Always wrap in a server-side span so the handler has a
+			// live `currentSpan` even when the caller didn't ship trace
+			// context (e.g. a non-Effect-SDK client). When trace context
+			// is present, reattach it as the parent so the server span
+			// joins the caller's trace.
+			const rpcMethod = `${actor._tag}/${action._tag}`;
+			const traceMeta = readTraceMeta(meta);
+			pipeline = pipeline.pipe(
+				Effect.withSpan(rpcMethod, {
+					parent: traceMeta
+						? Tracer.externalSpan(traceMeta)
+						: undefined,
+					kind: "server",
+					attributes: {
+						"rpc.system.name": rpcSystem,
+						"rpc.method": rpcMethod,
+					},
+				}),
+			);
 
 			const exit = await Effect.runPromiseExitWith(services)(pipeline);
 			if (Exit.isSuccess(exit)) return exit.value;
@@ -268,11 +296,12 @@ const toRivetkitRegistry = Effect.fnUntraced(function* (
  * static field is a `Layer` for a specific mode mirroring the
  * non-Effect TS SDK: `start`. Each requires `Registry`.
  */
-export class Runner extends Context.Service<Runner, {
-	readonly mode: "start" | "test";
-}>()(
-	"@rivetkit/effect/Actor/Runner",
-) {
+export class Runner extends Context.Service<
+	Runner,
+	{
+		readonly mode: "start" | "test";
+	}
+>()("@rivetkit/effect/Actor/Runner") {
 	static start = Layer.effect(
 		Runner,
 		Effect.gen(function* () {
@@ -341,12 +370,15 @@ export class Runner extends Context.Service<Runner, {
 					key,
 					actionName,
 					encodedPayload,
+					meta,
 				}) =>
 					Effect.tryPromise({
 						try: () =>
 							rivetkitClient[actorName].getOrCreate(key).action({
 								name: actionName,
-								args: [encodedPayload],
+								args: meta
+									? [encodedPayload, meta]
+									: [encodedPayload],
 							}),
 						catch: (cause) =>
 							cause instanceof Rivetkit.RivetError
@@ -534,62 +566,82 @@ const Proto = {
 					> = {};
 					for (const action of actions) {
 						const tag = action._tag;
-						handle[tag] = (payload) =>
-							Effect.gen(function* () {
-								const encoded =
-									yield* Schema.encodeUnknownEffect(
-										action.payloadSchema,
-									)(payload);
-								const raw = yield* client
-									.callAction({
-										actorName: self._tag,
-										key,
-										actionName: tag,
-										encodedPayload: encoded,
-									})
-									.pipe(
-										// Try `errorSchema` first against the
-										// wire metadata. Fall back to wrapping
-										// the raw RivetError via `RivetErrorFromWire`.
-										Effect.catch((rivetErr) =>
-											Schema.decodeUnknownEffect(
-												action.errorSchema,
-											)(
-												(
-													rivetErr as {
-														metadata?: unknown;
-													}
-												).metadata,
-											).pipe(
-												Effect.matchEffect({
-													onSuccess: (typed) =>
-														Effect.fail(typed),
-													onFailure: () =>
-														Schema.decodeUnknownEffect(
-															RivetError.RivetErrorFromWire,
-														)({
-															group: rivetErr.group,
-															code: rivetErr.code,
-															message:
-																rivetErr.message,
-															metadata: (
-																rivetErr as {
-																	metadata?: unknown;
-																}
-															).metadata,
-														}).pipe(
-															Effect.flatMap(
-																Effect.fail,
-															),
+						const rpcMethod = `${self._tag}/${tag}`;
+						// `Effect.fn` wraps the generator in a span named
+						// `rpcMethod` (kind=client + OTel `rpc.*` attrs)
+						// without an extra `pipe(Effect.withSpan(...))`.
+						// The active span inside is the one whose IDs
+						// the body reads via `Effect.currentSpan` and
+						// ships as `meta.trace`, so the server-side
+						// wrapper can reattach it as the handler's
+						// parent. Same pattern as Effect's RPC layer
+						// (`RpcClient.ts`).
+						handle[tag] = Effect.fn(rpcMethod, {
+							kind: "client",
+							attributes: {
+								"rpc.system.name": rpcSystem,
+								"rpc.method": rpcMethod,
+							},
+						})(function* (payload: unknown) {
+							const encoded = yield* Schema.encodeUnknownEffect(
+								action.payloadSchema,
+							)(payload);
+							const span = yield* Effect.currentSpan;
+							const meta: ActionMeta = {
+								trace: {
+									traceId: span.traceId,
+									spanId: span.spanId,
+									sampled: span.sampled,
+								},
+							};
+							const raw = yield* client
+								.callAction({
+									actorName: self._tag,
+									key,
+									actionName: tag,
+									encodedPayload: encoded,
+									meta,
+								})
+								.pipe(
+									// Try `errorSchema` first against the
+									// wire metadata. Fall back to wrapping
+									// the raw RivetError via `RivetErrorFromWire`.
+									Effect.catch((rivetErr) =>
+										Schema.decodeUnknownEffect(
+											action.errorSchema,
+										)(
+											(rivetErr as { metadata?: unknown })
+												.metadata,
+										).pipe(
+											Effect.matchEffect({
+												onSuccess: (typed) =>
+													Effect.fail(typed),
+												onFailure: () =>
+													Schema.decodeUnknownEffect(
+														RivetError.RivetErrorFromWire,
+													)({
+														group: rivetErr.group,
+														code: rivetErr.code,
+														message:
+															rivetErr.message,
+														metadata: (
+															rivetErr as {
+																metadata?: unknown;
+															}
+														).metadata,
+													}).pipe(
+														Effect.flatMap(
+															Effect.fail,
 														),
-												}),
-											),
+													),
+											}),
 										),
-									);
-								return yield* Schema.decodeUnknownEffect(
-									action.successSchema,
-								)(raw);
-							}) as Effect.Effect<unknown, unknown, never>;
+									),
+								);
+							return yield* Schema.decodeUnknownEffect(
+								action.successSchema,
+							)(raw);
+						}) as (p: unknown) => Effect.Effect<unknown, unknown>;
 					}
 					return handle as Handle<Action.AnyWithProps>;
 				},
