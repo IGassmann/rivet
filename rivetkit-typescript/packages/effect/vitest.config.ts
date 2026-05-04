@@ -11,7 +11,7 @@ const env = {
 	RIVET_ENGINE_BINARY: join(here, "../../../target/debug/rivet-engine"),
 	// The shared vitest base sets RIVET_LOG_LEVEL=DEBUG, which floods the
 	// terminal with engine + runtime logs. Keep this suite quiet.
-	RIVET_LOG_LEVEL: "ERROR",
+	RIVET_LOG_LEVEL: "SILENT",
 };
 
 export default defineConfig({
