@@ -54,6 +54,25 @@ export class CurrentAddress extends Context.Service<
 >()("@rivetkit/effect/Actor/CurrentAddress") {}
 
 /**
+ * Internal carrier for the per-wake sleep request. Provided
+ * automatically by the SDK during `onWake`; consumers should yield
+ * `Actor.Sleep` (the `Effect` below) rather than this tag directly.
+ */
+export class SleepFn extends Context.Service<SleepFn, Effect.Effect<void>>()(
+	"@rivetkit/effect/Actor/SleepFn",
+) {}
+
+/**
+ * Asks the engine to sleep the current actor instance after the
+ * current action returns. The wake scope's finalizers run, and the
+ * actor is reloaded lazily on the next call. Yieldable from any action
+ * handler or the wake-scope build effect.
+ */
+export const Sleep: Effect.Effect<void, never, SleepFn> = Effect.flatten(
+	SleepFn.asEffect(),
+);
+
+/**
  * One actor registered with the `Registry`. The `buildHandlers`
  * effect is run once per wake by the runner to construct
  * per-instance state and handlers; the handlers themselves are not
@@ -241,11 +260,15 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 				const built = entry.buildHandlers as Effect.Effect<
 					unknown,
 					never,
-					Scope.Scope | CurrentAddress
+					Scope.Scope | CurrentAddress | SleepFn
 				>;
 				const handlers = yield* built.pipe(
 					Effect.provideService(CurrentAddress, address),
 					Effect.provideService(Scope.Scope, scope),
+					Effect.provideService(
+						SleepFn,
+						Effect.sync(() => c.sleep()),
+					),
 				) as Effect.Effect<unknown, never, never>;
 				return { handlers, scope };
 			});
@@ -479,7 +502,7 @@ export interface Actor<
 	): Layer.Layer<
 		never,
 		never,
-		| Exclude<RX, Scope.Scope | CurrentAddress>
+		| Exclude<RX, Scope.Scope | CurrentAddress | SleepFn>
 		| HandlerServices<Handlers>
 		| Action.ServicesServer<Actions>
 		| Action.ServicesClient<Actions>
