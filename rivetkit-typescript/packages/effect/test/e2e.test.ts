@@ -1,5 +1,6 @@
 import { assert, layer } from "@effect/vitest";
-import { Effect, Layer } from "effect";
+import { Effect, Layer, Schedule } from "effect";
+import { TestClock } from "effect/testing";
 import { Registry, RivetError, Runner } from "@rivetkit/effect";
 import {
 	Counter,
@@ -75,22 +76,23 @@ layer(TestLayer)("end-to-end", (it) => {
 			});
 			assert.strictEqual(beforeSleep, 11);
 
-			// Give the engine a moment to process the sleep request
-			// and tear down the wake scope before the next call
-			// triggers a fresh wake. `Effect.promise` bypasses the
-			// suite's TestClock so real time actually elapses.
-			yield* Effect.promise(
-				() => new Promise((resolve) => setTimeout(resolve, 2000)),
+			// Engine-side sleep teardown is asynchronous and the SDK
+			// exposes no "actor slept" hook today, so poll the
+			// post-condition. `count` is `Ref.make(0)` per wake, so
+			// seeing 0 is the deterministic signal that the prior
+			// wake torn down and a fresh one started. `TestClock.withLive`
+			// swaps in the real Clock for the duration of the poll so
+			// the schedule's interval and the timeout both elapse in
+			// wall time (the suite otherwise runs under TestClock).
+			const inMemoryAfterWake = yield* counter.GetCount().pipe(
+				Effect.repeat({
+					until: (n) => n === 0,
+					schedule: Schedule.spaced("100 millis"),
+				}),
+				Effect.timeout("10 seconds"),
+				TestClock.withLive,
 			);
-
-			// `count` is `Ref.make(0)` per wake; if the actor
-			// didn't sleep+rewake, we'd still see 7.
-			const inMemoryAfterWake = yield* counter.GetCount();
-			assert.strictEqual(
-				inMemoryAfterWake,
-				0,
-				"in-memory ref should be reset by a fresh wake",
-			);
+			assert.strictEqual(inMemoryAfterWake, 0);
 
 			// `+ 0` is a no-op increment whose return value is the
 			// freshly-loaded persisted total. Anything other than
