@@ -1,4 +1,4 @@
-import { Effect, Ref } from "effect"
+import { Effect, SubscriptionRef } from "effect"
 import { Actor } from "@rivetkit/effect"
 import { Counter, CounterOverflowError } from "./api.ts"
 
@@ -26,16 +26,13 @@ export const CounterLive = Counter.toLayer(
 		// - Swappable via layers. Tests can provide an in-memory KV
 		//   or a mock DB without changing the actor code.
 
-		// PersistedSubscriptionRef extends SubscriptionRef with
-		// throttled durable persistence. Standard SubscriptionRef
-		// combinators (get, set, update, modify, changes) work as-is.
-		// Every published change schedules a save via the configured
-		// stateSaveInterval; the wake-scope finalizer flushes pending
-		// writes before sleep so state is durable on teardown. Use
-		// PersistedSubscriptionRef.sync / updateAndSync when an action
-		// must wait for durability before responding.
-		// const state = yield* Counter.State
-		//    // ^ PersistedSubscriptionRef<{ count: number }>
+		// Counter.State yields a SubscriptionRef whose published changes
+		// are mirrored back to rivetkit's persisted state. Standard
+		// SubscriptionRef combinators (get, set, update, modify, changes)
+		// work as-is, and the wake-scope finalizer flushes pending writes
+		// before sleep so state is durable on teardown.
+		const state = yield* Counter.State
+		//    ^ SubscriptionRef<{ count: number }>
 		// const events = yield* Counter.Events
 		//    // ^ { countChanged: PubSub<number> }
 		// const messages = yield* Counter.Messages
@@ -47,16 +44,11 @@ export const CounterLive = Counter.toLayer(
 			`waking ${address.name}/${address.key.join(",")} actorId=${address.actorId}`,
 		)
 
-		// In-memory per-wake state. Resets on every wake; this v1
-		// has no persistence. Replace with a persisted state ref
-		// once Actor.State lands.
-		const count = yield* Ref.make(0)
-
 		yield* Effect.addFinalizer(() =>
-			Ref.get(count).pipe(
-				Effect.flatMap((n) =>
+			SubscriptionRef.get(state).pipe(
+				Effect.flatMap(({ count }) =>
 					Effect.log(
-						`sleeping ${address.name}/${address.key.join(",")} count=${n}`,
+						`sleeping ${address.name}/${address.key.join(",")} count=${count}`,
 					),
 				),
 			),
@@ -94,9 +86,9 @@ export const CounterLive = Counter.toLayer(
 		return Counter.of({
 			Increment: ({ payload }) =>
 				Effect.gen(function* () {
-					const next = yield* Ref.updateAndGet(
-						count,
-						(n) => n + payload.amount,
+					const { count: next } = yield* SubscriptionRef.updateAndGet(
+						state,
+						(s) => ({ count: s.count + payload.amount }),
 					)
 					if (next > 20) {
 						return yield* new CounterOverflowError({
@@ -108,7 +100,8 @@ export const CounterLive = Counter.toLayer(
 					return next
 				}),
 
-			GetCount: () => Ref.get(count),
+			GetCount: () =>
+				SubscriptionRef.get(state).pipe(Effect.map((s) => s.count)),
 		})
 	}),
 )

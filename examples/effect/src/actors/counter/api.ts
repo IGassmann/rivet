@@ -1,4 +1,4 @@
-import { Schema } from "effect"
+import { Effect, Schema } from "effect"
 import { Actor, Action } from "@rivetkit/effect"
 
 // --- Errors ---
@@ -60,11 +60,11 @@ export const GetCount = Action.make("GetCount", {
 // implementation. Both server and client code import this;
 // the implementation stays server-only.
 export const Counter = Actor.make("Counter", {
-	// state: Schema.Struct({
-	// 	count: Schema.Number.pipe(
-	// 		Schema.withConstructorDefault(Effect.succeed(0)),
-	// 	),
-	// }),
+	state: Schema.Struct({
+		count: Schema.Number.pipe(
+			Schema.withConstructorDefault(Effect.succeed(0)),
+		),
+	}),
 	actions: [Increment, GetCount],
 	// messages: [Reset, IncrementBy],	// durable, queued, background
 	// events: { countChanged: Schema.Number },
