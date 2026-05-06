@@ -4,7 +4,7 @@ import { Predicate } from "effect";
  * Identifies the SDK as the RPC system on action spans. Stamped onto
  * the `rpc.system.name` OTel attribute.
  */
-export const rpcSystem = "rivet.actor";
+export const rpcSystem = "rivet.actors";
 
 /**
  * Cross-wire trace metadata. Carries just enough of an `Effect.Tracer`
