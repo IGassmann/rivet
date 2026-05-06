@@ -6,7 +6,7 @@ import {
 	SchemaTransformation,
 	SubscriptionRef,
 } from "effect";
-import { Action, Actor } from "@rivetkit/effect";
+import { Action, Actor, ActorState } from "@rivetkit/effect";
 
 // --- Counter ---
 
@@ -140,11 +140,6 @@ export const PersistAndSleep = Action.make("PersistAndSleep", {
 });
 
 export const Counter = Actor.make("Counter", {
-	state: Schema.Struct({
-		count: Schema.Number.pipe(
-			Schema.withConstructorDefault(Effect.succeed(0)),
-		),
-	}),
 	actions: [
 		Increment,
 		GetCount,
@@ -160,9 +155,16 @@ export const Counter = Actor.make("Counter", {
 	],
 });
 
+const CounterState = ActorState.make("CounterState", {
+	schema: Schema.Struct({
+		count: Schema.Number,
+	}),
+	initial: () => ({ count: 0 }),
+});
+
 export const CounterLive = Counter.toLayer(
 	Effect.gen(function* () {
-		const state = yield* Counter.State;
+		const state = yield* CounterState;
 		const count = yield* Ref.make(0);
 		// Wake-scope yield of a non-built-in service. Resolved once per
 		// wake; the captured value is closed over by `WakeGreeting`.
@@ -235,6 +237,7 @@ export const CounterLive = Counter.toLayer(
 				}),
 		});
 	}),
+	{ state: CounterState },
 );
 
 // --- Pinger ---

@@ -1,6 +1,19 @@
-import { Effect, SubscriptionRef } from "effect"
-import { Actor } from "@rivetkit/effect"
-import { Counter, CounterOverflowError } from "./api.ts"
+import { Effect, Schema, SubscriptionRef } from "effect";
+import { Actor, ActorState } from "@rivetkit/effect";
+import { Counter, CounterOverflowError } from "./api.ts";
+
+// --- Actor State ---
+
+// State configuration (`schema` + `initial`) is server-only — it
+// describes the persisted shape and must not leak into the client
+// bundle. Defining it here keeps the contract in `api.ts` lean and
+// shareable; the client never imports this file.
+const CounterState = ActorState.make("CounterState", {
+	schema: Schema.Struct({
+		count: Schema.Number,
+	}),
+	initial: () => ({ count: 0 }),
+});
 
 // --- Actor Implementation ---
 
@@ -26,12 +39,13 @@ export const CounterLive = Counter.toLayer(
 		// - Swappable via layers. Tests can provide an in-memory KV
 		//   or a mock DB without changing the actor code.
 
-		// Counter.State yields a SubscriptionRef whose published changes
-		// are mirrored back to rivetkit's persisted state. Standard
-		// SubscriptionRef combinators (get, set, update, modify, changes)
-		// work as-is, and the wake-scope finalizer flushes pending writes
-		// before sleep so state is durable on teardown.
-		const state = yield* Counter.State
+		// Yielding `CounterState` resolves to a SubscriptionRef whose
+		// published changes are mirrored back to rivetkit's persisted
+		// state. Standard SubscriptionRef combinators (get, set, update,
+		// modify, changes) work as-is, and the wake-scope finalizer
+		// flushes pending writes before sleep so state is durable on
+		// teardown.
+		const state = yield* CounterState;
 		//    ^ SubscriptionRef<{ count: number }>
 		// const events = yield* Counter.Events
 		//    // ^ { countChanged: PubSub<number> }
@@ -39,10 +53,10 @@ export const CounterLive = Counter.toLayer(
 		//    // ^ MessageQueue<Reset | IncrementBy>
 		// const kv = yield* Actor.Kv
 		// const db = yield* Actor.Db
-		const address = yield* Actor.CurrentAddress
+		const address = yield* Actor.CurrentAddress;
 		yield* Effect.log(
 			`waking ${address.name}/${address.key.join(",")} actorId=${address.actorId}`,
-		)
+		);
 
 		yield* Effect.addFinalizer(() =>
 			SubscriptionRef.get(state).pipe(
@@ -52,7 +66,7 @@ export const CounterLive = Counter.toLayer(
 					),
 				),
 			),
-		)
+		);
 
 		// --- Message processing (not yet implemented) ---
 		// Pull-based: the actor controls when to take the next message.
@@ -64,13 +78,13 @@ export const CounterLive = Counter.toLayer(
 		// 	yield* Match.value(msg).pipe(
 		// 		Match.tag("Reset", () =>
 		// 			Effect.gen(function* () {
-		// 				yield* PersistedSubscriptionRef.set(state, { count: 0 })
+		// 				yield* SubscriptionRef.set(state, 0)
 		// 				yield* PubSub.publish(events.countChanged, 0)
 		// 			})
 		// 		),
 		// 		Match.tag("IncrementBy", ({ payload, complete }) =>
 		// 			Effect.gen(function* () {
-		// 				const next = yield* PersistedSubscriptionRef.updateAndGet(
+		// 				const next = yield* SubscriptionRef.updateAndGet(
 		// 					state,
 		// 					(s) => ({ count: s.count + payload.amount }),
 		// 				)
@@ -89,19 +103,20 @@ export const CounterLive = Counter.toLayer(
 					const { count: next } = yield* SubscriptionRef.updateAndGet(
 						state,
 						(s) => ({ count: s.count + payload.amount }),
-					)
+					);
 					if (next > 20) {
 						return yield* new CounterOverflowError({
 							limit: 20,
 							message: `count ${next} would exceed limit 20`,
-						})
+						});
 					}
 					// yield* PubSub.publish(events.countChanged, next)
-					return next
+					return next;
 				}),
 
 			GetCount: () =>
 				SubscriptionRef.get(state).pipe(Effect.map((s) => s.count)),
-		})
+		});
 	}),
-)
+	{ state: CounterState },
+);

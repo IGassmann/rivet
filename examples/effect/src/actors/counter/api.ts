@@ -1,4 +1,4 @@
-import { Effect, Schema } from "effect"
+import { Schema } from "effect"
 import { Actor, Action } from "@rivetkit/effect"
 
 // --- Errors ---
@@ -57,14 +57,11 @@ export const GetCount = Action.make("GetCount", {
 // --- Actor Definition ---
 
 // The definition is the actor's public contract. It carries no
-// implementation. Both server and client code import this;
-// the implementation stays server-only.
+// implementation and no persisted-state schema (state is server-only,
+// configured via `ActorState.make` + `toLayer({ state })` in `live.ts`).
+// Both server and client code import this; the implementation stays
+// server-only.
 export const Counter = Actor.make("Counter", {
-	state: Schema.Struct({
-		count: Schema.Number.pipe(
-			Schema.withConstructorDefault(Effect.succeed(0)),
-		),
-	}),
 	actions: [Increment, GetCount],
 	// messages: [Reset, IncrementBy],	// durable, queued, background
 	// events: { countChanged: Schema.Number },
