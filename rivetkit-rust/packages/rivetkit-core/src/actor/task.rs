@@ -37,6 +37,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures::FutureExt;
@@ -44,26 +45,28 @@ use futures::FutureExt;
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::{JoinError, JoinHandle};
-use tokio::time::{Duration, Instant, sleep_until, timeout};
-use tracing::Instrument;
+use tracing::{Instrument, instrument::WithSubscriber};
 
 use crate::actor::action::ActionDispatchError;
 use crate::actor::connection::ConnHandle;
 use crate::actor::context::ActorContext;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::actor::diagnostics::record_actor_warning;
 use crate::actor::factory::ActorFactory;
+use crate::actor::keys::{LAST_PUSHED_ALARM_KEY, PERSIST_DATA_KEY};
 use crate::actor::lifecycle_hooks::{ActorEvents, ActorStart, Reply};
 use crate::actor::messages::{
 	ActorEvent, QueueSendResult, Request, Response, SerializeStateReason, StateDelta,
 };
 use crate::actor::metrics::ActorMetrics;
 use crate::actor::preload::{PreloadedKv, PreloadedPersistedActor};
-use crate::actor::state::{
-	LAST_PUSHED_ALARM_KEY, PERSIST_DATA_KEY, PersistedActor, decode_last_pushed_alarm,
-	decode_persisted_actor,
-};
+use crate::actor::state::{PersistedActor, decode_last_pushed_alarm, decode_persisted_actor};
 use crate::actor::task_types::ShutdownKind;
 use crate::error::{ActorLifecycle as ActorLifecycleError, ActorRuntime};
+use crate::runtime::RuntimeSpawner;
+#[cfg(test)]
+use crate::time::sleep;
+use crate::time::{Instant, sleep_until, timeout};
 use crate::types::{SaveStateOpts, format_actor_key};
 use crate::websocket::WebSocket;
 
@@ -209,39 +212,53 @@ pub(crate) fn actor_channel_overloaded_error(
 			_ => {}
 		}
 	}
-	if let Some(metrics) = metrics {
-		if let Some(suppression) =
-			record_actor_warning(metrics.actor_id(), "actor_channel_overloaded")
-		{
+	#[cfg(not(target_arch = "wasm32"))]
+	{
+		if let Some(metrics) = metrics {
+			if let Some(suppression) =
+				record_actor_warning(metrics.actor_id(), "actor_channel_overloaded")
+			{
+				tracing::warn!(
+					actor_id = %suppression.actor_id,
+					channel,
+					capacity,
+					operation,
+					event = if channel == LIFECYCLE_EVENT_INBOX_CHANNEL {
+						operation
+					} else {
+						""
+					},
+					per_actor_suppressed = suppression.per_actor_suppressed,
+					global_suppressed = suppression.global_suppressed,
+					"actor bounded channel overloaded"
+				);
+			}
+		} else {
 			tracing::warn!(
-				actor_id = %suppression.actor_id,
 				channel,
 				capacity,
 				operation,
-				event = if channel == LIFECYCLE_EVENT_INBOX_CHANNEL {
-					operation
-				} else {
-					""
-				},
-				per_actor_suppressed = suppression.per_actor_suppressed,
-				global_suppressed = suppression.global_suppressed,
 				"actor bounded channel overloaded"
 			);
 		}
-	} else {
-		tracing::warn!(
-			channel,
+	}
+	#[cfg(target_arch = "wasm32")]
+	{
+		let _ = metrics;
+		anyhow!(
+			"actor bounded channel overloaded: channel={channel}, capacity={capacity}, operation={operation}"
+		)
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	{
+		ActorLifecycleError::Overloaded {
+			channel: channel.to_owned(),
 			capacity,
-			operation,
-			"actor bounded channel overloaded"
-		);
+			operation: operation.to_owned(),
+		}
+		.build()
 	}
-	ActorLifecycleError::Overloaded {
-		channel: channel.to_owned(),
-		capacity,
-		operation: operation.to_owned(),
-	}
-	.build()
 }
 
 pub(crate) fn try_send_lifecycle_command(
@@ -283,6 +300,7 @@ pub enum DispatchCommand {
 		reply: oneshot::Sender<HttpDispatchResult>,
 	},
 	OpenWebSocket {
+		conn: ConnHandle,
 		ws: WebSocket,
 		request: Option<Request>,
 		reply: oneshot::Sender<Result<()>>,
@@ -868,21 +886,20 @@ impl ActorTask {
 	fn core_dispatched_hook_reply(&self, operation: &'static str) -> Reply<()> {
 		let (tx, rx) = oneshot::channel();
 		let ctx = self.ctx.clone();
-		tokio::spawn(
-			async move {
-				match rx.await {
-					Ok(Ok(())) => {}
-					Ok(Err(error)) => {
-						tracing::error!(?error, operation, "core dispatched hook failed");
-					}
-					Err(error) => {
-						tracing::error!(?error, operation, "core dispatched hook reply dropped");
-					}
+		let task = async move {
+			match rx.await {
+				Ok(Ok(())) => {}
+				Ok(Err(error)) => {
+					tracing::error!(?error, operation, "core dispatched hook failed");
 				}
-				ctx.mark_core_dispatched_hook_completed();
+				Err(error) => {
+					tracing::error!(?error, operation, "core dispatched hook reply dropped");
+				}
 			}
-			.in_current_span(),
-		);
+			ctx.mark_core_dispatched_hook_completed();
+		}
+		.in_current_span();
+		RuntimeSpawner::spawn(task);
 		tx.into()
 	}
 
@@ -953,7 +970,13 @@ impl ActorTask {
 						);
 						self.log_dispatch_command_handled(command_kind, "enqueued");
 						let actor_id = self.ctx.actor_id().to_owned();
+						let action_keep_awake = self
+							.ctx
+							.internal_keep_awake_region()
+							.with_log_fields("dispatch_action", Some(actor_id.clone()));
+						self.ctx.reset_sleep_timer();
 						self.ctx.wait_until(async move {
+							let _action_keep_awake = action_keep_awake;
 							match tracked_reply_rx.await {
 								Ok(result) => {
 									tracing::info!(
@@ -1031,10 +1054,16 @@ impl ActorTask {
 					}
 				}
 			}
-			DispatchCommand::OpenWebSocket { ws, request, reply } => {
+			DispatchCommand::OpenWebSocket {
+				conn,
+				ws,
+				request,
+				reply,
+			} => {
 				match self.send_actor_event(
 					"dispatch_websocket_open",
 					ActorEvent::WebSocketOpen {
+						conn,
 						ws,
 						request,
 						reply: Reply::from(reply),
@@ -1131,11 +1160,15 @@ impl ActorTask {
 	}
 
 	fn dispatch_lifecycle_error(&self) -> Option<anyhow::Error> {
+		// TODO: Share admission policy with RegistryDispatcher::active_actor.
+		if self.ctx.destroy_requested() {
+			self.ctx.warn_work_sent_to_stopping_instance("dispatch");
+			return Some(ActorLifecycleError::Destroying.build());
+		}
+
 		match self.lifecycle {
-			LifecycleState::Started => None,
-			LifecycleState::SleepGrace
-			| LifecycleState::SleepFinalize
-			| LifecycleState::DestroyGrace => {
+			LifecycleState::Started | LifecycleState::SleepGrace => None,
+			LifecycleState::SleepFinalize | LifecycleState::DestroyGrace => {
 				self.ctx.warn_work_sent_to_stopping_instance("dispatch");
 				Some(ActorLifecycleError::Stopping.build())
 			}
@@ -1172,15 +1205,23 @@ impl ActorTask {
 		let is_new = !persisted.actor.has_initialized;
 		self.ctx.load_persisted_actor(persisted.actor);
 		self.ctx.load_last_pushed_alarm(persisted.last_pushed_alarm);
-		self.ctx.set_has_initialized(true);
-		self.ctx
-			.persist_state(SaveStateOpts { immediate: true })
-			.await
-			.context("persist actor initialization")?;
+		// New manual-startup runtimes must not persist initialization until the
+		// runtime startup_ready handshake completes. The runtime preamble owns
+		// initial state creation.
+		if !is_new || !self.factory.requires_manual_startup_ready() {
+			self.ctx.set_has_initialized(true);
+			self.ctx
+				.persist_state(SaveStateOpts { immediate: true })
+				.await
+				.context("persist actor initialization")?;
+		}
 		let init_inspector_token_started_at = Instant::now();
-		crate::inspector::init_inspector_token(&self.ctx)
-			.await
-			.context("initialize inspector token")?;
+		crate::inspector::auth::init_inspector_token_with_preload(
+			&self.ctx,
+			self.preloaded_kv.as_ref(),
+		)
+		.await
+		.context("initialize inspector token")?;
 		tracing::debug!(
 			actor_id = %actor_id,
 			duration_ms = duration_ms_f64(init_inspector_token_started_at.elapsed()),
@@ -1197,6 +1238,18 @@ impl ActorTask {
 
 		self.transition_to(LifecycleState::Started);
 		self.spawn_run_handle(is_new).await?;
+		if is_new {
+			// Manual-startup runtimes usually mark initialization during their
+			// preamble. This is the fallback for runtimes that completed startup
+			// without doing so.
+			if !self.ctx.persisted_actor().has_initialized {
+				self.ctx.set_has_initialized(true);
+			}
+			self.ctx
+				.persist_state(SaveStateOpts { immediate: true })
+				.await
+				.context("persist actor startup state")?;
+		}
 		self.reset_sleep_deadline().await;
 		self.ctx.drain_overdue_scheduled_events().await?;
 		tracing::debug!(
@@ -1211,9 +1264,10 @@ impl ActorTask {
 	async fn load_persisted_startup(&mut self) -> Result<PersistedStartup> {
 		match std::mem::take(&mut self.preload_persisted_actor) {
 			PreloadedPersistedActor::Some(preloaded) => {
+				let last_pushed_alarm = self.load_startup_last_pushed_alarm().await?;
 				return Ok(PersistedStartup {
 					actor: preloaded,
-					last_pushed_alarm: Self::load_last_pushed_alarm(self.ctx.kv().clone()).await?,
+					last_pushed_alarm,
 				});
 			}
 			PreloadedPersistedActor::BundleExistsButEmpty => {
@@ -1226,6 +1280,16 @@ impl ActorTask {
 				});
 			}
 			PreloadedPersistedActor::NoBundle => {}
+		}
+
+		if self.preloaded_kv.is_some() {
+			let actor = self
+				.decode_persisted_actor_startup(self.load_startup_key(PERSIST_DATA_KEY).await?)?;
+			let last_pushed_alarm = self.load_startup_last_pushed_alarm().await?;
+			return Ok(PersistedStartup {
+				actor,
+				last_pushed_alarm,
+			});
 		}
 
 		let mut values = self
@@ -1258,14 +1322,41 @@ impl ActorTask {
 		})
 	}
 
-	async fn load_last_pushed_alarm(kv: crate::kv::Kv) -> Result<Option<i64>> {
-		kv.get(LAST_PUSHED_ALARM_KEY)
+	async fn load_startup_key(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+		if let Some(entry) = self
+			.preloaded_kv
+			.as_ref()
+			.and_then(|preloaded| preloaded.key_entry(key))
+		{
+			return Ok(entry);
+		}
+
+		self.ctx
+			.kv()
+			.get(key)
 			.await
-			.context("load persisted last pushed alarm")?
+			.context("load persisted actor startup key")
+	}
+
+	async fn load_startup_last_pushed_alarm(&self) -> Result<Option<i64>> {
+		self.load_startup_key(LAST_PUSHED_ALARM_KEY)
+			.await?
 			.map(|bytes| decode_last_pushed_alarm(&bytes))
 			.transpose()
 			.context("decode persisted last pushed alarm")
 			.map(Option::flatten)
+	}
+
+	fn decode_persisted_actor_startup(&self, encoded: Option<Vec<u8>>) -> Result<PersistedActor> {
+		match encoded {
+			Some(bytes) => {
+				decode_persisted_actor(&bytes).context("decode persisted actor startup data")
+			}
+			None => Ok(PersistedActor {
+				input: self.start_input.clone(),
+				..PersistedActor::default()
+			}),
+		}
 	}
 
 	fn ensure_actor_event_channel(&mut self) {
@@ -1310,7 +1401,8 @@ impl ActorTask {
 			startup_ready: startup_ready_tx,
 		};
 		let factory = self.factory.clone();
-		self.run_handle = Some(tokio::spawn(
+		let run_dispatch = tracing::dispatcher::get_default(Clone::clone);
+		self.run_handle = Some(RuntimeSpawner::spawn(
 			async move {
 				match AssertUnwindSafe(factory.start(start)).catch_unwind().await {
 					Ok(result) => result,
@@ -1320,7 +1412,8 @@ impl ActorTask {
 					.build()),
 				}
 			}
-			.in_current_span(),
+			.in_current_span()
+			.with_subscriber(run_dispatch),
 		));
 		if let Some(startup_ready_rx) = startup_ready_rx {
 			startup_ready_rx
@@ -1398,7 +1491,7 @@ impl ActorTask {
 		let clean_exit = match outcome {
 			Ok(Ok(())) => true,
 			Ok(Err(error)) => {
-				tracing::error!(?error, "actor run handler failed");
+				log_actor_error(&error, "actor run handler failed");
 				false
 			}
 			Err(error) => {
@@ -1446,7 +1539,7 @@ impl ActorTask {
 		let grace_period = self.factory.config().effective_sleep_grace_period();
 		self.sleep_deadline = None;
 		self.ctx.cancel_sleep_timer();
-		self.ctx.cancel_abort_signal_for_sleep();
+		self.ctx.cancel_actor_abort_signal();
 		self.sleep_grace = Some(SleepGraceState {
 			deadline: Instant::now() + grace_period,
 			reason,
@@ -1484,7 +1577,7 @@ impl ActorTask {
 		let Some(grace) = self.sleep_grace.as_ref() else {
 			return None;
 		};
-		if self.ctx.can_finalize_sleep() {
+		if self.ctx.can_finalize_shutdown(grace.reason) {
 			let reason = grace.reason;
 			self.sleep_grace = None;
 			return Some(LiveExit::Shutdown { reason });
@@ -1500,6 +1593,10 @@ impl ActorTask {
 			run_handle.abort();
 		}
 		self.ctx.cancel_shutdown_deadline();
+		// The deadline changes teardown from graceful draining to cancellation.
+		// Without this marker, final cleanup would wait on work that already
+		// exhausted its grace budget.
+		self.ctx.mark_shutdown_deadline_reached();
 		self.ctx.record_shutdown_timeout(grace.reason);
 		tracing::warn!(
 			actor_id = %self.ctx.actor_id(),
@@ -1529,7 +1626,7 @@ impl ActorTask {
 		match (&mut run_handle).await {
 			Ok(Ok(())) => {}
 			Ok(Err(error)) => {
-				tracing::error!(?error, "actor run handler failed during shutdown");
+				log_actor_error(&error, "actor run handler failed during shutdown");
 			}
 			Err(error) => {
 				if !error.is_cancelled() {
@@ -1559,7 +1656,7 @@ impl ActorTask {
 		let started_at = Instant::now();
 		tokio::select! {
 			result = ctx.wait_for_shutdown_tasks(deadline) => result,
-			_ = tokio::time::sleep(LONG_SHUTDOWN_DRAIN_WARNING_THRESHOLD) => {
+			_ = sleep(LONG_SHUTDOWN_DRAIN_WARNING_THRESHOLD) => {
 				if ctx.wait_for_shutdown_tasks(Instant::now()).await {
 					true
 				} else {
@@ -1657,15 +1754,18 @@ impl ActorTask {
 			ShutdownKind::Sleep => LifecycleState::SleepFinalize,
 			ShutdownKind::Destroy => LifecycleState::Destroying,
 		});
-		self.save_final_state().await?;
-		self.close_actor_event_channel();
-		self.join_aborted_run_handle().await;
-		Self::finish_shutdown_cleanup_with_ctx(self.ctx.clone(), reason).await?;
-		if matches!(reason, ShutdownKind::Destroy) {
+		let result: Result<()> = async {
+			self.save_final_state().await?;
+			self.close_actor_event_channel();
+			self.join_aborted_run_handle().await;
+			Self::finish_shutdown_cleanup_with_ctx(self.ctx.clone(), reason).await
+		}
+		.await;
+		if result.is_ok() && matches!(reason, ShutdownKind::Destroy) {
 			self.ctx.mark_destroy_completed();
 		}
 		self.ctx.record_shutdown_wait(reason, started_at.elapsed());
-		Ok(())
+		result
 	}
 
 	async fn save_final_state(&mut self) -> Result<()> {
@@ -1750,6 +1850,7 @@ impl ActorTask {
 			.cleanup()
 			.await
 			.with_context(|| format!("cleanup sqlite during {reason_label} shutdown"))?;
+		trim_native_allocator_after_shutdown(&actor_id, reason_label);
 		tracing::debug!(
 			actor_id = %actor_id,
 			reason = reason_label,
@@ -2107,8 +2208,16 @@ impl ActorTask {
 			"actor lifecycle transition"
 		);
 		self.lifecycle = lifecycle;
-		self.ctx
-			.set_started(matches!(lifecycle, LifecycleState::Started));
+		if matches!(lifecycle, LifecycleState::Started) {
+			// A restarted actor is a new generation. Clear shutdown state that was
+			// only meant to stop the previous generation.
+			self.ctx.reset_abort_signal_for_start();
+			self.ctx.clear_sleep_requested();
+		}
+		self.ctx.set_started(matches!(
+			lifecycle,
+			LifecycleState::Started | LifecycleState::SleepGrace
+		));
 	}
 }
 
@@ -2119,6 +2228,24 @@ fn shutdown_reason_label(reason: ShutdownKind) -> &'static str {
 	}
 }
 
+#[cfg(all(unix, target_env = "gnu"))]
+fn trim_native_allocator_after_shutdown(actor_id: &str, reason: &str) {
+	unsafe extern "C" {
+		fn malloc_trim(pad: usize) -> i32;
+	}
+
+	let rc = unsafe { malloc_trim(0) };
+	tracing::debug!(
+		actor_id,
+		reason,
+		rc,
+		"trimmed native allocator after actor shutdown"
+	);
+}
+
+#[cfg(not(all(unix, target_env = "gnu")))]
+fn trim_native_allocator_after_shutdown(_actor_id: &str, _reason: &str) {}
+
 fn clone_shutdown_result(result: &Result<()>) -> Result<()> {
 	match result {
 		Ok(()) => Ok(()),
@@ -2127,6 +2254,18 @@ fn clone_shutdown_result(result: &Result<()>) -> Result<()> {
 			Err(anyhow::Error::new(error))
 		}
 	}
+}
+
+fn log_actor_error(error: &anyhow::Error, log_message: &'static str) {
+	let structured = rivet_error::RivetError::extract(error);
+	tracing::error!(
+		?error,
+		group = structured.group(),
+		code = structured.code(),
+		message = %structured.message(),
+		metadata = ?structured.metadata(),
+		"{log_message}"
+	);
 }
 
 fn result_outcome<T>(result: &Result<T>) -> &'static str {

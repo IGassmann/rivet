@@ -2,17 +2,16 @@
 # Publish
 # =============================================================================
 #
-# Single workflow for preview publish (PRs + main pushes) AND release cuts
-# (workflow_dispatch). The build, npm publish, R2 upload, and Docker manifest
-# steps run identically for all three triggers. Only the npm dist-tag,
+# Single workflow for preview publish AND release cuts. Both triggers are
+# manual (workflow_dispatch). The build, npm publish, R2 upload, and Docker
+# manifest steps run identically for both modes. Only the npm dist-tag,
 # release-specific retagging, git tag, and GitHub release differ.
 #
 # Triggers and mapping:
-#   pull_request      → trigger=pr      npm_tag=pr-N   build_mode=debug
-#   push: main        → trigger=main    npm_tag=main   build_mode=debug
-#   workflow_dispatch → trigger=release npm_tag=latest build_mode=release
-#                       (npm_tag becomes `rc` if version contains `-rc.`, or
-#                        `next` if `latest=false`)
+#   workflow_dispatch (no version)   → trigger=branch  npm_tag=<sanitized branch>  build_mode=debug
+#   workflow_dispatch (with version) → trigger=release npm_tag=latest              build_mode=release
+#                                       (npm_tag becomes `rc` if version contains `-rc.`, or
+#                                        `next` if `latest=false`)
 #
 # See .agent/specs/publish-flow-unification.md for the design.
 # ============================================================================
@@ -20,18 +19,14 @@
 name: publish
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release (e.g. 2.5.0 or 2.5.0-rc.1)"
-        required: true
+        description: "Version to release (e.g. 2.5.0 or 2.5.0-rc.1). Leave empty for preview publish on the dispatched branch."
+        required: false
         type: string
       latest:
-        description: "Tag as @latest"
+        description: "Tag as @latest (release only)"
         required: true
         type: boolean
         default: true
@@ -53,8 +48,6 @@ jobs:
       npm_tag: ${{ steps.ctx.outputs.npm_tag }}
       sha: ${{ steps.ctx.outputs.sha }}
       latest: ${{ steps.ctx.outputs.latest }}
-      pr_number: ${{ steps.ctx.outputs.pr_number }}
-      is_fork: ${{ steps.fork.outputs.is_fork }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -69,22 +62,13 @@ jobs:
       - id: ctx
         name: Resolve publish context
         run: pnpm --filter=publish exec tsx src/ci/bin.ts context-output
-      - name: Compute is_fork flag
-        id: fork
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
-            echo "is_fork=true" >> $GITHUB_OUTPUT
-          else
-            echo "is_fork=false" >> $GITHUB_OUTPUT
-          fi
 
   # ---------------------------------------------------------------------------
-  # build — matrix of 10 native/engine artifacts (11 on release for Windows)
+  # build — matrix of native/engine artifacts
   # ---------------------------------------------------------------------------
   build:
     needs: [context]
     name: "Build ${{ matrix.name }}"
-    if: needs.context.outputs.is_fork != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -215,7 +199,7 @@ jobs:
             --secret id=DEPOT_TOKEN,env=DEPOT_TOKEN \
             --build-arg BUILD_TARGET=${{ matrix.build_target }} \
             --build-arg BUILD_MODE=${{ steps.mode.outputs.build_mode }} \
-            --build-arg BUILD_FRONTEND=false \
+            --build-arg BUILD_FRONTEND=${{ matrix.build_target == 'engine' && 'true' || 'false' }} \
             -f ${{ matrix.docker }} \
             -t builder-${{ matrix.build_target }}-${{ matrix.platform }} \
             --load \
@@ -233,12 +217,49 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
+  # build-wasm — wasm package artifact built in parallel with native artifacts
+  # ---------------------------------------------------------------------------
+  build-wasm:
+    needs: [context]
+    name: "Build rivetkit-wasm"
+    runs-on: depot-ubuntu-24.04-8
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: ${{ needs.context.outputs.trigger == 'release' }}
+      - run: corepack enable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: wasm32-unknown-unknown
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rivetkit-wasm-publish"
+          cache-on-failure: true
+      - name: Install wasm package dependencies
+        run: pnpm install --frozen-lockfile --filter=@rivetkit/rivetkit-wasm
+      - name: Build wasm package
+        run: pnpm --filter=@rivetkit/rivetkit-wasm build
+      - name: Upload wasm package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-package
+          path: rivetkit-typescript/packages/rivetkit-wasm/pkg
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
   # docker-images — per-arch runtime images pushed to Docker Hub
   # ---------------------------------------------------------------------------
   docker-images:
     needs: [context]
     name: "Docker ${{ matrix.arch_suffix }}"
-    if: needs.context.outputs.is_fork != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -262,7 +283,7 @@ jobs:
             echo "build_frontend=true" >> $GITHUB_OUTPUT
           else
             echo "cargo_build_mode=debug" >> $GITHUB_OUTPUT
-            echo "build_frontend=false" >> $GITHUB_OUTPUT
+            echo "build_frontend=true" >> $GITHUB_OUTPUT
           fi
       - uses: ./.github/actions/docker-setup
         with:
@@ -298,12 +319,12 @@ jobs:
   # publish — npm publish + R2 upload + Docker manifest + release tail
   # ---------------------------------------------------------------------------
   publish:
-    needs: [context, build, docker-images]
+    needs: [context, build, build-wasm, docker-images]
     name: "Publish"
     if: |
       !cancelled() &&
-      needs.context.outputs.is_fork != 'true' &&
       needs.build.result == 'success' &&
+      needs.build-wasm.result == 'success' &&
       needs.docker-images.result == 'success'
     runs-on: depot-ubuntu-24.04-8
     permissions:
@@ -343,6 +364,16 @@ jobs:
           path: engine-artifacts
           pattern: engine-*
           merge-multiple: true
+      - name: Download wasm package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-package
+          path: rivetkit-typescript/packages/rivetkit-wasm/pkg
+      - name: Validate wasm package artifact
+        run: |
+          test -f rivetkit-typescript/packages/rivetkit-wasm/pkg/rivetkit_wasm.js
+          test -f rivetkit-typescript/packages/rivetkit-wasm/pkg/rivetkit_wasm.d.ts
+          test -f rivetkit-typescript/packages/rivetkit-wasm/pkg/rivetkit_wasm_bg.wasm
 
       - name: Place native binaries in platform packages
         run: |
@@ -397,7 +428,9 @@ jobs:
 
       # ---- build TypeScript packages (turbo dep graph picks up native) ----
       - name: Build TypeScript packages
-        run: pnpm build -F rivetkit -F '@rivetkit/*' -F '!@rivetkit/shared-data' -F '!@rivetkit/engine-frontend' -F '!@rivetkit/mcp-hub' -F '!@rivetkit/rivetkit-napi'
+        env:
+          SKIP_WASM_BUILD: "1"
+        run: pnpm build -F rivetkit -F '@rivetkit/*' -F '!@rivetkit/shared-data' -F '!@rivetkit/engine-frontend' -F '!@rivetkit/mcp-hub' -F '!@rivetkit/rivetkit-napi' -F '!@rivetkit/rivetkit-wasm'
 
       # ---- shared publish (runs for all triggers) ----
       - name: Finalize package versions for publish
@@ -478,15 +511,3 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: pnpm --filter=publish exec tsx src/ci/bin.ts gh-release --version ${{ needs.context.outputs.version }}
-
-      # ---- preview-only tail ----
-      - name: Comment on PR
-        if: needs.context.outputs.trigger == 'pr'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: |
-          pnpm --filter=publish exec tsx src/ci/bin.ts comment-pr \
-            --pr-number ${{ needs.context.outputs.pr_number }} \
-            --version ${{ needs.context.outputs.version }} \
-            --tag ${{ needs.context.outputs.npm_tag }}

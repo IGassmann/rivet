@@ -145,7 +145,7 @@ export const workflowNestedLoopActor = actor({
 		getState: (c) => c.state,
 	},
 	options: {
-		sleepTimeout: 50,
+		sleepTimeout: 1000,
 	},
 });
 
@@ -294,7 +294,7 @@ export const workflowSpawnChildActor = actor({
 		getState: (c) => c.state,
 	},
 	options: {
-		sleepTimeout: 50,
+		sleepTimeout: 1000,
 	},
 });
 

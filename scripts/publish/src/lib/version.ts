@@ -165,12 +165,6 @@ export async function updateSourceFiles(
 			find: /([ \t]*)\[workspace\.package\]\n\1version = ".*"/,
 			replace: `$1[workspace.package]\n$1version = "${version}"`,
 		},
-		{
-			path: "rivetkit-typescript/packages/sqlite-native/Cargo.toml",
-			find: /^version = ".*"/m,
-			replace: `version = "${version}"`,
-			required: false,
-		},
 		// Example dependency specs — examples pin rivetkit / @rivetkit/*.
 		// Root package.json resolutions override these in development, but
 		// released examples shipped to users should carry the new version.

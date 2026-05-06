@@ -17,7 +17,11 @@ impl RegistryDispatcher {
 
 		let original_path = request.path.clone();
 		let request = build_http_request(request).await?;
-		let route = RegistryHttpRoute::from_paths(&original_path, request.uri().path())?;
+		let route = RegistryHttpRoute::from_paths(
+			&original_path,
+			request.uri().path(),
+			self.handle_inspector_http_in_runtime,
+		)?;
 		let instance = match self.active_actor(actor_id).await {
 			Ok(instance) => instance,
 			Err(error) => {
@@ -104,6 +108,7 @@ impl RegistryDispatcher {
 			FrameworkHttpRoute::Metadata => handle_metadata_fetch(&request),
 			FrameworkHttpRoute::Health => handle_health_fetch(&request),
 			FrameworkHttpRoute::Root => handle_root_fetch(&request),
+			FrameworkHttpRoute::NotFound => handle_not_found_fetch(&request),
 		}
 	}
 
@@ -388,12 +393,19 @@ enum RegistryHttpRoute {
 }
 
 impl RegistryHttpRoute {
-	fn from_paths(original_path: &str, normalized_path: &str) -> Result<Self> {
+	fn from_paths(
+		original_path: &str,
+		normalized_path: &str,
+		handle_inspector_http_in_runtime: bool,
+	) -> Result<Self> {
 		if let Some(stripped) = original_path.strip_prefix("/request") {
 			if stripped.is_empty() || matches!(stripped.as_bytes().first(), Some(b'/') | Some(b'?'))
 			{
 				return Ok(Self::UserRawRequest);
 			}
+		}
+		if handle_inspector_http_in_runtime && normalized_path.starts_with("/inspector/") {
+			return Ok(Self::UserRawRequest);
 		}
 
 		if let Some(segment) = single_path_segment(normalized_path, "/action/") {
@@ -411,7 +423,7 @@ impl RegistryHttpRoute {
 			"/metadata" => Ok(Self::Framework(FrameworkHttpRoute::Metadata)),
 			"/health" => Ok(Self::Framework(FrameworkHttpRoute::Health)),
 			"/" => Ok(Self::Framework(FrameworkHttpRoute::Root)),
-			_ => Ok(Self::UserRawRequest),
+			_ => Ok(Self::Framework(FrameworkHttpRoute::NotFound)),
 		}
 	}
 }
@@ -422,6 +434,7 @@ pub(super) enum FrameworkHttpRoute {
 	Metadata,
 	Health,
 	Root,
+	NotFound,
 }
 
 pub(super) struct DecodedHttpQueueRequest {
@@ -463,6 +476,19 @@ fn handle_root_fetch(request: &Request) -> Result<HttpResponse> {
 	text_response(
 		StatusCode::OK,
 		"This is an RivetKit actor.\n\nLearn more at https://rivetkit.org",
+	)
+}
+
+fn handle_not_found_fetch(request: &Request) -> Result<HttpResponse> {
+	let encoding = request_encoding(request.headers());
+	message_boundary_error_response(
+		encoding,
+		framework_error_status("actor", "not_found"),
+		ActorRuntime::NotFound {
+			resource: "route".to_owned(),
+			id: request.uri().path().to_owned(),
+		}
+		.build(),
 	)
 }
 
@@ -584,16 +610,6 @@ pub(super) async fn build_http_request(request: HttpRequest) -> Result<Request> 
 		.with_context(|| format!("build actor request for `{}`", request.path))
 }
 
-pub(super) fn is_actor_request_path(path: &str) -> bool {
-	let Some(stripped) = path.strip_prefix("/request") else {
-		return false;
-	};
-	if stripped.is_empty() {
-		return true;
-	}
-	matches!(stripped.as_bytes().first(), Some(b'/') | Some(b'?'))
-}
-
 pub(super) fn normalize_actor_request_path(path: &str) -> String {
 	let Some(stripped) = path.strip_prefix("/request") else {
 		return path.to_owned();
@@ -607,6 +623,19 @@ pub(super) fn normalize_actor_request_path(path: &str) -> String {
 		Some(b'/') | Some(b'?') => stripped.to_owned(),
 		_ => path.to_owned(),
 	}
+}
+
+#[cfg(test)]
+pub(super) fn is_actor_request_path(path: &str) -> bool {
+	let Some(stripped) = path.strip_prefix("/request") else {
+		return false;
+	};
+
+	stripped.is_empty()
+		|| stripped
+			.as_bytes()
+			.first()
+			.is_some_and(|byte| matches!(byte, b'/' | b'?'))
 }
 
 pub(super) fn build_envoy_response(response: Response) -> Result<HttpResponse> {
@@ -892,6 +921,7 @@ pub(super) fn framework_error_status(group: &str, code: &str) -> StatusCode {
 	match (group, code) {
 		("auth", "forbidden") => StatusCode::FORBIDDEN,
 		("actor", "action_not_found") => StatusCode::NOT_FOUND,
+		("actor", "not_found") => StatusCode::NOT_FOUND,
 		("actor", "action_timed_out") => StatusCode::REQUEST_TIMEOUT,
 		("actor", "invalid_request") => StatusCode::BAD_REQUEST,
 		("actor", "method_not_allowed") => StatusCode::METHOD_NOT_ALLOWED,

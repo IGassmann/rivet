@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use crate::utils::sleep;
+
 /// Debug-only wrapper around an `mpsc::UnboundedReceiver` that injects configurable
 /// latency on each receive. Used for testing reconnection behavior under latency.
 pub struct LatencyReceiver<T> {
@@ -20,7 +22,7 @@ impl<T> LatencyReceiver<T> {
 	pub async fn recv(&mut self) -> Option<T> {
 		let item = self.rx.recv().await?;
 		if let Some(latency) = self.latency {
-			tokio::time::sleep(latency).await;
+			sleep(latency).await;
 		}
 		Some(item)
 	}

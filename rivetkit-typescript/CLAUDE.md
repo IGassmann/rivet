@@ -12,6 +12,18 @@
 - Core drivers must remain SQLite-agnostic. Any SQLite-specific wiring belongs behind the native database provider boundary.
 - Before deleting a `rivetkit/*` package export, grep `examples/`, `website/`, and `frontend/` for self-imports. Those consumers are part of the supported package surface on this branch.
 
+## Runtime Boundary
+
+- Select runtime behavior from `CoreRuntime.kind`, not `instanceof` adapter classes; NAPI maps to the native runtime kind and wasm maps to wasm.
+- Keep `CoreRuntime` SQL methods on the portable `RuntimeSql*` structs from `packages/rivetkit/src/registry/runtime.ts`; NAPI-only `Buffer` conversion belongs inside `NapiCoreRuntime`.
+- Keep `RuntimeSqlBindParam` variants exact and `RuntimeSqlExecuteResult.route` limited to `read`, `write`, or `writeFallback`; normalize generated adapter output before returning it.
+- Keep `CoreRuntime` byte payloads on `RuntimeBytes`/`Uint8Array`; NAPI-only `Buffer` conversion belongs inside `NapiCoreRuntime`.
+- Shared actor glue in `packages/rivetkit/src/registry/native.ts` should construct `RuntimeBytes`/`Uint8Array`; leave `Buffer` creation to `NapiCoreRuntime`.
+- Wasm bindings for NAPI-supported runtime APIs should forward to `rivetkit-core`; avoid placeholder returns that break runtime parity.
+- Wasm `registerTask` must forward to core `ActorContext::register_task(...)`, not `waitUntil`, so shutdown-drain semantics match NAPI without conflating public `waitUntil` work.
+- Bridge error HTTP status promotion belongs in `rivetkit-core`; TS native/wasm runtime adapters should decode encoded status fields instead of maintaining promotion tables.
+- Use public `sqlite` config for runtime SQLite backend selection; wasm defaults unset SQLite to remote and must reject local before runtime construction.
+
 ## Native SQLite v2
 
 - If `packages/rivetkit` still needs a BARE codec after schema-generator removal, vendor only the live generated modules under `src/common/bare/` and import them from source instead of `dist/schemas/**`.
@@ -98,6 +110,7 @@ The log name matches the key in `ActorMetrics.startup`. Internal phases use `per
 ## Sleep Shutdown
 
 - Sleep shutdown should wait for in-flight HTTP action work and pending disconnect callbacks before `onSleep`, but should not block on open hibernatable connections alone because existing connection actions may still complete during the graceful shutdown window.
+- Driver tests that wait for a target actor to sleep should record lifecycle events into a separate observer actor; do not poll target actions or hold a normal target connection open while waiting.
 
 ## Drizzle Compatibility Testing
 
@@ -111,9 +124,31 @@ cd rivetkit-typescript/packages/rivetkit
 
 The script installs each drizzle-orm version, typechecks `scripts/drizzle-compat-smoke.ts` against the `rivetkit/db/drizzle` public surface, and reports pass/fail per version. It restores the original package.json and lockfile on exit. Update the `DEFAULT_VERSIONS` array in the script when adding support for new drizzle releases.
 
+## Test Harness
+
+- Shared local `rivet-engine` lifecycle for TypeScript tests lives in `packages/rivetkit/tests/shared-engine.ts`; driver and platform tests should reuse it instead of launching a separate engine.
+- Runtime parity tests can instantiate `NapiCoreRuntime` and `WasmCoreRuntime` with fake binding classes, then drive shared actor glue through `buildNativeFactory(...)` without requiring generated NAPI or wasm artifacts.
+- Platform wasm smoke tests should reuse `packages/rivetkit/tests/platforms/shared-registry.ts` for the raw-SQL SQLite counter actor and public wasm `setup(...)` shape.
+- Platform smoke tests should use `packages/rivetkit/tests/platforms/shared-platform-harness.ts` for serverless runner setup, app process logging, temp app dirs, health checks, and pinned `pnpm dlx` CLI launches.
+- When adding, removing, or renaming a `packages/rivetkit/tests/driver/*.test.ts` file that uses `describeDriverMatrix`, update the Fast/Slow/Excluded test lists and the suite-description table in `.claude/skills/driver-test-runner/SKILL.md` in the same change.
+
 ## Cloudflare Workers Compatibility
 
 Cloudflare Workers forbid `setTimeout`, `fetch`, `connect`, and other async I/O in global scope (outside a request handler). The `Registry` constructor runs in global scope, so it must never call these APIs unconditionally. Any deferred work (e.g., prestarting the runtime) must be gated behind a synchronous config check before scheduling a timer. See `packages/rivetkit/src/registry/index.ts` for the pattern: the outer `if` guards `setTimeout`, and the inner `if` re-checks after the tick to pick up late config mutations.
+
+## Wasm Binding Package
+
+- Treat `packages/rivetkit-wasm/pkg/` as wasm-pack output; commit source and build scripts, then regenerate package artifacts during package builds.
+- Export wasm raw WebSocket handles as `WebSocketHandle`, not `WebSocket`, because wasm-bindgen rejects classes that shadow the host global.
+- Keep wasm runtime adapter byte normalization on `Uint8Array`; do not add Node `Buffer` dependencies to `packages/rivetkit/src/registry/wasm-runtime.ts`.
+- Pass platform wasm bindings through `setup({ wasm: { bindings, initInput } })`; do not add hidden `globalThis` binding hooks.
+- Wasm `CoreRegistry` serverless startup must use a `BuildingServerless` waiter state; shutdown during build must wake waiters and drain any newly built runtime.
+- Validate wasm-only serve config constraints before converting to core `ServeConfig` or starting registry side effects.
+- Run `pnpm --filter @rivetkit/rivetkit-wasm run check:package` after wasm package export or files changes to verify the published tarball includes the root entrypoint and wasm artifacts.
+- Build `@rivetkit/rivetkit-wasm` with its package-local pinned `wasm-pack` dependency. Do not use `npx -y wasm-pack`.
+- Intern wasm bridged `RivetErrorSchema` values by `(group, code)` only; live per-error messages must stay on `RivetError.message` instead of expanding the schema cache key.
+- Track wasm websocket callback regions in a map keyed by active region IDs and remove entries on end so repeated callbacks do not retain empty slots.
+- Treat wasm websocket callback region ID `0` as the untracked sentinel; wrap `u32` allocation by skipping live IDs instead of panicking.
 
 ## Workflow Context Actor Access Guards
 

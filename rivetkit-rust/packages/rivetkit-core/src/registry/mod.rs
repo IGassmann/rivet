@@ -4,12 +4,13 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::time::{Instant, timeout};
 
 use ::http::StatusCode;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use reqwest::Url;
 use rivet_envoy_client::config::{
 	ActorStopHandle, BoxFuture as EnvoyBoxFuture, EnvoyCallbacks, HttpRequest, HttpResponse,
 	WebSocketHandler, WebSocketMessage, WebSocketSender,
@@ -26,6 +27,7 @@ use serde_json::{Value as JsonValue, json};
 use tokio::sync::{Mutex as TokioMutex, Notify, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 use vbare::OwnedVersionedData;
 
 use crate::actor::action::ActionDispatchError;
@@ -33,10 +35,11 @@ use crate::actor::config::CanHibernateWebSocket;
 use crate::actor::connection::{ConnHandle, HibernatableConnectionMetadata};
 use crate::actor::context::{ActorContext, InspectorAttachGuard};
 use crate::actor::factory::ActorFactory;
+use crate::actor::keys::PERSIST_DATA_KEY;
 use crate::actor::lifecycle_hooks::Reply;
 use crate::actor::messages::{ActorEvent, QueueSendResult, Request, Response, StateDelta};
 use crate::actor::preload::{PreloadedKv, PreloadedPersistedActor};
-use crate::actor::state::{PERSIST_DATA_KEY, decode_persisted_actor};
+use crate::actor::state::decode_persisted_actor;
 use crate::actor::task::{
 	ActorTask,
 	DispatchCommand,
@@ -47,6 +50,7 @@ use crate::actor::task::{
 	try_send_lifecycle_command,
 };
 use crate::actor::task_types::ShutdownKind;
+#[cfg(feature = "native-runtime")]
 use crate::engine_process::EngineProcessManager;
 use crate::error::{ActorLifecycle as ActorLifecycleError, ActorRuntime};
 use crate::inspector::protocol::{
@@ -54,6 +58,7 @@ use crate::inspector::protocol::{
 };
 use crate::inspector::{Inspector, InspectorAuth, InspectorSignal, InspectorSubscription};
 use crate::kv::Kv;
+use crate::runtime::RuntimeSpawner;
 use crate::sqlite::SqliteDb;
 use crate::types::{ActorKey, ActorKeySegment, WsMessage};
 use crate::websocket::WebSocket;
@@ -64,6 +69,7 @@ mod envoy_callbacks;
 mod http;
 mod inspector;
 mod inspector_ws;
+#[cfg(feature = "native-runtime")]
 mod runner_config;
 mod websocket;
 
@@ -97,20 +103,23 @@ type ActiveActorInstance = Arc<ActorTaskHandle>;
 
 enum ActorInstanceState {
 	Active(ActiveActorInstance),
-	Stopping(ActiveActorInstance),
+	Stopping {
+		instance: ActiveActorInstance,
+		reason: ShutdownKind,
+	},
 }
 
 impl ActorInstanceState {
 	fn instance(&self) -> ActiveActorInstance {
 		match self {
-			Self::Active(instance) | Self::Stopping(instance) => instance.clone(),
+			Self::Active(instance) | Self::Stopping { instance, .. } => instance.clone(),
 		}
 	}
 
 	fn active_instance(&self) -> Option<ActiveActorInstance> {
 		match self {
 			Self::Active(instance) => Some(instance.clone()),
-			Self::Stopping(_) => None,
+			Self::Stopping { .. } => None,
 		}
 	}
 }
@@ -182,6 +191,7 @@ pub struct ServeConfig {
 	pub serverless_client_token: Option<String>,
 	pub serverless_validate_endpoint: bool,
 	pub serverless_max_start_payload_bytes: usize,
+	pub serverless_cache_envoy: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -427,25 +437,39 @@ impl CoreRegistry {
 		shutdown: CancellationToken,
 	) -> Result<()> {
 		let dispatcher = self.into_dispatcher(&config);
+		#[cfg(feature = "native-runtime")]
 		let _engine_process = match config.engine_binary_path.as_ref() {
 			Some(binary_path) => {
 				Some(EngineProcessManager::start(binary_path, &config.endpoint).await?)
 			}
 			None => None,
 		};
+		#[cfg(not(feature = "native-runtime"))]
+		if config.engine_binary_path.is_some() {
+			anyhow::bail!("engine process spawning requires the `native-runtime` feature");
+		}
+
+		#[cfg(feature = "native-runtime")]
 		runner_config::ensure_local_normal_runner_config(&config).await?;
 		let callbacks = Arc::new(RegistryCallbacks {
 			dispatcher: dispatcher.clone(),
 		});
 
+		let prepopulate_actor_names = dispatcher
+			.build_actor_metadata_map()
+			.into_iter()
+			.map(|(name, metadata)| (name, rivet_envoy_client::config::ActorName { metadata }))
+			.collect();
 		let handle = start_envoy(rivet_envoy_client::config::EnvoyConfig {
 			version: config.version,
 			endpoint: config.endpoint,
 			token: config.token,
 			namespace: config.namespace,
 			pool_name: config.pool_name,
-			prepopulate_actor_names: HashMap::new(),
-			metadata: None,
+			prepopulate_actor_names,
+			metadata: Some(json!({
+				"rivetkit": { "version": config.serverless_package_version },
+			})),
 			not_global: false,
 			debug_latency_ms: None,
 			callbacks,
@@ -462,7 +486,7 @@ impl CoreRegistry {
 		// Bounded drain. If envoy cannot reach the engine (reconnect loop stuck),
 		// we fall back to immediate `Stop` rather than hanging indefinitely.
 		// The outer host (TS signal handler / Rust binary) is the backstop.
-		match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, handle.shutdown_and_wait(false)).await {
+		match timeout(SHUTDOWN_DRAIN_TIMEOUT, handle.shutdown_and_wait(false)).await {
 			Ok(()) => {}
 			Err(_) => {
 				tracing::warn!("envoy shutdown drain exceeded timeout; forcing immediate stop");
@@ -505,6 +529,51 @@ impl RegistryDispatcher {
 				.filter(|token| !token.is_empty()),
 			handle_inspector_http_in_runtime,
 		}
+	}
+
+	pub(crate) fn build_actor_metadata_map(&self) -> HashMap<String, JsonValue> {
+		self.factories
+			.iter()
+			.map(|(actor_name, factory)| {
+				let config = factory.config();
+				let mut metadata = serde_json::Map::new();
+				if let Some(icon) = &config.icon {
+					metadata.insert("icon".to_owned(), json!(icon));
+				}
+				if let Some(name) = &config.name {
+					metadata.insert("name".to_owned(), json!(name));
+				}
+				metadata.insert(
+					"preload".to_owned(),
+					json!({
+						"keys": [
+							[1],
+							[3],
+							[5, 1, 1],
+							[6],
+						],
+						"prefixes": [
+							{
+								"prefix": [6, 1],
+								"maxBytes": config.preload_max_workflow_bytes.unwrap_or(131_072),
+								"partial": false,
+							},
+							{
+								"prefix": [2],
+								"maxBytes": config.preload_max_connections_bytes.unwrap_or(65_536),
+								"partial": false,
+							},
+							{
+								"prefix": [5, 1, 2],
+								"maxBytes": 65_536,
+								"partial": false,
+							},
+						],
+					}),
+				);
+				(actor_name.clone(), JsonValue::Object(metadata))
+			})
+			.collect()
 	}
 }
 
@@ -570,7 +639,7 @@ impl RegistryDispatcher {
 		)
 		.with_preloaded_persisted_actor(request.preload_persisted_actor)
 		.with_preloaded_kv(request.preloaded_kv);
-		let join = tokio::spawn(task.run());
+		let join = RuntimeSpawner::spawn(task.run());
 
 		let (start_tx, start_rx) = oneshot::channel();
 		let result: Result<Arc<ActorTaskHandle>> = async {
@@ -612,15 +681,16 @@ impl RegistryDispatcher {
 					.map(|(_, pending_stop)| pending_stop);
 				if let Some(pending_stop) = pending_stop {
 					let actor_id = request.actor_id.clone();
-					if matches!(
-						map_envoy_stop_reason(&pending_stop.reason),
-						ShutdownKind::Destroy
-					) {
+					let stop_reason = map_envoy_stop_reason(&pending_stop.reason);
+					if matches!(stop_reason, ShutdownKind::Destroy) {
 						instance.ctx.mark_destroy_requested();
 					}
 					self.set_actor_instance_state(
 						actor_id.clone(),
-						ActorInstanceState::Stopping(instance.clone()),
+						ActorInstanceState::Stopping {
+							instance: instance.clone(),
+							reason: stop_reason,
+						},
 					)
 					.await;
 					let _ = self
@@ -629,7 +699,7 @@ impl RegistryDispatcher {
 						.await;
 
 					let dispatcher = self.clone();
-					tokio::spawn(async move {
+					RuntimeSpawner::spawn(async move {
 						if let Err(error) = dispatcher
 							.shutdown_started_instance(
 								&actor_id,
@@ -688,12 +758,19 @@ impl RegistryDispatcher {
 		}
 	}
 
-	async fn transition_actor_to_stopping(&self, actor_id: &str) -> Option<ActiveActorInstance> {
+	async fn transition_actor_to_stopping(
+		&self,
+		actor_id: &str,
+		reason: ShutdownKind,
+	) -> Option<ActiveActorInstance> {
 		match self.actor_instances.entry_async(actor_id.to_owned()).await {
 			SccEntry::Occupied(mut entry) => {
 				let instance = entry.get().instance();
 				if matches!(entry.get(), ActorInstanceState::Active(_)) {
-					entry.insert(ActorInstanceState::Stopping(instance.clone()));
+					entry.insert(ActorInstanceState::Stopping {
+						instance: instance.clone(),
+						reason,
+					});
 				} else {
 					instance
 						.ctx
@@ -712,7 +789,9 @@ impl RegistryDispatcher {
 		match self.actor_instances.entry_async(actor_id.to_owned()).await {
 			SccEntry::Occupied(entry) => {
 				let should_remove = match entry.get() {
-					ActorInstanceState::Stopping(instance) => Arc::ptr_eq(instance, expected),
+					ActorInstanceState::Stopping { instance, .. } => {
+						Arc::ptr_eq(instance, expected)
+					}
 					ActorInstanceState::Active(_) => false,
 				};
 				if should_remove {
@@ -730,7 +809,14 @@ impl RegistryDispatcher {
 			match instance.get() {
 				ActorInstanceState::Active(instance) => {
 					let instance = instance.clone();
+					// TODO: Share admission policy with ActorTask::dispatch_lifecycle_error.
 					if instance.ctx.started() {
+						if instance.ctx.destroy_requested() {
+							instance
+								.ctx
+								.warn_work_sent_to_stopping_instance("active_actor");
+							return Err(ActorLifecycleError::Destroying.build());
+						}
 						return Ok(instance);
 					}
 
@@ -739,20 +825,29 @@ impl RegistryDispatcher {
 						.warn_work_sent_to_stopping_instance("active_actor");
 					return Err(if instance.ctx.destroy_requested() {
 						ActorLifecycleError::Destroying.build()
+					} else if instance.ctx.sleep_requested() {
+						ActorLifecycleError::Stopping.build()
 					} else {
 						ActorLifecycleError::Starting.build()
 					});
 				}
-				ActorInstanceState::Stopping(instance) => {
+				ActorInstanceState::Stopping { instance, reason } => {
 					let instance = instance.clone();
-					instance
-						.ctx
-						.warn_work_sent_to_stopping_instance("active_actor");
-					return Err(if instance.ctx.destroy_requested() {
-						ActorLifecycleError::Destroying.build()
-					} else {
-						ActorLifecycleError::Stopping.build()
-					});
+					match reason {
+						ShutdownKind::Sleep if instance.ctx.started() => return Ok(instance),
+						ShutdownKind::Sleep => {
+							instance
+								.ctx
+								.warn_work_sent_to_stopping_instance("active_actor");
+							return Err(ActorLifecycleError::Stopping.build());
+						}
+						ShutdownKind::Destroy => {
+							instance
+								.ctx
+								.warn_work_sent_to_stopping_instance("active_actor");
+							return Err(ActorLifecycleError::Destroying.build());
+						}
+					}
 				}
 			}
 		}
@@ -790,7 +885,11 @@ impl RegistryDispatcher {
 			return Ok(());
 		}
 
-		let instance = match self.transition_actor_to_stopping(actor_id).await {
+		let task_stop_reason = map_envoy_stop_reason(&reason);
+		let instance = match self
+			.transition_actor_to_stopping(actor_id, task_stop_reason)
+			.await
+		{
 			Some(instance) => instance,
 			None => {
 				let _ = self
@@ -860,7 +959,7 @@ impl RegistryDispatcher {
 				Instant::now() + instance.factory.config().effective_sleep_grace_period();
 			if !instance
 				.ctx
-				.wait_for_internal_keep_awake_idle(shutdown_deadline.into())
+				.wait_for_internal_keep_awake_idle(shutdown_deadline)
 				.await
 			{
 				instance.ctx.record_direct_subsystem_shutdown_warning(
@@ -874,7 +973,7 @@ impl RegistryDispatcher {
 			}
 			if !instance
 				.ctx
-				.wait_for_http_requests_drained(shutdown_deadline.into())
+				.wait_for_http_requests_drained(shutdown_deadline)
 				.await
 			{
 				instance
@@ -936,7 +1035,6 @@ impl RegistryDispatcher {
 		generation: u32,
 		actor_name: &str,
 		key: ActorKey,
-		sqlite_startup_data: Option<protocol::SqliteStartupData>,
 		factory: &ActorFactory,
 	) -> ActorContext {
 		let ctx = ActorContext::build(
@@ -946,11 +1044,12 @@ impl RegistryDispatcher {
 			self.region.clone(),
 			factory.config().clone(),
 			Kv::new(handle.clone(), actor_id.to_owned()),
-			SqliteDb::new(
+			SqliteDb::new_with_remote_sqlite(
 				handle.clone(),
 				actor_id.to_owned(),
-				sqlite_startup_data,
+				Some(generation as u64),
 				factory.config().has_database,
+				factory.config().remote_sqlite,
 			),
 		);
 		ctx.configure_envoy(handle, Some(generation));

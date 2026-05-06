@@ -146,7 +146,24 @@ export function encodeJsonCompatValue(input: any): any {
 	return input;
 }
 
-export function reviveJsonCompatValue(input: any): any {
+export interface JsonCompatReviveOptions {
+	coerceSafeIntegerBigInts?: boolean;
+}
+
+export function reviveJsonCompatValue(
+	input: any,
+	options: JsonCompatReviveOptions = {},
+): any {
+	if (typeof input === "bigint") {
+		if (
+			options.coerceSafeIntegerBigInts &&
+			input >= BigInt(Number.MIN_SAFE_INTEGER) &&
+			input <= BigInt(Number.MAX_SAFE_INTEGER)
+		) {
+			return Number(input);
+		}
+		return input;
+	}
 	if (Array.isArray(input)) {
 		if (
 			input.length === 2 &&
@@ -166,18 +183,21 @@ export function reviveJsonCompatValue(input: any): any {
 				return undefined;
 			}
 			if (input[0].startsWith("$$")) {
-				return [input[0].substring(1), reviveJsonCompatValue(input[1])];
+				return [
+					input[0].substring(1),
+					reviveJsonCompatValue(input[1], options),
+				];
 			}
 			throw new Error(
 				`Unknown JSON encoding type: ${input[0]}. This may indicate corrupted data or a version mismatch.`,
 			);
 		}
-		return input.map((value) => reviveJsonCompatValue(value));
+		return input.map((value) => reviveJsonCompatValue(value, options));
 	}
 	if (isPlainObject(input)) {
 		const decoded: Record<string, unknown> = {};
 		for (const [key, value] of Object.entries(input)) {
-			decoded[key] = reviveJsonCompatValue(value);
+			decoded[key] = reviveJsonCompatValue(value, options);
 		}
 		return decoded;
 	}

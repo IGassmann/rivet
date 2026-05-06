@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use crate::time::{SystemTime, UNIX_EPOCH, sleep};
 
 use anyhow::Result;
 use futures::future::BoxFuture;
@@ -13,6 +15,8 @@ use uuid::Uuid;
 use crate::actor::context::ActorContext;
 use crate::actor::state::PersistedScheduleEvent;
 use crate::error::ActorRuntime;
+#[cfg(feature = "wasm-runtime")]
+use crate::runtime::RuntimeSpawner;
 
 pub(super) type InternalKeepAwakeCallback =
 	Arc<dyn Fn(BoxFuture<'static, Result<()>>) -> BoxFuture<'static, Result<()>> + Send + Sync>;
@@ -163,19 +167,19 @@ impl ActorContext {
 
 		self.all_events()
 			.into_iter()
-			.filter(|event| event.timestamp_ms <= now_ms)
+			.filter(|event| event.timestamp <= now_ms)
 			.collect()
 	}
 
 	fn schedule_event(&self, timestamp_ms: i64, action_name: &str, args: &[u8]) -> Result<()> {
 		let event = PersistedScheduleEvent {
 			event_id: Uuid::new_v4().to_string(),
-			timestamp_ms,
+			timestamp: timestamp_ms,
 			action: action_name.to_owned(),
-			args: args.to_vec(),
+			args: (!args.is_empty()).then(|| args.to_vec()),
 		};
 		let event_id = event.event_id.clone();
-		let args_len = event.args.len();
+		let args_len = event.args.as_ref().map_or(0, Vec::len);
 
 		self.insert_event_sorted(event);
 		tracing::debug!(
@@ -196,8 +200,8 @@ impl ActorContext {
 			let position = events
 				.binary_search_by(|existing| {
 					existing
-						.timestamp_ms
-						.cmp(&event.timestamp_ms)
+						.timestamp
+						.cmp(&event.timestamp)
 						.then_with(|| existing.event_id.cmp(&event.event_id))
 				})
 				.unwrap_or_else(|index| index);
@@ -220,7 +224,7 @@ impl ActorContext {
 			.0
 			.schedule_dirty_since_push
 			.swap(false, Ordering::SeqCst);
-		let next_alarm = self.next_event().map(|event| event.timestamp_ms);
+		let next_alarm = self.next_event().map(|event| event.timestamp);
 		self.arm_local_alarm(next_alarm);
 		if !should_push {
 			return Ok(());
@@ -256,7 +260,7 @@ impl ActorContext {
 		let now_ms = now_timestamp_ms();
 		let next_alarm = self
 			.next_event()
-			.and_then(|event| (event.timestamp_ms > now_ms).then_some(event.timestamp_ms));
+			.and_then(|event| (event.timestamp > now_ms).then_some(event.timestamp));
 		self.arm_local_alarm(next_alarm);
 		if !should_push {
 			return Ok(());
@@ -345,8 +349,10 @@ impl ActorContext {
 			return;
 		}
 
-		let Ok(tokio_handle) = Handle::try_current() else {
-			return;
+		#[cfg(not(feature = "wasm-runtime"))]
+		let tokio_handle = match Handle::try_current() {
+			Ok(handle) => handle,
+			Err(_) => return,
 		};
 
 		let delay_ms = next_alarm.saturating_sub(now_timestamp_ms()).max(0) as u64;
@@ -361,25 +367,28 @@ impl ActorContext {
 		);
 		// Intentionally detached but abortable: the handle is stored in
 		// `local_alarm_task` and cancelled when alarms are resynced or stopped.
-		let handle = tokio_handle.spawn(
-			async move {
-				tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-				if schedule.0.schedule_local_alarm_epoch.load(Ordering::SeqCst) != local_alarm_epoch
-				{
-					return;
-				}
-				tracing::debug!(
-					timestamp_ms = next_alarm,
-					local_alarm_epoch,
-					"local actor alarm fired"
-				);
-				let Some(callback) = schedule.0.schedule_local_alarm_callback.lock().clone() else {
-					return;
-				};
-				callback().await;
+		let task = async move {
+			sleep(Duration::from_millis(delay_ms)).await;
+			if schedule.0.schedule_local_alarm_epoch.load(Ordering::SeqCst) != local_alarm_epoch {
+				return;
 			}
-			.in_current_span(),
-		);
+			tracing::debug!(
+				timestamp_ms = next_alarm,
+				local_alarm_epoch,
+				"local actor alarm fired"
+			);
+			let Some(callback) = schedule.0.schedule_local_alarm_callback.lock().clone() else {
+				return;
+			};
+			callback().await;
+		}
+		.in_current_span();
+
+		#[cfg(not(feature = "wasm-runtime"))]
+		let handle = tokio_handle.spawn(task);
+
+		#[cfg(feature = "wasm-runtime")]
+		let handle = RuntimeSpawner::spawn(task);
 
 		*self.0.schedule_local_alarm_task.lock() = Some(handle);
 	}

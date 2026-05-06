@@ -1,6 +1,6 @@
 use rivet_api_builder::{create_router, prelude::*};
 
-use crate::{actors, envoys, internal, namespaces, runner_configs, runners};
+use crate::{actors, depot_inspect, envoys, internal, namespaces, runner_configs, runners};
 
 #[tracing::instrument(skip_all)]
 pub async fn router(
@@ -40,6 +40,35 @@ pub async fn router(
 			.route("/runners/names", get(runners::list_names))
 			// MARK: Envoys
 			.route("/envoys", get(envoys::list))
+			// MARK: Depot inspect
+			.route("/depot/inspect/summary", get(depot_inspect::summary))
+			.route("/depot/inspect/catalog", get(depot_inspect::catalog))
+			.route(
+				"/depot/inspect/buckets/{bucket_id}",
+				get(depot_inspect::bucket),
+			)
+			.route(
+				"/depot/inspect/buckets/{bucket_id}/databases/{database_id}",
+				get(depot_inspect::database),
+			)
+			.route(
+				"/depot/inspect/branches/{branch_id}",
+				get(depot_inspect::branch),
+			)
+			.route(
+				"/depot/inspect/branches/{branch_id}/pages/{pgno}/trace",
+				get(depot_inspect::page_trace),
+			)
+			.route(
+				"/depot/inspect/branches/{branch_id}/rows/{family}",
+				get(depot_inspect::branch_rows),
+			)
+			.route("/depot/inspect/raw/key/{key}", get(depot_inspect::raw_key))
+			.route("/depot/inspect/raw/scan", get(depot_inspect::raw_scan))
+			.route(
+				"/depot/inspect/raw/decode-key/{key}",
+				get(depot_inspect::decode_key),
+			)
 			// MARK: Internal
 			.route("/cache/purge", post(internal::cache_purge))
 			.route(

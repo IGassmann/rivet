@@ -1,17 +1,27 @@
 import { describe, expect, test, vi } from "vitest";
 import {
-	ACTIVE_DB_WRITE_COUNT,
 	EXCEEDS_GRACE_HANDLER_DELAY,
 	EXCEEDS_GRACE_SLEEP_TIMEOUT,
+	KEEP_AWAKE_NESTED_FIRST_MS,
+	KEEP_AWAKE_NESTED_SECOND_MS,
+	KEEP_AWAKE_SINGLE_WORK_MS,
 	SLEEP_DB_TIMEOUT,
 	SLEEP_SCHEDULE_AFTER_ON_SLEEP_DELAY_MS,
 } from "../../fixtures/driver-test-suite/sleep-db";
-import { describeDriverMatrix } from "./shared-matrix";
+import {
+	RAW_WS_HANDLER_DELAY,
+	RAW_WS_HANDLER_SLEEP_TIMEOUT,
+} from "../../fixtures/driver-test-suite/sleep";
+import {
+	describeDriverMatrix,
+	SQLITE_DRIVER_MATRIX_OPTIONS,
+} from "./shared-matrix";
 import { setupDriverTest, waitFor } from "./shared-utils";
 
 type LogEntry = { id: number; event: string; created_at: number };
 
 const CONNECTION_READY_TIMEOUT_MS = 10_000;
+const ACTIVE_DB_WRITE_ADVANCES_BEFORE_SLEEP = 3;
 
 async function waitForAction<T>(
 	action: () => Promise<T>,
@@ -108,6 +118,32 @@ async function connectRawWebSocket(handle: {
 	});
 
 	return ws;
+}
+
+async function waitForRawWsMessage<T>(
+	ws: WebSocket,
+	matches: (data: any) => data is T,
+) {
+	return await new Promise<T>((resolve, reject) => {
+		const onMessage = (event: MessageEvent) => {
+			const data = JSON.parse(String(event.data));
+			if (matches(data)) {
+				cleanup();
+				resolve(data);
+			}
+		};
+		const onClose = () => {
+			cleanup();
+			reject(new Error("websocket closed early"));
+		};
+		const cleanup = () => {
+			ws.removeEventListener("message", onMessage);
+			ws.removeEventListener("close", onClose);
+		};
+
+		ws.addEventListener("message", onMessage);
+		ws.addEventListener("close", onClose, { once: true });
+	});
 }
 
 describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
@@ -220,8 +256,7 @@ describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
 			);
 		});
 
-		// TODO(#4705): Root-cause sleep-shutdown disconnect ordering and re-enable this coverage.
-		test.skip("onDisconnect can write to c.db during sleep shutdown", async (c) => {
+		test("onDisconnect can write to c.db during sleep shutdown", async (c) => {
 			const { client } = await setupDriverTest(c, driverTestConfig);
 
 			// Create actor with a connection
@@ -262,12 +297,11 @@ describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
 			expect(events).toContain("disconnect");
 		});
 
-		// TODO(#4705): Root-cause raw WebSocket close-handler DB access during sleep shutdown and re-enable this coverage.
-		test.skip("async websocket close handler can use c.db before sleep completes", async (c) => {
+		test("async websocket close handler can use c.db before sleep completes", async (c) => {
 			const { client } = await setupDriverTest(c, driverTestConfig);
 
 			const actor = client.sleepWithRawWsCloseDb.getOrCreate([
-				"raw-ws-close-db",
+				`raw-ws-close-db-${crypto.randomUUID()}`,
 			]);
 			const ws = await connectRawWebSocket(actor);
 
@@ -281,22 +315,33 @@ describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
 				ws.close();
 			});
 
-			await waitForAction(actor.getStatus, (status) => {
-				expect(status.sleepCount).toBe(1);
-				expect(status.startCount).toBe(2);
-			});
+			await waitFor(
+				driverTestConfig,
+				RAW_WS_HANDLER_DELAY + RAW_WS_HANDLER_SLEEP_TIMEOUT + 1_000,
+			);
 
 			const entries = await actor.getLogEntries();
 			const events = entries.map((entry: LogEntry) => entry.event);
+			expect(events).toContain("close-start");
+			expect(events).toContain("close-finish");
 			expect(events).toContain("sleep");
+			expect(events).toContain("wake");
+			expect(events.indexOf("close-start")).toBeLessThan(
+				events.indexOf("close-finish"),
+			);
+			expect(events.indexOf("close-finish")).toBeLessThan(
+				events.indexOf("sleep"),
+			);
+			expect(events.indexOf("sleep")).toBeLessThan(
+				events.lastIndexOf("wake"),
+			);
 		}, 30_000);
 
-		// TODO(#4705): Root-cause addEventListener close-handler DB access during sleep shutdown and re-enable this coverage.
-		test.skip("async websocket addEventListener close handler can use c.db before sleep completes", async (c) => {
+		test("async websocket addEventListener close handler can use c.db before sleep completes", async (c) => {
 			const { client } = await setupDriverTest(c, driverTestConfig);
 
 			const actor = client.sleepWithRawWsCloseDbListener.getOrCreate([
-				"raw-ws-close-db-listener",
+				`raw-ws-close-db-listener-${crypto.randomUUID()}`,
 			]);
 			const ws = await connectRawWebSocket(actor);
 
@@ -310,14 +355,26 @@ describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
 				ws.close();
 			});
 
-			await waitForAction(actor.getStatus, (status) => {
-				expect(status.sleepCount).toBe(1);
-				expect(status.startCount).toBe(2);
-			});
+			await waitFor(
+				driverTestConfig,
+				RAW_WS_HANDLER_DELAY + RAW_WS_HANDLER_SLEEP_TIMEOUT + 1_000,
+			);
 
 			const entries = await actor.getLogEntries();
 			const events = entries.map((entry: LogEntry) => entry.event);
+			expect(events).toContain("close-start");
+			expect(events).toContain("close-finish");
 			expect(events).toContain("sleep");
+			expect(events).toContain("wake");
+			expect(events.indexOf("close-start")).toBeLessThan(
+				events.indexOf("close-finish"),
+			);
+			expect(events.indexOf("close-finish")).toBeLessThan(
+				events.indexOf("sleep"),
+			);
+			expect(events.indexOf("sleep")).toBeLessThan(
+				events.lastIndexOf("wake"),
+			);
 		}, 30_000);
 
 		test("broadcast works in onSleep", async (c) => {
@@ -371,8 +428,7 @@ describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
 			expect(events).toContain("sleep-end");
 		});
 
-		// TODO(#4705): Root-cause handle action dispatch ordering during sleep shutdown and re-enable this coverage.
-		test.skip("action via handle during sleep shutdown is not queued", async (c) => {
+		test("action via handle during sleep shutdown is not queued", async (c) => {
 			const { client } = await setupDriverTest(c, driverTestConfig);
 
 			const handle = client.sleepWithDbAction.getOrCreate([
@@ -526,8 +582,71 @@ describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
 			expect(finalCounts.scheduledActionCount).toBe(1);
 		});
 
-		// TODO(#4705): Root-cause connection action dispatch ordering during sleep shutdown and re-enable this coverage.
-		test.skip("action via WebSocket connection during sleep shutdown is not queued", async (c) => {
+		test("keepAwake delays automatic sleep until it finishes", async (c) => {
+			const { client } = await setupDriverTest(c, driverTestConfig);
+
+			const actor = client.sleepKeepAwakeUntilIdle.getOrCreate([
+				`single-${crypto.randomUUID()}`,
+			]);
+
+			await actor.startSingleKeepAwake();
+
+			await waitFor(
+				driverTestConfig,
+				KEEP_AWAKE_SINGLE_WORK_MS + SLEEP_DB_TIMEOUT + 1_000,
+			);
+
+			const entries = await actor.getLogEntries();
+			const events = entries.map((entry: LogEntry) => entry.event);
+			expect(events).toContain("single-start");
+			expect(events).toContain("single-finish");
+			expect(events).toContain("sleep-1");
+			expect(events).toContain("wake-2");
+			expect(events.indexOf("single-finish")).toBeLessThan(
+				events.indexOf("sleep-1"),
+			);
+			expect(events.indexOf("sleep-1")).toBeLessThan(
+				events.indexOf("wake-2"),
+			);
+		});
+
+		test("nested keepAwake delays automatic sleep until the second keepAwake finishes", async (c) => {
+			const { client } = await setupDriverTest(c, driverTestConfig);
+
+			const actor = client.sleepKeepAwakeUntilIdle.getOrCreate([
+				`nested-${crypto.randomUUID()}`,
+			]);
+
+			await actor.startNestedKeepAwake();
+
+			await waitFor(
+				driverTestConfig,
+				SLEEP_DB_TIMEOUT +
+					KEEP_AWAKE_NESTED_FIRST_MS +
+					KEEP_AWAKE_NESTED_SECOND_MS +
+					1_000,
+			);
+
+			const entries = await actor.getLogEntries();
+			const events = entries.map((entry: LogEntry) => entry.event);
+			expect(events).toContain("nested-first-start");
+			expect(events).toContain("nested-first-finish");
+			expect(events).toContain("nested-second-start");
+			expect(events).toContain("nested-second-finish");
+			expect(events).toContain("sleep-1");
+			expect(events).toContain("wake-2");
+			expect(events.indexOf("nested-first-finish")).toBeLessThan(
+				events.indexOf("nested-second-finish"),
+			);
+			expect(events.indexOf("nested-second-finish")).toBeLessThan(
+				events.indexOf("sleep-1"),
+			);
+			expect(events.indexOf("sleep-1")).toBeLessThan(
+				events.indexOf("wake-2"),
+			);
+		});
+
+		test("action via WebSocket connection during sleep shutdown is not queued", async (c) => {
 			const { client } = await setupDriverTest(c, driverTestConfig);
 
 			const handle = client.sleepWithDbAction.getOrCreate([
@@ -577,8 +696,7 @@ describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
 				expect(events).not.toContain("ws-during-sleep");
 			}
 		});
-		// TODO(#4705): Root-cause new connection behavior during sleep shutdown and re-enable this coverage.
-		test.skip("new connections rejected during sleep shutdown", async (c) => {
+		test("new connections rejected during sleep shutdown", async (c) => {
 			const { client } = await setupDriverTest(c, driverTestConfig);
 
 			// The sleepWithDbAction actor has a 500ms delay in
@@ -623,8 +741,7 @@ describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
 			await secondConn.dispose();
 		});
 
-		// TODO(#4705): Root-cause raw WebSocket admission during sleep shutdown and re-enable this coverage.
-		test.skip("new raw WebSocket during sleep shutdown is rejected or queued", async (c) => {
+		test("new raw WebSocket during sleep shutdown is rejected or queued", async (c) => {
 			const { client } = await setupDriverTest(c, driverTestConfig);
 
 			// The sleepWithRawWs actor has a 500ms delay in onSleep.
@@ -747,8 +864,7 @@ describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
 			expect(events).toContain("waituntil-after-reject");
 		});
 
-		// TODO(#4705): Root-cause duplicate sleep-call semantics and re-enable this coverage.
-		test.skip("double sleep call is a no-op", async (c) => {
+		test("double sleep call is a no-op", async (c) => {
 			const { client } = await setupDriverTest(c, driverTestConfig);
 
 			// Use a connection to send the sleep trigger, because
@@ -761,15 +877,10 @@ describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
 
 			await waitForConnectionReady(connection);
 
-			// Trigger sleep twice rapidly via the connection.
-			// The second call should be a no-op because
-			// #sleepCalled is already true.
-			await connection.triggerSleep();
-			try {
-				await connection.triggerSleep();
-			} catch {
-				// May throw if actor already stopping
-			}
+			// Trigger sleep twice from the same action invocation. The second
+			// call should be a no-op because the first call already requested
+			// sleep for this actor generation.
+			await connection.triggerSleepTwice();
 
 			// Wait for sleep to complete
 			await waitFor(driverTestConfig, 1500);
@@ -903,8 +1014,7 @@ describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
 			{ timeout: 15_000 },
 		);
 
-		// TODO(#4705): Root-cause task-model shutdown ordering for concurrent WebSocket DB handlers and re-enable this coverage.
-		test.skip(
+		test(
 			"concurrent ws handlers with cached db ref get errors when grace period exceeded",
 			async (c) => {
 				const { client } = await setupDriverTest(c, driverTestConfig);
@@ -985,9 +1095,8 @@ describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
 			{ timeout: 15_000 },
 		);
 
-		// TODO(#4705): Root-cause in-flight DB write interruption during sleep shutdown and re-enable this coverage.
-		test.skip(
-			"active db writes interrupted by sleep produce db error",
+		test(
+			"active-db-writes interrupted by sleep persist exact completed count",
 			async (c) => {
 				const { client } = await setupDriverTest(c, driverTestConfig);
 
@@ -996,64 +1105,55 @@ describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
 				]);
 				const ws = await connectRawWebSocket(actor);
 
-				// Start the write loop
-				ws.send("start-writes");
+				const started = waitForRawWsMessage(
+					ws,
+					(data): data is { type: "started" } =>
+						data.type === "started",
+				);
+				ws.send(JSON.stringify({ type: "start-writes" }));
+				await started;
 
-				// Wait for confirmation
-				await new Promise<void>((resolve) => {
-					const onMessage = (event: MessageEvent) => {
-						const data = JSON.parse(String(event.data));
-						if (data.type === "started") {
-							ws.removeEventListener("message", onMessage);
-							resolve();
-						}
-					};
-					ws.addEventListener("message", onMessage);
-				});
+				for (
+					let i = 0;
+					i < ACTIVE_DB_WRITE_ADVANCES_BEFORE_SLEEP;
+					i++
+				) {
+					const writeCompleted = waitForRawWsMessage(
+						ws,
+						(
+							data,
+						): data is {
+							type: "write";
+							index: number;
+							writesCompleted: number;
+						} => data.type === "write" && data.index === i,
+					);
+					ws.send(JSON.stringify({ type: "continue-write" }));
+					const write = await writeCompleted;
+					expect(write.writesCompleted).toBe(i + 1);
+				}
 
 				// Trigger sleep while writes are in progress.
 				await triggerSleepBestEffort(actor);
 
-				// Poll until the woken actor reports the persisted post-sleep status after shutdown completes.
-				await vi.waitFor(
-					async () => {
-						const wokenActor =
-							client.sleepWsActiveDbExceedsGrace.getOrCreate([
-								"ws-active-db-exceeds-grace",
-							]);
-						const status = await wokenActor.getStatus();
-						expect(status.sleepCount).toBeGreaterThanOrEqual(1);
-						expect(status.startCount).toBeGreaterThanOrEqual(2);
-
-						const entries = await wokenActor.getLogEntries();
-						const writeEntries = entries.filter(
-							(e: { event: string }) =>
-								e.event.startsWith("write-"),
-						);
-						expect(writeEntries.length).toBeGreaterThan(0);
-						expect(writeEntries.length).toBeLessThan(
-							ACTIVE_DB_WRITE_COUNT,
-						);
-					},
-					{
-						timeout: 10_000,
-						interval: 50,
-					},
-				);
-
-				// Verify the DB has fewer rows than the full count.
 				const wokenActor =
 					client.sleepWsActiveDbExceedsGrace.getOrCreate([
 						"ws-active-db-exceeds-grace",
 					]);
+				await waitForAction(wokenActor.getStatus, (status) => {
+					expect(status.sleepCount).toBeGreaterThanOrEqual(1);
+					expect(status.startCount).toBeGreaterThanOrEqual(2);
+				});
+
 				const entries = await wokenActor.getLogEntries();
 				const writeEntries = entries.filter((e: { event: string }) =>
 					e.event.startsWith("write-"),
 				);
-				expect(writeEntries.length).toBeGreaterThan(0);
-				expect(writeEntries.length).toBeLessThan(ACTIVE_DB_WRITE_COUNT);
+				expect(writeEntries.length).toBe(
+					ACTIVE_DB_WRITE_ADVANCES_BEFORE_SLEEP,
+				);
 			},
 			{ timeout: 30_000 },
 		);
 	});
-});
+}, SQLITE_DRIVER_MATRIX_OPTIONS);

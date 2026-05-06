@@ -1,8 +1,6 @@
+import { describe, expect, test } from "vitest";
 import { describeDriverMatrix } from "./shared-matrix";
-import { describe, expect, test, vi } from "vitest";
 import { setupDriverTest } from "./shared-utils";
-
-const DB_READY_TIMEOUT_MS = 10_000;
 
 describeDriverMatrix("Actor Db Raw", (driverTestConfig) => {
 	describe("Actor Database (Raw) Tests", () => {
@@ -69,17 +67,13 @@ describeDriverMatrix("Actor Db Raw", (driverTestConfig) => {
 				// Second actor
 				await getActor2().insertValue("X");
 
-				// Reacquire keyed handles after the writes; fast sleep can leave
-				// older direct targets pointing at a stopping actor instance.
-				await vi.waitFor(
-						async () => {
-							const count1 = await getActor1().getCount();
-							const count2 = await getActor2().getCount();
-							expect(count1).toBe(2);
-							expect(count2).toBe(1);
-						},
-					{ timeout: DB_READY_TIMEOUT_MS, interval: 100 },
-				);
+				const verifyActor1 = getActor1();
+				const verifyActor2 = getActor2();
+				await Promise.all([verifyActor1.ready, verifyActor2.ready]);
+				const count1 = await verifyActor1.getCount();
+				const count2 = await verifyActor2.getCount();
+				expect(count1).toBe(2);
+				expect(count2).toBe(1);
 			});
 		});
 
@@ -97,5 +91,6 @@ describeDriverMatrix("Actor Db Raw", (driverTestConfig) => {
 				expect(values[0].value).toBe("test");
 			});
 		});
+
 	});
 });

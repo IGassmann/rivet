@@ -66,6 +66,7 @@ pub struct JsActorConfig {
 	pub name: Option<String>,
 	pub icon: Option<String>,
 	pub has_database: Option<bool>,
+	pub remote_sqlite: Option<bool>,
 	pub has_state: Option<bool>,
 	pub can_hibernate_websocket: Option<bool>,
 	pub state_save_interval_ms: Option<u32>,
@@ -141,6 +142,7 @@ pub(crate) struct QueueSendPayload {
 #[derive(Clone)]
 pub(crate) struct WebSocketPayload {
 	pub(crate) ctx: CoreActorContext,
+	pub(crate) conn: CoreConnHandle,
 	pub(crate) ws: CoreWebSocket,
 	pub(crate) request: Option<Request>,
 }
@@ -255,6 +257,7 @@ struct BridgeRivetErrorPayload {
 
 #[derive(Debug)]
 pub(crate) struct BridgeRivetErrorContext {
+	pub message: Option<String>,
 	pub public_: Option<bool>,
 	pub status_code: Option<u16>,
 }
@@ -265,11 +268,10 @@ static BRIDGE_RIVET_ERROR_SCHEMAS: LazyLock<
 
 impl std::fmt::Display for BridgeRivetErrorContext {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(
-			f,
-			"bridge rivet error context public={:?} status_code={:?}",
-			self.public_, self.status_code
-		)
+		match &self.message {
+			Some(message) => f.write_str(message),
+			None => f.write_str("bridged RivetError"),
+		}
 	}
 }
 
@@ -833,6 +835,7 @@ fn build_websocket_payload(
 ) -> napi::Result<Vec<napi::JsUnknown>> {
 	let mut object = env.create_object()?;
 	object.set("ctx", ActorContext::new(payload.ctx))?;
+	object.set("conn", ConnHandle::new(payload.conn))?;
 	object.set("ws", WebSocket::new(payload.ws))?;
 	if let Some(request) = payload.request {
 		object.set("request", build_request_object(env, request)?)?;
@@ -976,9 +979,11 @@ fn parse_bridge_rivet_error(reason: &str) -> Option<anyhow::Error> {
 			return None;
 		}
 	};
-	tracing::debug!(
+	tracing::warn!(
 		group = %payload.group.as_str(),
 		code = %payload.code.as_str(),
+		message = %payload.message.as_str(),
+		metadata = ?payload.metadata,
 		has_metadata = payload.metadata.is_some(),
 		public_ = ?payload.public_,
 		status_code = ?payload.status_code,
@@ -989,20 +994,30 @@ fn parse_bridge_rivet_error(reason: &str) -> Option<anyhow::Error> {
 		.metadata
 		.as_ref()
 		.and_then(|metadata| serde_json::value::to_raw_value(metadata).ok());
+	let message = payload.message;
 	let error = anyhow::Error::new(rivet_error::RivetError {
 		schema,
 		meta,
-		message: Some(payload.message),
+		message: Some(message.clone()),
 	});
 	Some(error.context(BridgeRivetErrorContext {
+		message: Some(message),
 		public_: payload.public_,
 		status_code: payload.status_code,
 	}))
 }
 
 pub(crate) fn callback_error(callback_name: &str, error: napi::Error) -> anyhow::Error {
+	let status = error.status;
 	let reason = error.reason;
 	if let Some(error) = parse_bridge_rivet_error(&reason) {
+		let error_chain = error.chain().map(ToString::to_string).collect::<Vec<_>>();
+		tracing::warn!(
+			callback = callback_name,
+			status = ?status,
+			error_chain = ?error_chain,
+			"napi callback failed with structured bridge error"
+		);
 		return error;
 	}
 	if error.status == napi::Status::Closing {
@@ -1036,6 +1051,7 @@ impl From<JsActorConfig> for ActorConfigInput {
 			name: value.name,
 			icon: value.icon,
 			has_database: value.has_database,
+			remote_sqlite: value.remote_sqlite,
 			has_state: value.has_state,
 			can_hibernate_websocket: value.can_hibernate_websocket,
 			state_save_interval_ms: value.state_save_interval_ms,

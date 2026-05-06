@@ -6,10 +6,10 @@ use tokio_postgres::IsolationLevel;
 use crate::{
 	atomic::apply_atomic_op,
 	error::DatabaseError,
-	options::ConflictRangeType,
+	options::{ConflictRangeType, MutationType},
 	tx_ops::Operation,
 	value::{KeyValue, Slice, Values},
-	versionstamp::substitute_versionstamp_if_incomplete,
+	versionstamp::{generate_versionstamp, substitute_raw_versionstamp},
 };
 
 pub enum TransactionCommand {
@@ -379,12 +379,11 @@ impl TransactionTask {
 			.await
 			.map_err(map_postgres_error)?;
 
+		let transaction_versionstamp = generate_versionstamp(0);
+
 		for op in operations {
 			match op {
-				Operation::Set { key, value } => {
-					// TODO: versionstamps need to be calculated on the sql side, not in rust
-					let value = substitute_versionstamp_if_incomplete(value.clone(), 0);
-
+				Operation::SetValue { key, value } => {
 					let query = "INSERT INTO kv (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2";
 					let stmt = tx.prepare_cached(query).await.map_err(map_postgres_error)?;
 
@@ -413,6 +412,32 @@ impl TransactionTask {
 					param,
 					op_type,
 				} => {
+					if matches!(op_type, MutationType::SetVersionstampedKey) {
+						let key = substitute_raw_versionstamp(key, &transaction_versionstamp)
+							.map_err(anyhow::Error::msg)
+							.context("failed substituting versionstamped key")?;
+						let query = "INSERT INTO kv (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2";
+						let stmt = tx.prepare_cached(query).await.map_err(map_postgres_error)?;
+
+						tx.execute(&stmt, &[&key, &param])
+							.await
+							.map_err(map_postgres_error)?;
+						continue;
+					}
+
+					if matches!(op_type, MutationType::SetVersionstampedValue) {
+						let value = substitute_raw_versionstamp(param, &transaction_versionstamp)
+							.map_err(anyhow::Error::msg)
+							.context("failed substituting versionstamped value")?;
+						let query = "INSERT INTO kv (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2";
+						let stmt = tx.prepare_cached(query).await.map_err(map_postgres_error)?;
+
+						tx.execute(&stmt, &[&key, &value])
+							.await
+							.map_err(map_postgres_error)?;
+						continue;
+					}
+
 					// TODO: All operations need to be done on the sql side, not in rust
 
 					// Get current value from database

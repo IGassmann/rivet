@@ -70,6 +70,13 @@ export const ClientConfigSchemaBase = z.object({
 		.optional()
 		.default(() => ({})),
 
+	gateway: z
+		.object({
+			skipReadyWait: z.boolean().optional().default(false),
+		})
+		.optional()
+		.default(() => ({ skipReadyWait: false })),
+
 	// See RunConfig.getUpgradeWebSocket
 	//
 	// This is required in the client config in order to support
@@ -147,6 +154,7 @@ export function convertRegistryConfigToClientConfig(
 		namespace: config.namespace,
 		poolName: config.envoy.poolName,
 		headers: config.headers,
+		gateway: { skipReadyWait: false },
 		encoding: "bare",
 		getUpgradeWebSocket: undefined,
 		// We don't need health checks for internal clients

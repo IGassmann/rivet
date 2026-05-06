@@ -8,13 +8,12 @@
  * those optionals at install time, so they must exist on the registry before
  * anyone installs the meta.
  *
- * NOTE: `@rivetkit/sqlite-native` and `@rivetkit/sqlite-wasm` are deliberately
- * NOT discovered here. The sqlite-native Rust crate is now statically linked
- * into `@rivetkit/rivetkit-napi` via `libsqlite3-sys` +
- * the `rivetkit-sqlite-native` workspace dep, so the standalone npm package is
- * redundant. The old sqlite-wasm package was removed from the workspace but
- * its package.json remains for compatibility. Both stay on the registry at
- * their last published versions.
+ * NOTE: `@rivetkit/sqlite-native` and `@rivetkit/sqlite-wasm` were removed from
+ * the workspace. Their replacements are `@rivetkit/rivetkit-napi` (which links
+ * the sqlite-native Rust crate statically via `libsqlite3-sys`) and
+ * `@rivetkit/rivetkit-wasm` (a single wasm bundle with no platform variants).
+ * The deleted names remain in EXCLUDED so any stray package.json on disk is
+ * still skipped by discovery.
  */
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";

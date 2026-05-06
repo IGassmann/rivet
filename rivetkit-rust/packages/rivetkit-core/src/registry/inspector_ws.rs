@@ -141,7 +141,7 @@ impl RegistryDispatcher {
 					}
 					let overlay_sender = open_sender.clone();
 					let overlay_actor_id = on_open_instance.ctx.actor_id().to_owned();
-					let overlay_task = tokio::spawn(
+					let overlay_task = RuntimeSpawner::spawn(
 						async move {
 							loop {
 								match overlay_rx.recv().await {
@@ -201,7 +201,7 @@ impl RegistryDispatcher {
 								let instance = listener_instance.clone();
 								let sender = listener_sender.clone();
 								let actor_id = instance.ctx.actor_id().to_owned();
-								tokio::spawn(
+								RuntimeSpawner::spawn(
 									async move {
 										match dispatcher
 											.inspector_push_message_for_signal(&instance, signal)
@@ -319,12 +319,15 @@ impl RegistryDispatcher {
 	) -> Result<Option<InspectorServerMessage>> {
 		match message {
 			inspector_protocol::ClientMessage::PatchStateRequest(request) => {
+				let state = request.state;
 				instance
 					.ctx
-					.save_state(vec![StateDelta::ActorState(request.state)])
+					.save_state(vec![StateDelta::ActorState(state.clone())])
 					.await
 					.context("save inspector websocket state patch")?;
-				Ok(None)
+				Ok(Some(InspectorServerMessage::StateUpdated(
+					inspector_protocol::StateUpdated { state },
+				)))
 			}
 			inspector_protocol::ClientMessage::StateRequest(request) => {
 				Ok(Some(InspectorServerMessage::StateResponse(

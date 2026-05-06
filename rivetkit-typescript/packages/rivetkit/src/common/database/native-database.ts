@@ -1,14 +1,48 @@
 import { decodeBridgeRivetError } from "@/actor/errors";
-import { AsyncMutex } from "./shared";
-import type { SqliteBindings, SqliteDatabase } from "./config";
+import type {
+	SqliteBindings,
+	SqliteDatabase,
+	SqliteExecuteResult,
+	SqliteNativeMetrics,
+} from "./config";
 
-interface NativeBindParam {
-	kind: "null" | "int" | "float" | "text" | "blob";
-	intValue?: number;
-	floatValue?: number;
-	textValue?: string;
-	blobValue?: Buffer;
-}
+type NativeBindNoValues = {
+	intValue?: never;
+	floatValue?: never;
+	textValue?: never;
+	blobValue?: never;
+};
+
+type NativeBindParam =
+	| ({ kind: "null" } & NativeBindNoValues)
+	| {
+			kind: "int";
+			intValue: number;
+			floatValue?: never;
+			textValue?: never;
+			blobValue?: never;
+	  }
+	| {
+			kind: "float";
+			intValue?: never;
+			floatValue: number;
+			textValue?: never;
+			blobValue?: never;
+	  }
+	| {
+			kind: "text";
+			intValue?: never;
+			floatValue?: never;
+			textValue: string;
+			blobValue?: never;
+	  }
+	| {
+			kind: "blob";
+			intValue?: never;
+			floatValue?: never;
+			textValue?: never;
+			blobValue: Buffer;
+	  };
 
 interface NativeExecResult {
 	columns: string[];
@@ -24,17 +58,19 @@ interface NativeRunResult {
 	changes: number;
 }
 
-export interface SqliteVfsMetrics {
-	requestBuildNs: number;
-	serializeNs: number;
-	transportNs: number;
-	stateUpdateNs: number;
-	totalNs: number;
-	commitCount: number;
+interface NativeExecuteResult {
+	columns: string[];
+	rows: unknown[][];
+	changes: number;
+	lastInsertRowId?: number | null;
 }
 
 export interface JsNativeDatabaseLike {
 	exec(sql: string): Promise<NativeExecResult>;
+	execute(
+		sql: string,
+		params?: NativeBindParam[] | null,
+	): Promise<NativeExecuteResult>;
 	query(
 		sql: string,
 		params?: NativeBindParam[] | null,
@@ -43,7 +79,7 @@ export interface JsNativeDatabaseLike {
 		sql: string,
 		params?: NativeBindParam[] | null,
 	): Promise<NativeRunResult>;
-	getSqliteVfsMetrics?(): SqliteVfsMetrics | null;
+	metrics?(): SqliteNativeMetrics | null;
 	takeLastKvError?(): string | null;
 	close(): Promise<void>;
 }
@@ -167,17 +203,112 @@ function toNativeBindings(
 	});
 }
 
-export function wrapJsNativeDatabase(
-	database: JsNativeDatabaseLike,
-): SqliteDatabase {
-	const mutex = new AsyncMutex();
-	let closed = false;
+function normalizeNativeMetrics(
+	metrics: SqliteNativeMetrics | null | undefined,
+): SqliteNativeMetrics | null {
+	if (!metrics) return null;
+	const raw = metrics as unknown as Record<string, unknown>;
+	const numberField = (camel: string, snake: string) =>
+		Number(raw[camel] ?? raw[snake] ?? 0);
 
-	const ensureOpen = () => {
-		if (closed) {
+	return {
+		requestBuildNs: numberField("requestBuildNs", "request_build_ns"),
+		serializeNs: numberField("serializeNs", "serialize_ns"),
+		transportNs: numberField("transportNs", "transport_ns"),
+		stateUpdateNs: numberField("stateUpdateNs", "state_update_ns"),
+		totalNs: numberField("totalNs", "total_ns"),
+		commitCount: numberField("commitCount", "commit_count"),
+		pageCacheEntries: numberField("pageCacheEntries", "page_cache_entries"),
+		pageCacheWeightedSize: numberField(
+			"pageCacheWeightedSize",
+			"page_cache_weighted_size",
+		),
+		pageCacheCapacityPages: numberField(
+			"pageCacheCapacityPages",
+			"page_cache_capacity_pages",
+		),
+		writeBufferDirtyPages: numberField(
+			"writeBufferDirtyPages",
+			"write_buffer_dirty_pages",
+		),
+		dbSizePages: numberField("dbSizePages", "db_size_pages"),
+	};
+}
+
+class NativeCloseGate {
+	#active = 0;
+	#closed = false;
+	#waiters: (() => void)[] = [];
+
+	enter(): () => void {
+		if (this.#closed) {
 			throw new Error(
 				"Database is closed. This usually means a background timer (setInterval, setTimeout) or a stray promise is still running after the actor stopped. Use c.abortSignal to clean up timers before the actor shuts down.",
 			);
+		}
+
+		this.#active++;
+		let released = false;
+		return () => {
+			if (released) {
+				return;
+			}
+			released = true;
+			this.#active--;
+			if (this.#active === 0) {
+				const waiters = this.#waiters.splice(0);
+				for (const waiter of waiters) {
+					waiter();
+				}
+			}
+		};
+	}
+
+	async close(callback: () => Promise<void>): Promise<void> {
+		if (this.#closed) {
+			return;
+		}
+		this.#closed = true;
+		if (this.#active > 0) {
+			await new Promise<void>((resolve) => this.#waiters.push(resolve));
+		}
+		await callback();
+	}
+}
+
+export function wrapJsNativeDatabase(
+	database: JsNativeDatabaseLike,
+): SqliteDatabase {
+	const gate = new NativeCloseGate();
+	let closePromise: Promise<void> | undefined;
+	let lastInsertRowId: number | null = null;
+
+	const executeNative = async (
+		sql: string,
+		params?: SqliteBindings,
+	): Promise<SqliteExecuteResult> => {
+		const lastInsertRowIdColumn = lastInsertRowIdColumnName(sql);
+		if (lastInsertRowIdColumn) {
+			return {
+				columns: [lastInsertRowIdColumn],
+				rows: [[lastInsertRowId ?? 0]],
+				changes: 0,
+				lastInsertRowId,
+			};
+		}
+
+		const release = gate.enter();
+		try {
+			const nativeParams = toNativeBindings(sql, params);
+			const result = await database.execute(sql, nativeParams);
+			if (result.lastInsertRowId !== undefined) {
+				lastInsertRowId = result.lastInsertRowId;
+			}
+			return result;
+		} catch (error) {
+			enrichNativeDatabaseError(database, error);
+		} finally {
+			release();
 		}
 	};
 
@@ -186,14 +317,15 @@ export function wrapJsNativeDatabase(
 			sql: string,
 			callback?: (row: unknown[], columns: string[]) => void,
 		): Promise<void> {
-			const result = await mutex.run(async () => {
-				ensureOpen();
-				try {
-					return await database.exec(sql);
-				} catch (error) {
-					enrichNativeDatabaseError(database, error);
-				}
-			});
+			const release = gate.enter();
+			let result: NativeExecResult;
+			try {
+				result = await database.exec(sql);
+			} catch (error) {
+				enrichNativeDatabaseError(database, error);
+			} finally {
+				release();
+			}
 			if (!callback) {
 				return;
 			}
@@ -201,37 +333,47 @@ export function wrapJsNativeDatabase(
 				callback(row, result.columns);
 			}
 		},
+		async execute(
+			sql: string,
+			params?: SqliteBindings,
+		): Promise<SqliteExecuteResult> {
+			return await executeNative(sql, params);
+		},
 		async run(sql: string, params?: SqliteBindings): Promise<void> {
-			await mutex.run(async () => {
-				ensureOpen();
-				try {
-					await database.run(sql, toNativeBindings(sql, params));
-				} catch (error) {
-					enrichNativeDatabaseError(database, error);
-				}
-			});
+			await executeNative(sql, params);
 		},
 		async query(sql: string, params?: SqliteBindings) {
-			return await mutex.run(async () => {
-				ensureOpen();
-				try {
-					return await database.query(sql, toNativeBindings(sql, params));
-				} catch (error) {
-					enrichNativeDatabaseError(database, error);
-				}
-			});
+			const { columns, rows } = await executeNative(sql, params);
+			return { columns, rows };
 		},
-		getSqliteVfsMetrics() {
-			return database.getSqliteVfsMetrics?.() ?? null;
+		nativeMetrics(): SqliteNativeMetrics | null {
+			return normalizeNativeMetrics(database.metrics?.());
 		},
 		async close(): Promise<void> {
-			await mutex.run(async () => {
-				if (closed) {
-					return;
-				}
-				closed = true;
-				await database.close();
-			});
+			closePromise ??= gate.close(() => database.close());
+			await closePromise;
 		},
 	};
+}
+
+function lastInsertRowIdColumnName(sql: string): string | undefined {
+	const match = sql.match(
+		/^\s*SELECT\s+last_insert_rowid\s*\(\s*\)\s*(?:AS\s+("[^"]+"|`[^`]+`|\[[^\]]+\]|\w+))?\s*;?\s*$/i,
+	);
+	if (!match) {
+		return undefined;
+	}
+
+	const alias = match[1];
+	if (!alias) {
+		return "last_insert_rowid()";
+	}
+	if (
+		(alias.startsWith('"') && alias.endsWith('"')) ||
+		(alias.startsWith("`") && alias.endsWith("`")) ||
+		(alias.startsWith("[") && alias.endsWith("]"))
+	) {
+		return alias.slice(1, -1);
+	}
+	return alias;
 }

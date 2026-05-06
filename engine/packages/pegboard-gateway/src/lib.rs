@@ -9,7 +9,10 @@ use rivet_error::*;
 use rivet_guard_core::{
 	ResponseBody, WebSocketHandle,
 	custom_serve::{CustomServeTrait, HibernationResult},
-	errors::{ServiceUnavailable, WebSocketServiceUnavailable},
+	errors::{
+		ActorStoppedWhileWaiting, GatewayResponseStartTimeout, TunnelMessageTimeout,
+		TunnelRequestAborted, TunnelResponseClosed, WebSocketServiceUnavailable,
+	},
 	request_context::RequestContext,
 	utils::is_ws_hibernate,
 	websocket_handle::WebSocketReceiver,
@@ -168,7 +171,7 @@ impl PegboardGateway {
 								}
 								protocol::mk2::ToServerTunnelMessageKind::ToServerResponseAbort => {
 									tracing::warn!("request aborted");
-									return Err(ServiceUnavailable.build());
+									return Err(TunnelRequestAborted.build());
 								}
 								_ => {
 									tracing::warn!("received non-response message from pubsub");
@@ -179,21 +182,19 @@ impl PegboardGateway {
 								request_id=%protocol::util::id_to_string(&request_id),
 								"received no message response during request init",
 							);
-							break;
+							return Err(TunnelResponseClosed.build());
 						}
 					}
 					_ = stopped_sub.next() => {
 						tracing::debug!("actor stopped while waiting for request response");
-						return Err(ServiceUnavailable.build());
+						return Err(ActorStoppedWhileWaiting.build());
 					}
 					_ = drop_rx.changed() => {
 						tracing::warn!(reason=?drop_rx.borrow(), "tunnel message timeout");
-						return Err(ServiceUnavailable.build());
+						return Err(TunnelMessageTimeout.build());
 					}
 				}
 			}
-
-			Err(ServiceUnavailable.build())
 		};
 		let response_start_timeout = Duration::from_millis(
 			self.ctx
@@ -206,7 +207,7 @@ impl PegboardGateway {
 			.map_err(|_| {
 				tracing::warn!("timed out waiting for response start from runner");
 
-				ServiceUnavailable.build()
+				GatewayResponseStartTimeout.build()
 			})??;
 		tracing::debug!("response handler task ended");
 

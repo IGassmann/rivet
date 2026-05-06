@@ -1,5 +1,7 @@
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::time::Instant;
 
 use parking_lot::Mutex;
 use scc::HashMap as SccHashMap;

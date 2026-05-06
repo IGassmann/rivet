@@ -9,7 +9,7 @@ import { RemoteEngineControlClient } from "@/engine-client/mod";
 import { ENGINE_ENDPOINT } from "@/common/engine";
 import type { Registry } from "@/registry";
 import type { RegistryActors, RegistryConfig } from "@/registry/config";
-import { getNodeFsSync } from "@/utils/node";
+import { getNodeFsSync, importNodeDependencies } from "@/utils/node";
 import pkg from "../package.json" with { type: "json" };
 import { logger } from "../src/registry/log";
 
@@ -149,6 +149,7 @@ export class Runtime<A extends RegistryActors> {
 
 		if (this.#config.staticDir) {
 			try {
+				importNodeDependencies();
 				const fsSync = getNodeFsSync();
 				if (fsSync.existsSync(this.#config.staticDir)) {
 					logLine("Static", `./${this.#config.staticDir}`);

@@ -1,40 +1,180 @@
 import { registry } from "./index.ts";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
+import type { Server as HttpServer } from "node:http";
+import * as v8 from "node:v8";
 
 const app = new Hono();
+const port = Number.parseInt(process.env.PORT ?? "3000", 10);
+const serverlessMode =
+	process.env.RIVET_RUN_ENGINE === "1" ||
+	process.env.RIVET_SERVERLESS_URL !== undefined ||
+	process.env.KITCHEN_SINK_SERVERLESS_URL !== undefined;
 
-function requestHeaders(headers: Headers) {
-	return Object.fromEntries(
-		Array.from(headers.entries()).map(([key, value]) => [
-			key,
-			key === "authorization" || key === "x-rivet-token"
-				? "<redacted>"
-				: value,
-		]),
-	);
+process.on("exit", (code) => {
+	console.log(JSON.stringify({ kind: "process_exit", code, pid: process.pid }));
+});
+if (process.env.SQLITE_MEMORY_SOAK_DIAGNOSTICS === "1") {
+	for (const signal of ["SIGINT", "SIGTERM"] as const) {
+		process.on(signal, () => {
+			console.log(
+				JSON.stringify({
+					kind: "process_signal",
+					signal,
+					pid: process.pid,
+					ppid: process.ppid,
+					timestamp: new Date().toISOString(),
+				}),
+			);
+			process.exit(signal === "SIGINT" ? 130 : 143);
+		});
+	}
 }
-
-app.use("*", async (c, next) => {
-	const startedAt = Date.now();
-	await next();
-	console.log(
+process.on("beforeExit", (code) => {
+	console.log(JSON.stringify({ kind: "process_before_exit", code, pid: process.pid }));
+});
+process.on("uncaughtException", (error) => {
+	console.error(
 		JSON.stringify({
-			kind: "request",
-			method: c.req.method,
-			path: new URL(c.req.url).pathname,
-			headers: requestHeaders(c.req.raw.headers),
-			status: c.res.status,
-			durationMs: Date.now() - startedAt,
+			kind: "uncaught_exception",
+			error: error.stack ?? error.message,
+		}),
+	);
+});
+process.on("unhandledRejection", (reason) => {
+	console.error(
+		JSON.stringify({
+			kind: "unhandled_rejection",
+			error: reason instanceof Error ? reason.stack ?? reason.message : String(reason),
 		}),
 	);
 });
 
-app.all("/api/rivet/*", (c) => registry.handler(c.req.raw));
-app.all("/api/rivet", (c) => registry.handler(c.req.raw));
+async function memoryBreakdown(forceGc: boolean) {
+	const gc = (globalThis as typeof globalThis & { gc?: () => void }).gc;
+	if (forceGc && typeof gc === "function") gc();
 
-serve({ fetch: app.fetch, port: 3000 }, () => {
-	console.log(
-		"serverless RivetKit listening on http://127.0.0.1:3000/api/rivet",
-	);
+	const memory = process.memoryUsage();
+	const heap = v8.getHeapStatistics();
+	const spaces = v8.getHeapSpaceStatistics();
+	const nativeNonV8Estimate = Math.max(0, memory.rss - heap.total_heap_size);
+	const diagnostics =
+		"diagnostics" in registry &&
+		typeof registry.diagnostics === "function"
+			? registry.diagnostics.bind(registry)
+			: undefined;
+	const registryDiagnostics = diagnostics
+		? await diagnostics().catch((error: unknown) => ({
+				error: error instanceof Error ? error.message : String(error),
+			}))
+		: { error: "registry diagnostics unavailable" };
+
+	return {
+		pid: process.pid,
+		timestamp: new Date().toISOString(),
+		uptimeSeconds: process.uptime(),
+		gcRequested: forceGc,
+		gcAvailable: typeof gc === "function",
+		process: {
+			rssBytes: memory.rss,
+			heapTotalBytes: memory.heapTotal,
+			heapUsedBytes: memory.heapUsed,
+			externalBytes: memory.external,
+			arrayBuffersBytes: memory.arrayBuffers,
+		},
+		v8: {
+			totalHeapSizeBytes: heap.total_heap_size,
+			usedHeapSizeBytes: heap.used_heap_size,
+			heapSizeLimitBytes: heap.heap_size_limit,
+			mallocedMemoryBytes: heap.malloced_memory,
+			externalMemoryBytes: heap.external_memory,
+			peakMallocedMemoryBytes: heap.peak_malloced_memory,
+			spaces: spaces.map((space) => ({
+				name: space.space_name,
+				sizeBytes: space.space_size,
+				usedBytes: space.space_used_size,
+				availableBytes: space.space_available_size,
+				physicalSizeBytes: space.physical_space_size,
+			})),
+		},
+		estimates: {
+			jsHeapResidentBytes: memory.heapTotal,
+			jsHeapUsedBytes: memory.heapUsed,
+			v8ExternalBytes: memory.external,
+			nativeNonV8ResidentEstimateBytes: nativeNonV8Estimate,
+		},
+		registry: registryDiagnostics,
+		resourceUsage: process.resourceUsage(),
+	};
+}
+
+function requestHeaders(headers: Headers) {
+	const entries: Array<[string, string]> = [];
+	headers.forEach((value, key) => {
+		entries.push([
+			key,
+			key === "authorization" || key === "x-rivet-token"
+				? "<redacted>"
+				: value,
+		]);
+	});
+	return Object.fromEntries(entries);
+}
+
+app.get("/debug/memory", async (c) => {
+	const forceGc = c.req.query("gc") === "1";
+	return c.json(await memoryBreakdown(forceGc));
 });
+
+app.post("/debug/heap-snapshot", (c) => {
+	if (process.env.SQLITE_MEMORY_SOAK_DIAGNOSTICS !== "1") {
+		return c.json({ error: "disabled" }, 404);
+	}
+
+	const path = c.req.query("path");
+	if (!path) {
+		return c.json({ error: "missing path" }, 400);
+	}
+
+	const writtenPath = v8.writeHeapSnapshot(path);
+	return c.json({ path: writtenPath });
+});
+
+app.use("*", async (c, next) => {
+	const startedAt = Date.now();
+	await next();
+	// console.log(
+	// 	JSON.stringify({
+	// 		kind: "request",
+	// 		method: c.req.method,
+	// 		path: new URL(c.req.url).pathname,
+	// 		headers: requestHeaders(c.req.raw.headers),
+	// 		status: c.res.status,
+	// 		durationMs: Date.now() - startedAt,
+	// 	}),
+	// );
+});
+
+if (serverlessMode) {
+	app.all("/api/rivet/*", (c) => registry.handler(c.req.raw));
+	app.all("/api/rivet", (c) => registry.handler(c.req.raw));
+} else {
+	registry.start();
+}
+
+const server = serve({ fetch: app.fetch, port }, () => {
+	if (serverlessMode) {
+		console.log(
+			`serverless RivetKit listening on http://127.0.0.1:${port}/api/rivet`,
+		);
+	} else {
+		console.log(
+			`kitchen sink diagnostics listening on http://127.0.0.1:${port}`,
+		);
+	}
+});
+const httpServer = server as unknown as HttpServer;
+httpServer.requestTimeout = 0;
+httpServer.headersTimeout = 0;
+httpServer.keepAliveTimeout = 0;
+httpServer.timeout = 0;

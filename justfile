@@ -2,6 +2,10 @@
 release *ARGS:
 	pnpm --filter=publish release {{ ARGS }}
 
+[group('release')]
+preview-publish:
+	gh workflow run .github/workflows/publish.yaml --ref "$(git rev-parse --abbrev-ref HEAD)"
+
 [group('docker')]
 docker-build:
 	docker build -f engine/docker/universal/Dockerfile --target engine-full -t rivetdev/engine:local --platform linux/x86_64 .

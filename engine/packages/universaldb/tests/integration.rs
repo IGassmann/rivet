@@ -74,6 +74,10 @@ async fn run_all_tests(db: universaldb::Database) {
 	test_basic_operations(&db).await;
 	clear_test_namespace(&db).await.unwrap();
 
+	// Test that plain Set stores arbitrary binary values verbatim.
+	test_plain_set_preserves_versionstamp_like_binary(&db).await;
+	clear_test_namespace(&db).await.unwrap();
+
 	// Test range operations
 	test_range_operations(&db).await;
 	clear_test_namespace(&db).await.unwrap();
@@ -212,6 +216,38 @@ async fn clear_test_namespace(db: &Database) -> Result<()> {
 		Ok(())
 	})
 	.await
+}
+
+async fn test_plain_set_preserves_versionstamp_like_binary(db: &Database) {
+	let test_subspace = Subspace::from("test");
+	let key = test_subspace.pack(&("plain-set-versionstamp-like-binary",));
+	let mut value = Vec::from([
+		0x33, 0x5a, 0x33, 0x59, 0x41, 0x37, 0x6c, 0x1d, 0x00, 0x09, 0x1f, 0x6b, 0x1d, 0x00, 0x09,
+		0x1f,
+	]);
+	value.extend_from_slice(&[0; 64]);
+
+	db.run(|tx| {
+		let key = key.clone();
+		let value = value.clone();
+		async move {
+			tx.set(&key, &value);
+			Ok(())
+		}
+	})
+	.await
+	.unwrap();
+
+	let actual = db
+		.run(|tx| {
+			let key = key.clone();
+			async move { tx.get(&key, Serializable).await }
+		})
+		.await
+		.unwrap()
+		.unwrap();
+
+	assert_eq!(actual.as_slice(), value.as_slice());
 }
 
 async fn test_basic_operations(db: &Database) {

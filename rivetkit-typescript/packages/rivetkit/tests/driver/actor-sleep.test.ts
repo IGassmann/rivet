@@ -157,8 +157,7 @@ describeDriverMatrix("Actor Sleep", (driverTestConfig) => {
 			);
 		});
 
-		// TODO(#4707): Root-cause persistent connection sleep-state behavior and re-enable this coverage.
-		test.skip("actor sleep persists state with connect", async (c) => {
+		test("actor sleep persists state with connect", async (c) => {
 			const { client } = await setupDriverTest(c, driverTestConfig);
 
 			// Create actor with persistent connection
@@ -302,6 +301,138 @@ describeDriverMatrix("Actor Sleep", (driverTestConfig) => {
 				expect(status.startCount).toBe(2);
 				expect(status.waitUntilCompleted).toBe(true);
 			}
+		});
+
+		// Reproduces the user-reported pattern where an abort listener is
+		// registered inside `onWake` and touches `c.vars` when the actor
+		// begins shutting down:
+		//
+		//   onWake: (c) => {
+		//     c.abortSignal.addEventListener('abort', () => {
+		//       c.vars.isStopping = true;   // TypeError in production
+		//     }, { once: true });
+		//   }
+		//
+		// In production this throws `Cannot set properties of undefined
+		// (setting 'isStopping')` when the abort TSF lands on the JS side
+		// after `onSleep`'s `finally` block has already run
+		// `cleanupNativeSleepRuntimeState`, which clears the per-actor JS
+		// runtime-state bag that backs the `vars` getter
+		// (rivetkit/src/registry/native.ts:419, 2484, 3996). The next read
+		// of `c.vars` then sees a freshly-created empty bag and returns
+		// `undefined`.
+		//
+		// The race is between:
+		//   - the tokio task in rivetkit-napi/src/actor_context.rs:502
+		//     that dispatches the abort TSF when `actor_token` cancels,
+		//   - the `RunGracefulCleanup` handler in
+		//     rivetkit-napi/src/napi_actor_events.rs:596 that dispatches
+		//     the `on_sleep` TSF.
+		// Whichever TSF lands first in Node's event-loop FIFO wins. When
+		// `on_sleep` lands first and its async `finally` (saveState +
+		// cleanup) finishes before the abort TSF lands, the abort listener
+		// observes a cleared bag and crashes.
+		test("c.vars survives in abort listener captured by onWake", async (c) => {
+			const { client } = await setupDriverTest(c, {
+				...driverTestConfig,
+				useRealTimers: true,
+			});
+
+			const sleepActor =
+				client.sleepAbortListenerVarsActor.getOrCreate();
+
+			{
+				const status = await sleepActor.getStatus();
+				expect(status.startCount).toBe(1);
+				expect(status.sleepCount).toBe(0);
+				expect(status.abortVarsSeenPerWake).toEqual(["unset"]);
+			}
+
+			// Drive the actor through several wake/sleep cycles. The user
+			// reported the crash can surface on the *second* abort, after
+			// the actor has already gone through one full
+			// reset_runtime_state + cleanup cycle on a previous wake.
+			for (let cycle = 0; cycle < 3; cycle += 1) {
+				const ws = await connectRawWebSocketWithRetry(sleepActor);
+				await sleepActor.triggerSleep();
+				await new Promise((resolve) => setTimeout(resolve, 1500));
+				try {
+					ws.close();
+				} catch {
+					// WebSocket may already be closed.
+				}
+			}
+
+			const status = await sleepActor.getStatus();
+			expect(status.sleepCount).toBe(3);
+			expect(status.startCount).toBeGreaterThanOrEqual(4);
+
+			// Every abort listener registered in onWake must have observed
+			// `c.vars` as a real object. If the race condition fires on
+			// any cycle, that wake's slot reads `"undefined"` (or an error
+			// string) and the assertion fails — pinning the bug.
+			for (let i = 0; i < status.abortVarsSeenPerWake.length - 1; i += 1) {
+				expect({
+					wake: i + 1,
+					observation: status.abortVarsSeenPerWake[i],
+				}).toEqual({ wake: i + 1, observation: "object" });
+			}
+		}, 60_000);
+
+		test("waitUntil accepts promises that resolve to undefined", async (c) => {
+			const { client, getRuntimeOutput } = await setupDriverTest(
+				c,
+				driverTestConfig,
+			);
+
+			const probe = client.counterWaitUntilProbe.getOrCreate();
+
+			expect(await probe.triggerWaitUntilVoid()).toBe(1);
+			await waitFor(driverTestConfig, 50);
+
+			expect(await probe.getCount()).toBe(1);
+			expect(getRuntimeOutput()).not.toContain(
+				"undefined cannot be represented as a serde_json::Value",
+			);
+
+			expect(await probe.triggerWaitUntilWithValue()).toBe(2);
+			await waitFor(driverTestConfig, 50);
+
+			expect(await probe.getCount()).toBe(2);
+			expect(getRuntimeOutput()).not.toContain(
+				"undefined cannot be represented as a serde_json::Value",
+			);
+
+			expect(await probe.triggerWaitUntilRejectVoid()).toBe(3);
+			await waitFor(driverTestConfig, 50);
+
+			const runtimeOutput = getRuntimeOutput();
+			expect(runtimeOutput).toContain("actor wait_until promise rejected");
+			expect(runtimeOutput).toContain("reject-with-error-ok");
+			expect(runtimeOutput).not.toContain(
+				"undefined cannot be represented as a serde_json::Value",
+			);
+		});
+
+		test("keepAwake accepts promises that resolve to undefined", async (c) => {
+			const { client, getRuntimeOutput } = await setupDriverTest(
+				c,
+				driverTestConfig,
+			);
+
+			const probe = client.counterWaitUntilProbe.getOrCreate();
+
+			expect(await probe.triggerKeepAwakeVoid()).toBe(1);
+			expect(await probe.triggerKeepAwakeWithValue()).toBe(2);
+			expect(await probe.getCount()).toBe(2);
+
+			const runtimeOutput = getRuntimeOutput();
+			expect(runtimeOutput).not.toContain(
+				"keepAwake bridge to native runtime failed",
+			);
+			expect(runtimeOutput).not.toContain(
+				"undefined cannot be represented as a serde_json::Value",
+			);
 		});
 
 		test("rpc calls keep actor awake", async (c) => {

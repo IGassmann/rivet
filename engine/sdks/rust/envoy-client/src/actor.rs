@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::async_counter::AsyncCounter;
 use rivet_envoy_protocol as protocol;
-use rivet_util::async_counter::AsyncCounter;
 use rivet_util_serde::HashableMap;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -16,7 +16,9 @@ use crate::connection::ws_send;
 use crate::context::SharedContext;
 use crate::handle::EnvoyHandle;
 use crate::stringify::stringify_to_rivet_tunnel_message_kind;
-use crate::utils::{BufferMap, id_to_str, wrapping_add_u16, wrapping_lte_u16, wrapping_sub_u16};
+use crate::utils::{
+	BufferMap, id_to_str, spawn_detached, wrapping_add_u16, wrapping_lte_u16, wrapping_sub_u16,
+};
 
 pub enum ToActor {
 	Intent {
@@ -125,18 +127,16 @@ pub fn create_actor(
 	config: protocol::ActorConfig,
 	hibernating_requests: Vec<protocol::HibernatingRequest>,
 	preloaded_kv: Option<protocol::PreloadedKv>,
-	sqlite_startup_data: Option<protocol::SqliteStartupData>,
 ) -> (mpsc::UnboundedSender<ToActor>, Arc<AsyncCounter>) {
 	let (tx, rx) = mpsc::unbounded_channel();
 	let active_http_request_count = Arc::new(AsyncCounter::new());
-	tokio::spawn(actor_inner(
+	spawn_detached(actor_inner(
 		shared,
 		actor_id,
 		generation,
 		config,
 		hibernating_requests,
 		preloaded_kv,
-		sqlite_startup_data,
 		rx,
 		active_http_request_count.clone(),
 	));
@@ -158,7 +158,6 @@ async fn actor_inner(
 	config: protocol::ActorConfig,
 	hibernating_requests: Vec<protocol::HibernatingRequest>,
 	preloaded_kv: Option<protocol::PreloadedKv>,
-	sqlite_startup_data: Option<protocol::SqliteStartupData>,
 	mut rx: mpsc::UnboundedReceiver<ToActor>,
 	active_http_request_count: Arc<AsyncCounter>,
 ) {
@@ -194,12 +193,12 @@ async fn actor_inner(
 			generation,
 			config,
 			preloaded_kv,
-			sqlite_startup_data,
 		)
 		.await;
 
 	if let Err(error) = start_result {
-		tracing::error!(?error, "actor start failed");
+		let error_chain = error.chain().map(ToString::to_string).collect::<Vec<_>>();
+		tracing::error!(?error, error_chain = ?error_chain, "actor start failed");
 		send_event(
 			&mut ctx,
 			protocol::Event::EventActorStateUpdate(protocol::EventActorStateUpdate {
@@ -543,27 +542,30 @@ fn handle_req_start(
 	let request_id = message_id.request_id;
 	let request_guard = ActiveHttpRequestGuard::new(ctx.active_http_request_count.clone());
 
-	http_request_tasks.spawn(
-		async move {
-			let _request_guard = request_guard;
-			let response = shared
-				.config
-				.callbacks
-				.fetch(handle_clone, actor_id, gateway_id, request_id, request)
-				.await;
+	let task = async move {
+		let _request_guard = request_guard;
+		let response = shared
+			.config
+			.callbacks
+			.fetch(handle_clone, actor_id, gateway_id, request_id, request)
+			.await;
 
-			match response {
-				Ok(response) => {
-					send_response(&shared, gateway_id, request_id, response).await;
-				}
-				Err(error) => {
-					tracing::error!(?error, "fetch failed");
-					send_fetch_error_response(&shared, gateway_id, request_id).await;
-				}
+		match response {
+			Ok(response) => {
+				send_response(&shared, gateway_id, request_id, response).await;
+			}
+			Err(error) => {
+				tracing::error!(?error, "fetch failed");
+				send_fetch_error_response(&shared, gateway_id, request_id).await;
 			}
 		}
-		.in_current_span(),
-	);
+	}
+	.in_current_span();
+
+	#[cfg(target_arch = "wasm32")]
+	http_request_tasks.spawn_local(task);
+	#[cfg(not(target_arch = "wasm32"))]
+	http_request_tasks.spawn(task);
 
 	if !req.stream {
 		ctx.pending_requests
@@ -687,7 +689,7 @@ fn spawn_ws_outgoing_task(
 			}
 		}
 	};
-	tokio::spawn(ws_task.in_current_span());
+	spawn_detached(ws_task.in_current_span());
 }
 
 async fn handle_ws_open(
@@ -1349,7 +1351,9 @@ async fn send_fetch_error_response(
 	gateway_id: protocol::GatewayId,
 	request_id: protocol::RequestId,
 ) {
-	let body = br#"{"group":"envoy","code":"fetch_failed","message":"actor fetch failed","metadata":{}}"#.to_vec();
+	let body =
+		br#"{"group":"envoy","code":"fetch_failed","message":"actor fetch failed","metadata":{}}"#
+			.to_vec();
 	let mut headers = HashableMap::new();
 	headers.insert("content-type".to_string(), "application/json".to_string());
 	headers.insert("content-length".to_string(), body.len().to_string());
@@ -1385,12 +1389,11 @@ mod tests {
 	use std::future::pending;
 	use std::sync::Mutex;
 	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-	use std::time::Duration;
+	use std::time::{Duration, Instant};
 
 	use tokio::sync::Notify;
 	use tokio::sync::oneshot;
 	use tokio::task::yield_now;
-	use tokio::time::Instant;
 
 	use super::*;
 	use crate::config::{BoxFuture, EnvoyCallbacks, WebSocketHandler, WebSocketSender};
@@ -1458,7 +1461,6 @@ mod tests {
 			_generation: u32,
 			_config: protocol::ActorConfig,
 			_preloaded_kv: Option<protocol::PreloadedKv>,
-			_sqlite_startup_data: Option<protocol::SqliteStartupData>,
 		) -> BoxFuture<anyhow::Result<()>> {
 			Box::pin(async { Ok(()) })
 		}
@@ -1559,7 +1561,6 @@ mod tests {
 			_generation: u32,
 			_config: protocol::ActorConfig,
 			_preloaded_kv: Option<protocol::PreloadedKv>,
-			_sqlite_startup_data: Option<protocol::SqliteStartupData>,
 		) -> BoxFuture<anyhow::Result<()>> {
 			Box::pin(async { Ok(()) })
 		}
@@ -1651,6 +1652,7 @@ mod tests {
 			envoy_key: "test-envoy".to_string(),
 			envoy_tx,
 			actors: Arc::new(std::sync::Mutex::new(HashMap::new())),
+			actors_notify: Arc::new(tokio::sync::Notify::new()),
 			live_tunnel_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
 			pending_hibernation_restores: Arc::new(std::sync::Mutex::new(HashMap::new())),
 			ws_tx: Arc::new(tokio::sync::Mutex::new(
@@ -1811,8 +1813,6 @@ mod tests {
 			actor_config(),
 			Vec::new(),
 			None,
-			0,
-			None,
 		);
 
 		actor_tx
@@ -1852,8 +1852,6 @@ mod tests {
 			1,
 			actor_config(),
 			Vec::new(),
-			None,
-			0,
 			None,
 		);
 
@@ -1899,8 +1897,6 @@ mod tests {
 			actor_config(),
 			Vec::new(),
 			None,
-			0,
-			None,
 		);
 
 		actor_tx
@@ -1933,8 +1929,6 @@ mod tests {
 			1,
 			actor_config(),
 			Vec::new(),
-			None,
-			0,
 			None,
 		);
 

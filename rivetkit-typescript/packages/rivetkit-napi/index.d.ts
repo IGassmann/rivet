@@ -51,6 +51,7 @@ export interface JsActorConfig {
   name?: string
   icon?: string
   hasDatabase?: boolean
+  remoteSqlite?: boolean
   hasState?: boolean
   canHibernateWebsocket?: boolean
   stateSaveIntervalMs?: number
@@ -92,6 +93,12 @@ export interface QueryResult {
   columns: Array<string>
   rows: Array<Array<any>>
 }
+export interface NativeExecuteResult {
+  columns: Array<string>
+  rows: Array<Array<any>>
+  changes: number
+  lastInsertRowId?: number
+}
 export interface JsSqliteVfsMetrics {
   requestBuildNs: number
   serializeNs: number
@@ -99,6 +106,11 @@ export interface JsSqliteVfsMetrics {
   stateUpdateNs: number
   totalNs: number
   commitCount: number
+  pageCacheEntries: number
+  pageCacheWeightedSize: number
+  pageCacheCapacityPages: number
+  writeBufferDirtyPages: number
+  dbSizePages: number
 }
 export interface JsQueueNextOptions {
   names?: Array<string>
@@ -162,6 +174,10 @@ export interface JsServerlessResponseHead {
   status: number
   headers: Record<string, string>
 }
+export interface JsRegistryDiagnostics {
+  mode: string
+  envoyActiveActorCount?: number
+}
 export interface JsServerlessStreamError {
   group: string
   code: string
@@ -212,6 +228,9 @@ export declare class ActorContext {
   aborted(): boolean
   runHandlerActive(): boolean
   restartRunHandler(): void
+  beginKeepAwake(): number
+  endKeepAwake(regionId: number): void
+  keepAwake(promise: Promise<any>): void
   beginWebsocketCallback(): number
   endWebsocketCallback(regionId: number): void
   abortSignal(): AbortSignal
@@ -221,7 +240,6 @@ export declare class ActorContext {
   disconnectConns(predicate: (...args: any[]) => any): Promise<void>
   broadcast(name: string, args: Buffer): void
   waitUntil(promise: Promise<any>): void
-  keepAwake(promise: Promise<any>): Promise<any>
   registerTask(promise: Promise<any>): void
   runtimeState(): object
   clearRuntimeState(): void
@@ -246,9 +264,10 @@ export declare class ConnHandle {
 }
 export declare class JsNativeDatabase {
   takeLastKvError(): string | null
-  getSqliteVfsMetrics(): JsSqliteVfsMetrics | null
+  metrics(): JsSqliteVfsMetrics | null
   run(sql: string, params?: Array<JsBindParam> | undefined | null): Promise<ExecuteResult>
   query(sql: string, params?: Array<JsBindParam> | undefined | null): Promise<QueryResult>
+  execute(sql: string, params?: Array<JsBindParam> | undefined | null): Promise<NativeExecuteResult>
   exec(sql: string): Promise<QueryResult>
   close(): Promise<void>
 }
@@ -295,6 +314,7 @@ export declare class CoreRegistry {
    * separately to avoid re-entrancy.
    */
   shutdown(): Promise<void>
+  diagnostics(): Promise<JsRegistryDiagnostics>
   handleServerlessRequest(req: JsServerlessRequest, onStreamEvent: (...args: any[]) => any, cancelToken: CancellationToken, config: JsServeConfig): Promise<JsServerlessResponseHead>
 }
 export declare class Schedule {

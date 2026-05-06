@@ -1,12 +1,16 @@
 use std::fmt;
 
 use anyhow::Result;
-use futures::future::BoxFuture;
 
 use crate::ActorConfig;
 use crate::actor::lifecycle_hooks::ActorStart;
+use crate::runtime::RuntimeBoxFuture;
 
-pub type ActorEntryFn = dyn Fn(ActorStart) -> BoxFuture<'static, Result<()>> + Send + Sync;
+#[cfg(feature = "wasm-runtime")]
+pub type ActorEntryFn = dyn Fn(ActorStart) -> RuntimeBoxFuture<Result<()>>;
+
+#[cfg(not(feature = "wasm-runtime"))]
+pub type ActorEntryFn = dyn Fn(ActorStart) -> RuntimeBoxFuture<Result<()>> + Send + Sync;
 
 /// Runtime extension point for building actor receive loops.
 pub struct ActorFactory {
@@ -15,10 +19,16 @@ pub struct ActorFactory {
 	manual_startup_ready: bool,
 }
 
+#[cfg(feature = "wasm-runtime")]
+unsafe impl Send for ActorFactory {}
+
+#[cfg(feature = "wasm-runtime")]
+unsafe impl Sync for ActorFactory {}
+
 impl ActorFactory {
 	pub fn new<F>(config: ActorConfig, entry: F) -> Self
 	where
-		F: Fn(ActorStart) -> BoxFuture<'static, Result<()>> + Send + Sync + 'static,
+		F: ActorEntry,
 	{
 		Self {
 			config,
@@ -31,7 +41,7 @@ impl ActorFactory {
 	/// after its own startup preamble finishes.
 	pub fn new_with_manual_startup_ready<F>(config: ActorConfig, entry: F) -> Self
 	where
-		F: Fn(ActorStart) -> BoxFuture<'static, Result<()>> + Send + Sync + 'static,
+		F: ActorEntry,
 	{
 		Self {
 			config,
@@ -51,6 +61,24 @@ impl ActorFactory {
 	pub async fn start(&self, start: ActorStart) -> Result<()> {
 		(self.entry)(start).await
 	}
+}
+
+#[cfg(feature = "wasm-runtime")]
+pub trait ActorEntry: Fn(ActorStart) -> RuntimeBoxFuture<Result<()>> + 'static {}
+
+#[cfg(feature = "wasm-runtime")]
+impl<F> ActorEntry for F where F: Fn(ActorStart) -> RuntimeBoxFuture<Result<()>> + 'static {}
+
+#[cfg(not(feature = "wasm-runtime"))]
+pub trait ActorEntry:
+	Fn(ActorStart) -> RuntimeBoxFuture<Result<()>> + Send + Sync + 'static
+{
+}
+
+#[cfg(not(feature = "wasm-runtime"))]
+impl<F> ActorEntry for F where
+	F: Fn(ActorStart) -> RuntimeBoxFuture<Result<()>> + Send + Sync + 'static
+{
 }
 
 impl fmt::Debug for ActorFactory {

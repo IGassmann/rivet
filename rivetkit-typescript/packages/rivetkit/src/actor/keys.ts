@@ -8,6 +8,7 @@ export const KEYS = {
 	INSPECTOR_TOKEN: Uint8Array.from([3]),
 	KV: Uint8Array.from([4]),
 	QUEUE_PREFIX: Uint8Array.from([5]),
+	LAST_PUSHED_ALARM: Uint8Array.from([6]),
 	WORKFLOW_PREFIX: Uint8Array.from([6]),
 	TRACES_PREFIX: Uint8Array.from([7]),
 };

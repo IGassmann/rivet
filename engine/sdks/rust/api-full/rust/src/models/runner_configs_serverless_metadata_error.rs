@@ -11,21 +11,25 @@
 use crate::models;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum RunnerConfigsServerlessMetadataError {
-    RunnerConfigsServerlessMetadataErrorOneOf(Box<models::RunnerConfigsServerlessMetadataErrorOneOf>),
-    RunnerConfigsServerlessMetadataErrorOneOf1(Box<models::RunnerConfigsServerlessMetadataErrorOneOf1>),
-    RunnerConfigsServerlessMetadataErrorOneOf2(Box<models::RunnerConfigsServerlessMetadataErrorOneOf2>),
-    RunnerConfigsServerlessMetadataErrorOneOf3(Box<models::RunnerConfigsServerlessMetadataErrorOneOf3>),
-    RunnerConfigsServerlessMetadataErrorOneOf4(Box<models::RunnerConfigsServerlessMetadataErrorOneOf4>),
-    RunnerConfigsServerlessMetadataErrorOneOf5(Box<models::RunnerConfigsServerlessMetadataErrorOneOf5>),
-    RunnerConfigsServerlessMetadataErrorOneOf6(Box<models::RunnerConfigsServerlessMetadataErrorOneOf6>),
+/// RunnerConfigsServerlessMetadataError : Wire-format envelope for serverless metadata errors.  Surfaced to API clients with a stable `{message, details, metadata}` shape regardless of which internal `ServerlessMetadataError` variant produced it. `metadata.kind` discriminates the variant; per-variant fields live alongside `kind`.
+#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunnerConfigsServerlessMetadataError {
+    #[serde(rename = "details", default, with = "::serde_with::rust::double_option", skip_serializing_if = "Option::is_none")]
+    pub details: Option<Option<String>>,
+    #[serde(rename = "message")]
+    pub message: String,
+    #[serde(rename = "metadata", default, with = "::serde_with::rust::double_option", skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Option<serde_json::Value>>,
 }
 
-impl Default for RunnerConfigsServerlessMetadataError {
-    fn default() -> Self {
-        Self::RunnerConfigsServerlessMetadataErrorOneOf(Default::default())
+impl RunnerConfigsServerlessMetadataError {
+    /// Wire-format envelope for serverless metadata errors.  Surfaced to API clients with a stable `{message, details, metadata}` shape regardless of which internal `ServerlessMetadataError` variant produced it. `metadata.kind` discriminates the variant; per-variant fields live alongside `kind`.
+    pub fn new(message: String) -> RunnerConfigsServerlessMetadataError {
+        RunnerConfigsServerlessMetadataError {
+            details: None,
+            message,
+            metadata: None,
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axum::response::{IntoResponse, Response};
 use rivet_api_builder::{
-	ApiBadRequest, ApiError,
+	ApiError,
 	extract::{Extension, Json, Query},
 };
 use rivet_api_types::{actors::list::*, pagination::Pagination};
@@ -63,17 +63,9 @@ async fn list_inner(ctx: ApiCtx, query: ListQuery) -> Result<ListResponse> {
 			.as_ref()
 			.map(|x| {
 				x.split(',')
-					.map(|s| {
-						s.trim().parse::<rivet_util::Id>().map_err(|e| {
-							ApiBadRequest {
-								reason: format!("invalid id in `actor_ids` query: {e}"),
-							}
-							.build()
-						})
-					})
-					.collect::<Result<Vec<_>>>()
+					.filter_map(|s| s.trim().parse::<rivet_util::Id>().ok())
+					.collect::<Vec<_>>()
 			})
-			.transpose()?
 			.unwrap_or_default(),
 	]
 	.concat();
@@ -121,6 +113,7 @@ async fn list_inner(ctx: ApiCtx, query: ListQuery) -> Result<ListResponse> {
 			query.namespace.clone(),
 			query.include_destroyed,
 			Some(limit),
+			query.cursor.clone(),
 		)
 		.await?;
 

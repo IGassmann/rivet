@@ -96,9 +96,6 @@ pub(crate) async fn batch_preload(
 					break;
 				}
 
-				// Mark this key as scanned regardless of whether it exists in FDB.
-				requested_get_keys.push(key.clone());
-
 				let key_subspace = subspace.subspace(&keys::actor_kv::KeyWrapper(key.clone()));
 				let mut stream = tx.get_ranges_keyvalues(
 					universaldb::RangeOption {
@@ -139,12 +136,24 @@ pub(crate) async fn batch_preload(
 					let size = entry_size(&k, &v, &m);
 					if total_bytes + size <= max_total_bytes {
 						total_bytes += size;
+						requested_get_keys.push(key.clone());
 						entries.push(ep::PreloadedKvEntry {
 							key: k,
 							value: v,
 							metadata: m,
 						});
+					} else {
+						tracing::debug!(
+							?key,
+							size,
+							remaining_budget = max_total_bytes.saturating_sub(total_bytes),
+							"preload get-key skipped due to global budget exhaustion"
+						);
 					}
+				} else {
+					// Mark missing keys as scanned so the runtime can distinguish
+					// "preloaded and absent" from "not preloaded".
+					requested_get_keys.push(key.clone());
 				}
 			}
 

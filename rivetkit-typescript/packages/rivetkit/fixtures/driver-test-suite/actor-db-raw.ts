@@ -1,5 +1,6 @@
 import { actor } from "rivetkit";
 import { db } from "@/common/database/mod";
+import type { registry } from "./registry-static";
 import { scheduleActorSleep } from "./schedule-sleep";
 
 function firstRowValue(row: Record<string, unknown> | undefined): unknown {
@@ -37,10 +38,32 @@ function makePayload(size: number): string {
 	return "x".repeat(normalizedSize);
 }
 
+async function recordLifecycleEvent(
+	c: {
+		key: string[];
+		state: { lifecycleObserverKey: string | null };
+		client: <T>() => T;
+	},
+	event: string,
+) {
+	const observerKey = c.state.lifecycleObserverKey;
+	if (!observerKey) {
+		return;
+	}
+
+	const client = c.client<typeof registry>();
+	const observer = client.lifecycleObserver.getOrCreate([observerKey]);
+	await observer.recordEvent({
+		actorKey: c.key.join("/"),
+		event,
+	});
+}
+
 export const dbActorRaw = actor({
 	state: {
 		disconnectInsertEnabled: false,
 		disconnectInsertDelayMs: 0,
+		lifecycleObserverKey: null as string | null,
 	},
 	db: db({
 		onMigrate: async (db) => {
@@ -54,6 +77,12 @@ export const dbActorRaw = actor({
 			`);
 		},
 	}),
+	onWake: async (c) => {
+		await recordLifecycleEvent(c, "wake");
+	},
+	onSleep: async (c) => {
+		await recordLifecycleEvent(c, "sleep");
+	},
 	onDisconnect: async (c) => {
 		if (!c.state.disconnectInsertEnabled) {
 			return;
@@ -76,6 +105,9 @@ export const dbActorRaw = actor({
 		configureDisconnectInsert: (c, enabled: boolean, delayMs: number) => {
 			c.state.disconnectInsertEnabled = enabled;
 			c.state.disconnectInsertDelayMs = Math.max(0, Math.floor(delayMs));
+		},
+		configureLifecycleObserver: (c, observerKey: string | null) => {
+			c.state.lifecycleObserverKey = observerKey;
 		},
 		getDisconnectInsertCount: async (c) => {
 			const results = await c.db.execute<{ count: number }>(
@@ -338,9 +370,26 @@ export const dbActorRaw = actor({
 		triggerSleep: (c) => {
 			scheduleActorSleep(c);
 		},
+		destroy: (c) => {
+			c.destroy();
+		},
+		ping: () => "pong",
 	},
 	options: {
 		actionTimeout: 120_000,
+		sleepTimeout: 100,
+	},
+});
+
+export const dbRemoteLifecycleProbe = actor({
+	db: db(),
+	actions: {
+		ping: () => "pong",
+		triggerSleep: (c) => {
+			scheduleActorSleep(c);
+		},
+	},
+	options: {
 		sleepTimeout: 100,
 	},
 });

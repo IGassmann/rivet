@@ -56,6 +56,7 @@ pub async fn fetch_actors_by_ids(
 	namespace: String,
 	include_destroyed: Option<bool>,
 	limit: Option<usize>,
+	cursor: Option<String>,
 ) -> Result<Vec<Actor>> {
 	if actor_ids.is_empty() {
 		return Ok(Vec::new());
@@ -76,6 +77,7 @@ pub async fn fetch_actors_by_ids(
 		let namespace = namespace.clone();
 		let include_destroyed = include_destroyed;
 		let limit = limit;
+		let cursor = cursor.clone();
 
 		async move {
 			// Prepare peer query with actor_ids
@@ -87,7 +89,7 @@ pub async fn fetch_actors_by_ids(
 				actor_id: dc_actor_ids,
 				include_destroyed,
 				limit,
-				cursor: None,
+				cursor,
 			};
 
 			if dc_label == ctx.config().dc_label() {
@@ -137,32 +139,40 @@ pub async fn find_dc_for_actor_creation(
 	runner_name: &str,
 	dc_name: Option<&str>,
 ) -> Result<u16> {
-	let target_dc_label = if let Some(dc_name) = &dc_name {
+	let requested_dc_label = if let Some(dc_name) = &dc_name {
 		// Use user-configured DC
-		ctx.config()
-			.dc_for_name(dc_name)
-			.ok_or_else(|| rivet_api_util::errors::Datacenter::NotFound.build())?
-			.datacenter_label
+		Some(
+			ctx.config()
+				.dc_for_name(dc_name)
+				.ok_or_else(|| rivet_api_util::errors::Datacenter::NotFound.build())?
+				.datacenter_label,
+		)
 	} else {
-		// Find the nearest DC with runners
-		let res = ctx
-			.op(
-				pegboard::ops::runner::list_runner_config_enabled_dcs::Input {
-					namespace_id,
-					runner_name: runner_name.into(),
-				},
-			)
-			.await?;
-		if let Some(dc_label) = res.dc_labels.into_iter().next() {
-			dc_label
-		} else {
-			return Err(pegboard::errors::Actor::NoRunnerConfigConfigured {
-				namespace: namespace_name.into(),
-				pool_name: runner_name.into(),
-			}
-			.build());
-		}
+		None
 	};
 
-	Ok(target_dc_label)
+	let res = ctx
+		.op(
+			pegboard::ops::runner::list_runner_config_enabled_dcs::Input {
+				namespace_id,
+				runner_name: runner_name.into(),
+			},
+		)
+		.await?;
+
+	let target_dc_label = if let Some(requested_dc_label) = requested_dc_label {
+		res.dc_labels
+			.into_iter()
+			.find(|dc_label| *dc_label == requested_dc_label)
+	} else {
+		res.dc_labels.into_iter().next()
+	};
+
+	target_dc_label.ok_or_else(|| {
+		pegboard::errors::Actor::NoRunnerConfigConfigured {
+			namespace: namespace_name.into(),
+			pool_name: runner_name.into(),
+		}
+		.build()
+	})
 }

@@ -1,6 +1,16 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ClientConfigSchema } from "@/client/config";
-import { HEADER_RIVET_TOKEN } from "@/common/actor-router-consts";
+import {
+	HEADER_RIVET_ACTOR,
+	HEADER_RIVET_SKIP_READY_WAIT,
+	HEADER_RIVET_TARGET,
+	HEADER_RIVET_TOKEN,
+	WS_PROTOCOL_ACTOR,
+	WS_PROTOCOL_SKIP_READY_WAIT,
+	WS_PROTOCOL_TARGET,
+	WS_PROTOCOL_TOKEN,
+} from "@/common/actor-router-consts";
+import { createClient } from "@/client/mod";
 import { RemoteEngineControlClient } from "@/engine-client/mod";
 
 describe.sequential("RemoteEngineControlClient public token usage", () => {
@@ -76,6 +86,82 @@ describe.sequential("RemoteEngineControlClient public token usage", () => {
 		expect(actorRequest?.headers.get("x-user-header")).toBe("present");
 	});
 
+	test("sets skip ready wait header for actor HTTP gateway requests", async () => {
+		const fetchCalls: Request[] = [];
+		const fetchMock = vi.fn(async (input: Request | URL | string) => {
+			const request = normalizeRequest(input);
+			fetchCalls.push(request);
+			return new Response("ok");
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const driver = new RemoteEngineControlClient(
+			ClientConfigSchema.parse({
+				endpoint: "https://api.rivet.dev",
+				disableMetadataLookup: true,
+			}),
+		);
+
+		const response = await driver.sendRequest(
+			{ directId: "actor-http-skip-ready-wait" },
+			new Request("http://actor/request/skip-ready-wait"),
+			{ skipReadyWait: true },
+		);
+
+		expect(response.status).toBe(200);
+		expect(fetchCalls).toHaveLength(1);
+
+		const actorRequest = fetchCalls[0];
+		expect(actorRequest?.url).toBe(
+			"https://api.rivet.dev/request/skip-ready-wait",
+		);
+		expect(actorRequest?.headers.get(HEADER_RIVET_TARGET)).toBe("actor");
+		expect(actorRequest?.headers.get(HEADER_RIVET_ACTOR)).toBe(
+			"actor-http-skip-ready-wait",
+		);
+		expect(actorRequest?.headers.get(HEADER_RIVET_SKIP_READY_WAIT)).toBe(
+			"1",
+		);
+	});
+
+	test("handle fetch forwards skip ready wait to browser request", async () => {
+		const fetchCalls: Request[] = [];
+		const fetchMock = vi.fn(async (input: Request | URL | string) => {
+			const request = normalizeRequest(input);
+			fetchCalls.push(request);
+			return new Response("ok");
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const client = createClient({
+			endpoint: "https://api.rivet.dev",
+			disableMetadataLookup: true,
+		});
+		const handle = client.getForId(
+			"mockAgenticLoop",
+			"actor-http-skip-ready-wait",
+		);
+
+		const response = await handle.fetch("/skip-ready-wait", {
+			skipReadyWait: true,
+		});
+
+		expect(response.status).toBe(200);
+		expect(fetchCalls).toHaveLength(1);
+
+		const actorRequest = fetchCalls[0];
+		expect(actorRequest?.url).toBe(
+			"https://api.rivet.dev/request/skip-ready-wait",
+		);
+		expect(actorRequest?.headers.get(HEADER_RIVET_TARGET)).toBe("actor");
+		expect(actorRequest?.headers.get(HEADER_RIVET_ACTOR)).toBe(
+			"actor-http-skip-ready-wait",
+		);
+		expect(actorRequest?.headers.get(HEADER_RIVET_SKIP_READY_WAIT)).toBe(
+			"1",
+		);
+	});
+
 	test("uses metadata clientToken for actor websocket gateway requests", async () => {
 		const fetchMock = vi.fn(async (input: Request | URL | string) => {
 			const request = normalizeRequest(input);
@@ -128,6 +214,49 @@ describe.sequential("RemoteEngineControlClient public token usage", () => {
 		expect(sockets).toHaveLength(1);
 		expect(sockets[0]?.url).toBe(
 			"https://public-ws.example/manager/gateway/actor%2Fws@public-ws-token/connect",
+		);
+
+		await driver.openWebSocket(
+			"/connect",
+			{ directId: "actor/ws-skip-ready-wait" },
+			"bare",
+			{ room: "lobby" },
+			{ skipReadyWait: true },
+		);
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(sockets).toHaveLength(2);
+		expect(sockets[1]?.url).toBe(
+			"https://public-ws.example/manager/connect",
+		);
+		expect(sockets[1]?.protocols).toEqual(
+			expect.arrayContaining([
+				`${WS_PROTOCOL_TARGET}actor`,
+				`${WS_PROTOCOL_ACTOR}actor/ws-skip-ready-wait`,
+				`${WS_PROTOCOL_TOKEN}public-ws-token`,
+				WS_PROTOCOL_SKIP_READY_WAIT,
+			]),
+		);
+
+		await driver.openWebSocket(
+			"/websocket?room=lobby",
+			{ directId: "actor/ws-query" },
+			"bare",
+			undefined,
+			{ skipReadyWait: true },
+		);
+
+		expect(sockets).toHaveLength(3);
+		expect(sockets[2]?.url).toBe(
+			"https://public-ws.example/manager/websocket?room=lobby",
+		);
+		expect(sockets[2]?.protocols).toEqual(
+			expect.arrayContaining([
+				`${WS_PROTOCOL_TARGET}actor`,
+				`${WS_PROTOCOL_ACTOR}actor/ws-query`,
+				`${WS_PROTOCOL_TOKEN}public-ws-token`,
+				WS_PROTOCOL_SKIP_READY_WAIT,
+			]),
 		);
 	});
 });

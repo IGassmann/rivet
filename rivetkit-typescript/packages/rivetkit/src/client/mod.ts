@@ -1,6 +1,6 @@
 import { injectDevtools } from "@/devtools-loader";
-import type { Registry } from "@/registry";
 import { RemoteEngineControlClient } from "@/engine-client/mod";
+import type { Registry } from "@/registry";
 import {
 	type Client,
 	type ClientConfigInput,
@@ -9,18 +9,23 @@ import {
 import { ClientConfigSchema } from "./config";
 
 export type { ActorDefinition, AnyActorDefinition } from "@/actor/definition";
-export type { Encoding } from "@/common/encoding";
 export {
 	ActorClientError,
 	ActorConnDisposed,
 	ActorError,
-	RivetError,
 	MalformedResponseMessage,
 	ManagerError,
+	RivetError,
 	UserError,
 } from "@/client/errors";
 export type { CreateRequest } from "@/client/query";
-export type { ActorActionFunction } from "./actor-common";
+export type { Encoding } from "@/common/encoding";
+export type {
+	ActorActionFunction,
+	ActorActionOptions,
+	ActorConnectOptions,
+	ActorGatewayOptions,
+} from "./actor-common";
 export type {
 	ActorConn,
 	ActorConnStatus,

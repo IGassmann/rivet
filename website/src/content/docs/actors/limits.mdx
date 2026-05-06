@@ -93,7 +93,7 @@ These limits apply to the [SQLite database](/docs/actors/state#sqlite-database) 
 
 ### KV Preloading
 
-When an actor starts, the engine can pre-fetch KV data declared in the actor name metadata and deliver it alongside the start command. This removes round-trips to storage during actor startup. RivetKit emits the preload manifest from its own key layout and exposes per-actor overrides via `options`. Operators can still enforce a global cap in the [engine config](/docs/self-hosting/configuration) with `pegboard.preload_max_total_bytes`.
+When an actor starts, the engine can pre-fetch KV data declared in the actor name metadata and deliver it alongside the start command. This removes round-trips to storage during actor startup. RivetKit emits the preload manifest from its own key layout and exposes per-actor overrides via `options`. Operators can still enforce a global cap in the [engine config](/docs/self-hosting/configuration) with `pegboard.preload_max_total_bytes`. In serverless mode, this data is serialized into the `/api/rivet/start` request body along with actor config and protocol metadata, so the accepted body size must be larger than the preload budget. RivetKit defaults `serverless.maxStartPayloadBytes` to 16 MiB to leave margin for the default 1 MiB preload budget and larger SQLite startup page preloads.
 
 | Name | Soft Limit | Hard Limit | Description |
 |------|------------|------------|-------------|
@@ -138,15 +138,16 @@ These timeouts control how actors are shut down when a serverless request reache
 
 | Name | Soft Limit | Hard Limit | Description |
 |------|------------|------------|-------------|
-| Request lifespan | 900 seconds (15 min) | — | Total lifespan of a serverless request before drain begins. Configurable via `requestLifespan` in [`configurePool`](/docs/connect/registry-configuration). |
-| Serverless drain grace period | — | 10 seconds | Time reserved at the end of a request for actors to stop gracefully. Configurable via [engine config](/docs/self-hosting/configuration) (`pegboard.serverless_drain_grace_period`). |
+| Request lifespan | 3600 seconds (60 min) | — | Total lifespan of a serverless request before drain begins. Configurable via `requestLifespan` in [`configurePool`](/docs/general/registry-configuration). |
+| Runner config drain grace period | — | 30 minutes | Time a serverless runner reserves for actors to stop gracefully. Configurable via `drainGracePeriod` in [`configurePool`](/docs/general/registry-configuration). |
+| Engine serverless drain fallback | — | 10 seconds | Engine-level fallback used when no per-runner config applies. Configurable via [engine config](/docs/self-hosting/configuration) (`pegboard.serverless_drain_grace_period`). |
 
 ### Actor Lifecycle
 
 | Name | Soft Limit | Hard Limit | Description |
 |------|------------|------------|-------------|
 | Actor start threshold | — | 30 seconds | Maximum time for an actor to start before it is considered lost and rescheduled. |
-| Actor stop threshold | — | 30 seconds | Maximum time for an actor to stop before it is considered lost. |
+| Actor stop threshold | — | 30 minutes | Maximum time for an actor to stop before it is considered lost. |
 
 ## Increasing Limits
 

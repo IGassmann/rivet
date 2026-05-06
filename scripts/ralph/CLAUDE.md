@@ -77,6 +77,50 @@ Only update CLAUDE.md if you have **genuinely reusable knowledge** that would he
 - Keep changes focused and minimal
 - Follow existing code patterns
 
+## Clean Fixes — Do Not Apply Hacky Patches
+
+**This PRD is a cleanup pass on real bugs. Each fix must be a clean, root-cause
+change — not a temporary or tactical patch.** A correct fix is the smallest
+change that addresses the actual cause and leaves the surrounding code as good
+as or better than you found it. The following are explicitly disallowed unless
+the user explicitly asks for them:
+
+- **No band-aids.** If `resolve_pages` holds the wrong lock, fix the lock — do
+  not add a comment claiming the lock is "fine". If a tx is non-atomic, fold
+  it into one tx or add a real revalidation read; do not add a retry loop.
+- **No "tactical" sleeps.** Do not paper over a race with `tokio::time::sleep`
+  or `setTimeout`. If a wakeup is lost, pre-arm the `Notified`. If a counter
+  needs an event, pair it with a `Notify` / `watch`. CLAUDE.md (`Performance`
+  section) is the binding floor.
+- **No retry-until-success in tests.** `vi.waitFor` is acceptable only with a
+  preceding `//` line that justifies polling vs awaiting. Retry loops that
+  swallow startup or stale-handle races are flake-masking and must be
+  replaced with deterministic ordering.
+- **No `#[allow(...)]` to silence a warning.** If clippy or rustc warns,
+  address the underlying issue. Adding `#[allow(dead_code)]` to keep a dead
+  helper alive is the wrong direction — the dead helper should go.
+- **No "I'll fix this in a follow-up" comments.** If you discover a related
+  bug while implementing a story, either include the fix in scope or write a
+  new issue entry — do not leave a `TODO: this is broken` in the code.
+- **No new `unwrap()` / `expect("…")` on recoverable paths.** Return
+  `anyhow::Error` with `.context(...)` or surface a typed `RivetError`.
+- **No copy-paste tests.** If you add a regression test, write the smallest
+  case that fails today and passes after the fix. Do not duplicate an
+  existing test "with one tweak" — share helpers via `tests/common/`.
+- **No "for now" abstractions.** Do not introduce a feature flag, shim, or
+  toggle to leave the old behavior reachable. The fix replaces the bug.
+
+**TDD process per story:** (1) write or identify a failing test that exercises
+the bug; (2) implement the clean fix; (3) confirm the same test now passes.
+Record the failing command in the story `notes` field as you go. If the fix
+sketch from `.agent/notes/sqlite-review-issues.md` proves wrong on closer
+inspection, update the issue file and the story `notes`, then implement the
+correct fix — do not silently divergeo from what's tracked.
+
+**When in doubt, ask the user.** A clean fix that takes a few extra minutes to
+get right is always preferable to a fast patch that introduces follow-up
+debt.
+
 ## Browser Testing (If Available)
 
 For any story that changes UI, verify it works in the browser if you have browser testing tools configured (e.g., via MCP):

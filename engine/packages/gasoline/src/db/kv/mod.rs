@@ -57,6 +57,11 @@ pub struct DatabaseKv {
 	system: Arc<Mutex<system::SystemInfo>>,
 }
 
+struct DispatchWorkflowResult {
+	workflow_id: Id,
+	created_tags: Vec<String>,
+}
+
 impl DatabaseKv {
 	/// Spawns a new thread and gracefully publishes a bump message to pubsub.
 	fn bump(&self, subject: BumpSubSubject) {
@@ -250,7 +255,7 @@ impl DatabaseKv {
 		input: &serde_json::value::RawValue,
 		unique: bool,
 		tx: &universaldb::Transaction,
-	) -> Result<Id> {
+	) -> Result<DispatchWorkflowResult> {
 		let tx = tx.with_subspace(self.subspace.clone());
 
 		if unique {
@@ -261,7 +266,10 @@ impl DatabaseKv {
 				.await?
 			{
 				tracing::debug!(?existing_workflow_id, "found existing workflow");
-				return Ok(existing_workflow_id);
+				return Ok(DispatchWorkflowResult {
+					workflow_id: existing_workflow_id,
+					created_tags: Vec::new(),
+				});
 			}
 		}
 
@@ -288,6 +296,12 @@ impl DatabaseKv {
 			.flatten()
 			.map(|(k, v)| Ok((k.clone(), value_to_str(v)?)))
 			.collect::<WorkflowResult<Vec<_>>>()?;
+		let mut created_tags = Vec::new();
+		for (_, tag) in &tags {
+			if !created_tags.contains(tag) {
+				created_tags.push(tag.clone());
+			}
+		}
 
 		for (k, v) in &tags {
 			// Write tag key
@@ -350,7 +364,10 @@ impl DatabaseKv {
 			)),
 		);
 
-		Ok(workflow_id)
+		Ok(DispatchWorkflowResult {
+			workflow_id,
+			created_tags,
+		})
 	}
 
 	async fn find_workflow_inner(
@@ -785,6 +802,7 @@ impl Database for DatabaseKv {
 	async fn update_worker_ping(
 		&self,
 		worker_id: Id,
+		worker_version: i64,
 		update_active_idx: bool,
 	) -> WorkflowResult<()> {
 		metrics::WORKER_LAST_PING
@@ -797,24 +815,34 @@ impl Database for DatabaseKv {
 			.run(|tx| async move {
 				let tx = tx.with_subspace(self.subspace.clone());
 
-				let last_ping_ts = rivet_util::timestamp::now();
+				let ping_ts = rivet_util::timestamp::now();
 				let last_ping_ts_key = keys::worker::LastPingTsKey::new(worker_id);
-
-				tx.write(&last_ping_ts_key, last_ping_ts)?;
+				let last_active_ping_ts_key = keys::worker::LastActivePingTsKey::new(worker_id);
+				let version_key = keys::worker::VersionKey::new(worker_id);
 
 				if update_active_idx {
-					if let Some(last_last_ping_ts) =
-						tx.read_opt(&last_ping_ts_key, Serializable).await?
+					// Delete old entry
+					if let Some(last_active_ping_ts) =
+						tx.read_opt(&last_active_ping_ts_key, Serializable).await?
 					{
-						let active_worker_idx_key =
-							keys::worker::ActiveWorkerIdxKey::new(last_last_ping_ts, worker_id);
-						tx.delete(&active_worker_idx_key);
+						let old_active_worker_idx_key = keys::worker::ActiveWorkerIdxKey::new(
+							last_active_ping_ts,
+							worker_version,
+							worker_id,
+						);
+						tx.delete(&old_active_worker_idx_key);
 					}
 
+					// Write new entry
 					let active_worker_idx_key =
-						keys::worker::ActiveWorkerIdxKey::new(last_ping_ts, worker_id);
+						keys::worker::ActiveWorkerIdxKey::new(ping_ts, worker_version, worker_id);
 					tx.write(&active_worker_idx_key, ())?;
+
+					tx.write(&last_active_ping_ts_key, ping_ts)?;
 				}
+
+				tx.write(&last_ping_ts_key, ping_ts)?;
+				tx.write(&version_key, worker_version)?;
 
 				Ok(())
 			})
@@ -832,13 +860,18 @@ impl Database for DatabaseKv {
 			.udb()
 			.map_err(WorkflowError::PoolsGeneric)?
 			.run(|tx| async move {
-				let last_ping_ts_key = keys::worker::LastPingTsKey::new(worker_id);
+				let last_active_ping_ts_key = keys::worker::LastActivePingTsKey::new(worker_id);
+				let version_key = keys::worker::VersionKey::new(worker_id);
 
-				if let Some(last_last_ping_ts) =
-					tx.read_opt(&last_ping_ts_key, Serializable).await?
-				{
-					let active_worker_idx_key =
-						keys::worker::ActiveWorkerIdxKey::new(last_last_ping_ts, worker_id);
+				if let (Some(last_active_ping_ts), Some(version)) = tokio::try_join!(
+					tx.read_opt(&last_active_ping_ts_key, Serializable),
+					tx.read_opt(&version_key, Serializable),
+				)? {
+					let active_worker_idx_key = keys::worker::ActiveWorkerIdxKey::new(
+						last_active_ping_ts,
+						version,
+						worker_id,
+					);
 					tx.delete(&active_worker_idx_key);
 				}
 
@@ -862,7 +895,7 @@ impl Database for DatabaseKv {
 		input: &serde_json::value::RawValue,
 		unique: bool,
 	) -> WorkflowResult<Id> {
-		let workflow_id = self
+		let dispatch_result = self
 			.pools
 			.udb()
 			.map_err(WorkflowError::PoolsGeneric)?
@@ -883,9 +916,12 @@ impl Database for DatabaseKv {
 			.context("failed to dispatch workflow")
 			.map_err(WorkflowError::Udb)?;
 
+		for tag in dispatch_result.created_tags {
+			self.bump(BumpSubSubject::WorkflowCreated { tag });
+		}
 		self.bump(BumpSubSubject::Worker);
 
-		Ok(workflow_id)
+		Ok(dispatch_result.workflow_id)
 	}
 
 	#[tracing::instrument(skip_all, fields(?workflow_ids))]
@@ -1053,6 +1089,7 @@ impl Database for DatabaseKv {
 	async fn pull_workflows(
 		&self,
 		worker_id: Id,
+		worker_version: i64,
 		filter: &[&str],
 	) -> WorkflowResult<Vec<PulledWorkflowData>> {
 		let start_instant = Instant::now();
@@ -1105,8 +1142,7 @@ impl Database for DatabaseKv {
 						.1;
 
 					// Pull all available wake conditions from all registered wf names
-					let (mut active_worker_ids, wake_keys) = tokio::try_join!(
-						// Check
+					let (mut active_workers, wake_keys) = tokio::try_join!(
 						tx.get_ranges_keyvalues(
 							universaldb::RangeOption {
 								mode: StreamingMode::WantAll,
@@ -1115,10 +1151,7 @@ impl Database for DatabaseKv {
 							// This is Snapshot to reduce contention and exact timestamps are not important
 							Snapshot,
 						)
-						.map(|res| {
-							let key = tx.unpack::<keys::worker::ActiveWorkerIdxKey>(res?.key())?;
-							Ok(key.worker_id)
-						})
+						.map(|res| tx.unpack::<keys::worker::ActiveWorkerIdxKey>(res?.key()))
 						.try_collect::<Vec<_>>(),
 						async {
 							let start = Instant::now();
@@ -1169,26 +1202,41 @@ impl Database for DatabaseKv {
 						.custom_instrument(tracing::debug_span!("read_wake_conditions"))
 					)?;
 
+					let highest_worker_version = active_workers
+						.iter()
+						.reduce(|acc, e| if acc.version > e.version { acc } else { e })
+						.map(|e| e.version)
+						.unwrap_or_default();
+
+					// Do not pull if this worker is outdated. This ensures old workers do not pick up
+					// workflows that may have already been run on a new worker
+					if worker_version < highest_worker_version {
+						tracing::info!("worker version is outdated, not pulling workflows");
+						return Ok(Vec::new());
+					}
+
+					// Keep only highest version workers
+					active_workers.retain(|w| w.version == highest_worker_version);
+
 					// Sort for consistency across all workers
-					active_worker_ids.sort();
+					active_workers.sort_by_key(|w| w.worker_id);
 
 					// Get a globally unique idx for the current worker relative to all active workers
-					let current_worker_idx = if let Some(current_worker_idx) = active_worker_ids
+					let current_worker_idx = if let Some(current_worker_idx) = active_workers
 						.iter()
 						.enumerate()
-						.find_map(|(i, other_worker_id)| {
-							(&worker_id == other_worker_id).then_some(i)
-						}) {
+						.find_map(|(i, worker)| (worker_id == worker.worker_id).then_some(i))
+					{
 						current_worker_idx as u64
 					} else {
 						tracing::error!(
 							?worker_id,
-							"current worker should have valid ping, defaulting to worker index 0"
+							"current worker should exist in active worker idx, defaulting to worker index 0"
 						);
 
 						0
 					};
-					let active_worker_count = active_worker_ids.len().max(1) as u64;
+					let active_worker_count = active_workers.len().max(1) as u64;
 
 					// Collect name and deadline ts for each wf id
 					let mut dedup_workflows = HashMap::<Id, MinimalPulledWorkflow>::new();
@@ -2192,7 +2240,7 @@ impl Database for DatabaseKv {
 		Ok(())
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(skip_all, fields(?workflow_id, %location))]
 	async fn pull_next_signals(
 		&self,
 		workflow_id: Id,
@@ -2610,12 +2658,12 @@ impl Database for DatabaseKv {
 		_loop_location: Option<&Location>,
 		unique: bool,
 	) -> WorkflowResult<Id> {
-		let sub_workflow_id = self
+		let dispatch_result = self
 			.pools
 			.udb()
 			.map_err(WorkflowError::PoolsGeneric)?
 			.run(|tx| async move {
-				let sub_workflow_id = self
+				let dispatch_result = self
 					.dispatch_workflow_inner(
 						ray_id,
 						sub_workflow_id,
@@ -2635,22 +2683,25 @@ impl Database for DatabaseKv {
 					&location,
 					version,
 					rivet_util::timestamp::now(),
-					sub_workflow_id,
+					dispatch_result.workflow_id,
 					sub_workflow_name,
 					tags,
 					input,
 				)?;
 
-				Ok(sub_workflow_id)
+				Ok(dispatch_result)
 			})
 			.custom_instrument(tracing::info_span!("dispatch_sub_workflow_tx"))
 			.await
 			.context("failed to dispatch sub workflow")
 			.map_err(WorkflowError::Udb)?;
 
+		for tag in dispatch_result.created_tags {
+			self.bump(BumpSubSubject::WorkflowCreated { tag });
+		}
 		self.bump(BumpSubSubject::Worker);
 
-		Ok(sub_workflow_id)
+		Ok(dispatch_result.workflow_id)
 	}
 
 	#[tracing::instrument(skip_all)]

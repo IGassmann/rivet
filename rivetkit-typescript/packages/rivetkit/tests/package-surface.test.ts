@@ -22,6 +22,11 @@ import type {
 	WakeContextOf,
 	WebSocketContextOf,
 } from "rivetkit";
+import type {
+	AnyDatabaseProvider,
+	DatabaseProvider,
+	RawAccess,
+} from "rivetkit/db";
 import { db as rawDb } from "rivetkit/db";
 import { db as drizzleDb, defineConfig } from "rivetkit/db/drizzle";
 import { decodeWorkflowHistoryTransport } from "rivetkit/inspector";
@@ -73,6 +78,11 @@ type RestoredContextTypeSmoke = [
 	WebSocketContextOf<typeof contextTypeSmokeActor>,
 ];
 
+type RestoredDatabaseSurfaceTypes = [
+	DatabaseProvider<RawAccess>,
+	AnyDatabaseProvider,
+];
+
 describe("package surface", () => {
 	test("restores supported package entrypoints", () => {
 		expect(packageJson.exports).toHaveProperty("./test");
@@ -99,6 +109,11 @@ describe("package surface", () => {
 	test("restores root ContextOf helper exports", () => {
 		const contextTypes: RestoredContextTypeSmoke | null = null;
 		expect(contextTypes).toBeNull();
+	});
+
+	test("restores database provider type exports", () => {
+		const databaseTypes: RestoredDatabaseSurfaceTypes | null = null;
+		expect(databaseTypes).toBeNull();
 	});
 
 	test("keeps database helpers on dedicated subpaths", () => {

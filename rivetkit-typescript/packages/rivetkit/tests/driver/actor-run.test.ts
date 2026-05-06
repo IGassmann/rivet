@@ -1,5 +1,5 @@
 import { describeDriverMatrix } from "./shared-matrix";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { RUN_SLEEP_TIMEOUT } from "../../fixtures/driver-test-suite/run";
 import { setupDriverTest, waitFor } from "./shared-utils";
 
@@ -135,7 +135,15 @@ describeDriverMatrix("Actor Run", (driverTestConfig) => {
 		test("run handler that exits early sleeps instead of destroying", async (c) => {
 			const { client } = await setupDriverTest(c, driverTestConfig);
 
-			const actor = client.runWithEarlyExit.getOrCreate(["early-exit"]);
+			const observer = client.lifecycleObserver.getOrCreate([
+				"run-with-early-exit",
+			]);
+			await observer.clearEvents();
+
+			const actor = client.runWithEarlyExit.getOrCreate([
+				`early-exit-${Date.now()}`,
+			]);
+			const actorId = await actor.resolve();
 
 			// Wait for run to start and exit
 			await waitFor(driverTestConfig, 100);
@@ -143,8 +151,24 @@ describeDriverMatrix("Actor Run", (driverTestConfig) => {
 			const state1 = await actor.getState();
 			expect(state1.runStarted).toBe(true);
 
-			// Wait for the run handler to exit and the normal idle sleep timeout.
-			await waitFor(driverTestConfig, RUN_SLEEP_TIMEOUT + 400);
+			if (!driverTestConfig.skip?.sleep) {
+				// Poll because the sleep hook is emitted from the actor runtime after idle detection.
+				await vi.waitFor(
+					async () => {
+						const events = await observer.getEvents();
+						expect(
+							events.filter(
+								(event) =>
+									event.actorKey === actorId &&
+									event.event === "sleep",
+							),
+						).toHaveLength(1);
+					},
+					{ timeout: RUN_SLEEP_TIMEOUT + 5_000 },
+				);
+			} else {
+				await waitFor(driverTestConfig, RUN_SLEEP_TIMEOUT + 400);
+			}
 
 			const state2 = await actor.getState();
 			expect(state2.runStarted).toBe(true);

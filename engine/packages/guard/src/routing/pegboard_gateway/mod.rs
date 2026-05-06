@@ -9,22 +9,19 @@ use hyper::header::HeaderName;
 use rivet_guard_core::{RouteConfig, RouteTarget, RoutingOutput, request_context::RequestContext};
 
 use super::{
-	SEC_WEBSOCKET_PROTOCOL, WS_PROTOCOL_ACTOR, WS_PROTOCOL_BYPASS_CONNECTABLE, WS_PROTOCOL_TOKEN,
-	X_RIVET_BYPASS_CONNECTABLE, X_RIVET_TOKEN, actor_path::ParsedActorPath,
+	SEC_WEBSOCKET_PROTOCOL, WS_PROTOCOL_ACTOR, WS_PROTOCOL_SKIP_READY_WAIT, WS_PROTOCOL_TOKEN,
+	X_RIVET_SKIP_READY_WAIT, X_RIVET_TOKEN, actor_path::ParsedActorPath,
 };
 use crate::{
 	errors,
 	routing::{
-		actor_path::parse_actor_path,
+		actor_path::{is_actor_gateway_path, parse_actor_path},
 		pegboard_gateway::resolve_actor_query::ResolveQueryActorResult,
 	},
 	shared_state::SharedState,
 };
 use cors::{CorsPreflight, set_non_preflight_cors};
 use resolve_actor_query::resolve_query;
-
-const ACTOR_FORCE_WAKE_PENDING_TIMEOUT: i64 = util::duration::seconds(60);
-const ACTOR_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Time to wait before starting pool error checks
 const RUNNER_POOL_ERROR_CHECK_DELAY: Duration = Duration::from_secs(1);
@@ -40,24 +37,46 @@ pub async fn route_request_path_based(
 	shared_state: &SharedState,
 	req_ctx: &mut RequestContext,
 ) -> Result<Option<RoutingOutput>> {
+	let res = route_request_path_based_inner(ctx, shared_state, req_ctx).await;
+
+	match &res {
+		Ok(Some(_)) | Err(_) => {
+			// Attach CORS headers to the actual (non-OPTIONS) response so both the
+			// actor response and any early error are readable by the browser.
+			set_non_preflight_cors(req_ctx);
+		}
+		_ => {}
+	}
+
+	res
+}
+
+pub async fn route_request_path_based_inner(
+	ctx: &StandaloneCtx,
+	shared_state: &SharedState,
+	req_ctx: &mut RequestContext,
+) -> Result<Option<RoutingOutput>> {
+	if req_ctx.method() == hyper::Method::OPTIONS {
+		if is_actor_gateway_path(req_ctx.path()) {
+			return Ok(Some(RoutingOutput::CustomServe(Arc::new(CorsPreflight))));
+		}
+
+		return Ok(None);
+	}
+
 	let Some(actor_path) = parse_actor_path(req_ctx.path())? else {
 		return Ok(None);
 	};
 
-	if req_ctx.method() == hyper::Method::OPTIONS {
-		return Ok(Some(RoutingOutput::CustomServe(Arc::new(CorsPreflight))));
-	}
-
 	tracing::debug!(?actor_path, "routing using path-based actor routing");
 
-	let (actor_id, token, stripped_path, bypass_connectable) = match actor_path {
+	let (actor_id, token, stripped_path, skip_ready_wait) = match actor_path {
 		ParsedActorPath::Direct(path) => (
 			Id::parse(&path.actor_id).context("invalid actor id in path")?,
 			read_gateway_token_for_path_based(req_ctx, path.token.as_deref())?
 				.map(ToOwned::to_owned),
 			path.stripped_path.clone(),
-			// TODO:
-			false,
+			read_skip_ready_wait_for_path_based(req_ctx)?,
 		),
 		ParsedActorPath::Query(path) => match resolve_query(ctx, &path.query).await? {
 			ResolveQueryActorResult::Found { actor_id } => (
@@ -65,7 +84,7 @@ pub async fn route_request_path_based(
 				read_gateway_token_for_path_based(req_ctx, path.token.as_deref())?
 					.map(ToOwned::to_owned),
 				path.stripped_path.clone(),
-				path.query.bypass_connectable(),
+				path.query.skip_ready_wait(),
 			),
 			ResolveQueryActorResult::Forward { dc_label } => {
 				let peer_dc = ctx
@@ -96,7 +115,7 @@ pub async fn route_request_path_based(
 		actor_id,
 		&stripped_path,
 		token.as_deref(),
-		bypass_connectable,
+		skip_ready_wait,
 	)
 	.await
 	.map(Some)
@@ -119,8 +138,16 @@ pub async fn route_request(
 		return Ok(Some(RoutingOutput::CustomServe(Arc::new(CorsPreflight))));
 	}
 
+	if !req_ctx.is_websocket() && !is_actor_http_request_path(req_ctx.path()) {
+		return Ok(None);
+	}
+
+	// Attach CORS headers to the actual (non-OPTIONS) response so both the
+	// actor response and any early error are readable by the browser.
+	set_non_preflight_cors(req_ctx);
+
 	// Extract actor ID and token from WebSocket protocol or HTTP headers
-	let (actor_id_str, token, bypass_connectable) = if req_ctx.is_websocket() {
+	let (actor_id_str, token, skip_ready_wait) = if req_ctx.is_websocket() {
 		// For WebSocket, parse the sec-websocket-protocol header
 		let protocols_header = req_ctx
 			.headers()
@@ -154,11 +181,9 @@ pub async fn route_request(
 			.find_map(|p| p.strip_prefix(WS_PROTOCOL_TOKEN))
 			.map(ToOwned::to_owned);
 
-		let bypass_connectable = protocols
-			.iter()
-			.any(|p| p == &WS_PROTOCOL_BYPASS_CONNECTABLE);
+		let skip_ready_wait = protocols.iter().any(|p| p == &WS_PROTOCOL_SKIP_READY_WAIT);
 
-		(actor_id, token, bypass_connectable)
+		(actor_id, token, skip_ready_wait)
 	} else {
 		// For HTTP, use headers
 		let actor_id = req_ctx
@@ -182,9 +207,9 @@ pub async fn route_request(
 			.context("invalid x-rivet-token header")?
 			.map(ToOwned::to_owned);
 
-		let bypass_connectable = req_ctx.headers().contains_key(X_RIVET_BYPASS_CONNECTABLE);
+		let skip_ready_wait = read_skip_ready_wait_header(req_ctx)?;
 
-		(actor_id.to_string(), token, bypass_connectable)
+		(actor_id.to_string(), token, skip_ready_wait)
 	};
 
 	// Find actor to route to
@@ -198,10 +223,18 @@ pub async fn route_request(
 		actor_id,
 		&stripped_path,
 		token.as_deref(),
-		bypass_connectable,
+		skip_ready_wait,
 	)
 	.await
 	.map(Some)
+}
+
+fn is_actor_http_request_path(path: &str) -> bool {
+	let Some(stripped) = path.strip_prefix("/request") else {
+		return false;
+	};
+
+	stripped.is_empty() || matches!(stripped.as_bytes().first(), Some(b'/') | Some(b'?'))
 }
 
 async fn route_request_inner(
@@ -211,13 +244,8 @@ async fn route_request_inner(
 	actor_id: Id,
 	stripped_path: &str,
 	_token: Option<&str>,
-	bypass_connectable: bool,
+	skip_ready_wait: bool,
 ) -> Result<RoutingOutput> {
-	// Attach CORS headers to the actual (non-OPTIONS) response so both the
-	// actor response and any early error (e.g. EE auth failure) are readable
-	// by the browser.
-	set_non_preflight_cors(req_ctx);
-
 	// NOTE: Token validation implemented in EE
 
 	// Route to peer dc where the actor lives
@@ -292,7 +320,7 @@ async fn route_request_inner(
 				actor_id,
 				actor,
 				stripped_path,
-				bypass_connectable,
+				skip_ready_wait,
 				ready_sub2,
 				stopped_sub2,
 				fail_sub2,
@@ -307,7 +335,7 @@ async fn route_request_inner(
 				actor_id,
 				actor,
 				stripped_path,
-				bypass_connectable,
+				skip_ready_wait,
 				ready_sub,
 				stopped_sub,
 				fail_sub,
@@ -330,7 +358,7 @@ async fn handle_actor_v2(
 	actor_id: Id,
 	actor: pegboard::ops::actor::get_for_gateway::Output,
 	stripped_path: &str,
-	bypass_connectable: bool,
+	skip_ready_wait: bool,
 	mut ready_sub: SubscriptionHandle<pegboard::workflows::actor2::Ready>,
 	mut stopped_sub: SubscriptionHandle<pegboard::workflows::actor2::Stopped>,
 	mut fail_sub: SubscriptionHandle<pegboard::workflows::actor2::Failed>,
@@ -347,7 +375,7 @@ async fn handle_actor_v2(
 	}
 
 	let envoy_key = if let (Some(envoy_key), true) =
-		(actor.envoy_key, actor.connectable || bypass_connectable)
+		(actor.envoy_key, actor.connectable || skip_ready_wait)
 	{
 		envoy_key
 	} else {
@@ -406,7 +434,7 @@ async fn handle_actor_v2(
 					}
 				}
 				// Ready timeout
-				_ = tokio::time::sleep(ACTOR_READY_TIMEOUT) => {
+				_ = tokio::time::sleep(ctx.config().guard().actor_ready_timeout()) => {
 					return Err(errors::ActorReadyTimeout { actor_id }.build());
 				}
 			}
@@ -433,7 +461,7 @@ async fn handle_actor_v1(
 	actor_id: Id,
 	actor: pegboard::ops::actor::get_for_gateway::Output,
 	stripped_path: &str,
-	bypass_connectable: bool,
+	skip_ready_wait: bool,
 	mut ready_sub: SubscriptionHandle<pegboard::workflows::actor::Ready>,
 	mut stopped_sub: SubscriptionHandle<pegboard::workflows::actor::Stopped>,
 	mut fail_sub: SubscriptionHandle<pegboard::workflows::actor::Failed>,
@@ -450,7 +478,7 @@ async fn handle_actor_v1(
 
 		ctx.signal(pegboard::workflows::actor::Wake {
 			allocation_override: pegboard::workflows::actor::AllocationOverride::DontSleep {
-				pending_timeout: Some(ACTOR_FORCE_WAKE_PENDING_TIMEOUT),
+				pending_timeout: Some(ctx.config().guard().actor_force_wake_pending_timeout()),
 			},
 		})
 		.to_workflow_id(actor.workflow_id)
@@ -459,7 +487,7 @@ async fn handle_actor_v1(
 	}
 
 	let runner_id = if let (Some(runner_id), true) =
-		(actor.runner_id, actor.connectable || bypass_connectable)
+		(actor.runner_id, actor.connectable || skip_ready_wait)
 	{
 		runner_id
 	} else {
@@ -486,7 +514,9 @@ async fn handle_actor_v1(
 
 						let res = ctx.signal(pegboard::workflows::actor::Wake {
 							allocation_override: pegboard::workflows::actor::AllocationOverride::DontSleep {
-								pending_timeout: Some(ACTOR_FORCE_WAKE_PENDING_TIMEOUT),
+								pending_timeout: Some(
+									ctx.config().guard().actor_force_wake_pending_timeout(),
+								),
 							},
 						})
 						.to_workflow_id(actor.workflow_id)
@@ -522,7 +552,7 @@ async fn handle_actor_v1(
 						actor_id,
 						actor,
 						stripped_path,
-						bypass_connectable,
+						skip_ready_wait,
 						ready_sub2,
 						stopped_sub2,
 						fail_sub2,
@@ -535,7 +565,7 @@ async fn handle_actor_v1(
 					}
 				}
 				// Ready timeout
-				_ = tokio::time::sleep(ACTOR_READY_TIMEOUT) => {
+				_ = tokio::time::sleep(ctx.config().guard().actor_ready_timeout()) => {
 					return Err(errors::ActorReadyTimeout { actor_id }.build());
 				}
 			}
@@ -590,6 +620,48 @@ fn read_gateway_token_for_path_based<'a>(
 			.map(|x| x.to_str())
 			.transpose()
 			.context("invalid x-rivet-token header")
+	}
+}
+
+fn read_skip_ready_wait_for_path_based(req_ctx: &RequestContext) -> Result<bool> {
+	if req_ctx.is_websocket() {
+		Ok(req_ctx
+			.headers()
+			.get(SEC_WEBSOCKET_PROTOCOL)
+			.and_then(|protocols| protocols.to_str().ok())
+			.is_some_and(|protocols| {
+				protocols
+					.split(',')
+					.map(|p| p.trim())
+					.any(|p| p == WS_PROTOCOL_SKIP_READY_WAIT)
+			}))
+	} else {
+		read_skip_ready_wait_header(req_ctx)
+	}
+}
+
+fn read_skip_ready_wait_header(req_ctx: &RequestContext) -> Result<bool> {
+	let Some(value) = req_ctx.headers().get(X_RIVET_SKIP_READY_WAIT) else {
+		return Ok(false);
+	};
+
+	let value = value
+		.to_str()
+		.context("invalid x-rivet-skip-ready-wait header")?;
+	parse_skip_ready_wait_bool(value).ok_or_else(|| {
+		crate::errors::InvalidHeader {
+			header: X_RIVET_SKIP_READY_WAIT.to_string(),
+			detail: "expected true, false, 1, or 0".to_string(),
+		}
+		.build()
+	})
+}
+
+fn parse_skip_ready_wait_bool(value: &str) -> Option<bool> {
+	match value {
+		"true" | "1" => Some(true),
+		"false" | "0" => Some(false),
+		_ => None,
 	}
 }
 

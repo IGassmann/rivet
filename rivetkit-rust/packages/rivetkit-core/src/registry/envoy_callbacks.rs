@@ -2,6 +2,7 @@ use tracing::Instrument;
 
 use super::*;
 use crate::error::ActorRuntime;
+use crate::runtime::RuntimeSpawner;
 
 impl EnvoyCallbacks for RegistryCallbacks {
 	fn on_actor_start(
@@ -11,7 +12,6 @@ impl EnvoyCallbacks for RegistryCallbacks {
 		generation: u32,
 		config: protocol::ActorConfig,
 		preloaded_kv: Option<protocol::PreloadedKv>,
-		sqlite_startup_data: Option<protocol::SqliteStartupData>,
 	) -> EnvoyBoxFuture<anyhow::Result<()>> {
 		let dispatcher = self.dispatcher.clone();
 		let actor_name = config.name.clone();
@@ -34,7 +34,6 @@ impl EnvoyCallbacks for RegistryCallbacks {
 				generation,
 				&actor_name,
 				key,
-				sqlite_startup_data,
 				factory.as_ref(),
 			);
 
@@ -58,13 +57,13 @@ impl EnvoyCallbacks for RegistryCallbacks {
 		&self,
 		_handle: EnvoyHandle,
 		actor_id: String,
-		generation: u32,
+		_generation: u32,
 		reason: protocol::StopActorReason,
 		stop_handle: ActorStopHandle,
 	) -> EnvoyBoxFuture<anyhow::Result<()>> {
 		let dispatcher = self.dispatcher.clone();
 		Box::pin(async move {
-			tokio::spawn(
+			RuntimeSpawner::spawn(
 				async move {
 					if let Err(error) = dispatcher.stop_actor(&actor_id, reason, stop_handle).await
 					{
@@ -197,6 +196,7 @@ impl ServeConfig {
 			serverless_client_token: settings.serverless_client_token,
 			serverless_validate_endpoint: settings.serverless_validate_endpoint,
 			serverless_max_start_payload_bytes: settings.serverless_max_start_payload_bytes,
+			serverless_cache_envoy: true,
 		}
 	}
 }

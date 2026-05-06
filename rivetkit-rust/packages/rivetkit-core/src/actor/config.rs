@@ -61,6 +61,7 @@ pub struct ActorConfig {
 	/// Whether the user declared a SQLite database for this actor (`db({...})`
 	/// on the TS side). Gates the inspector database tab.
 	pub has_database: bool,
+	pub remote_sqlite: bool,
 	/// Whether the user declared actor state (`state: ...` or `createState`).
 	/// Gates the inspector state tab and state-subscription messages.
 	pub has_state: bool,
@@ -97,6 +98,7 @@ pub struct ActorConfigInput {
 	pub name: Option<String>,
 	pub icon: Option<String>,
 	pub has_database: Option<bool>,
+	pub remote_sqlite: Option<bool>,
 	pub has_state: Option<bool>,
 	pub can_hibernate_websocket: Option<bool>,
 	pub state_save_interval_ms: Option<u32>,
@@ -126,6 +128,7 @@ impl ActorConfig {
 			name: config.name,
 			icon: config.icon,
 			has_database: config.has_database.unwrap_or(false),
+			remote_sqlite: config.remote_sqlite.unwrap_or(false),
 			has_state: config.has_state.unwrap_or(false),
 			..Self::default()
 		};
@@ -210,6 +213,7 @@ impl Default for ActorConfig {
 			name: None,
 			icon: None,
 			has_database: false,
+			remote_sqlite: false,
 			has_state: false,
 			can_hibernate_websocket: CanHibernateWebSocket::default(),
 			state_save_interval: DEFAULT_STATE_SAVE_INTERVAL,

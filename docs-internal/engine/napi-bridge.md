@@ -34,6 +34,15 @@ Rules for `rivetkit-typescript/packages/rivetkit-napi/`. The bridge is pure plum
 - Receive-loop `SerializeState` handling stays inline in `napi_actor_events.rs`, reuses the shared `state_deltas_from_payload(...)` converter from `actor_context.rs`, and only cancels the adapter abort token on `Destroy` or final adapter teardown, not on `Sleep`.
 - Receive-loop NAPI optional callbacks preserve the TypeScript runtime defaults: missing `onBeforeSubscribe` allows the subscription, missing workflow callbacks reply `None`, and missing connection lifecycle hooks still accept the connection while leaving the existing empty conn state untouched.
 
+## Runtime-state reference cleanup
+
+- `ActorContextShared::runtime_state` stores a N-API `Ref<()>` for the JS-only actor runtime state bag. `Ref::unref(env)` and reference deletion require an `Env`, but `reset_runtime_state()` runs from receive-loop worker paths and `Drop for ActorContextShared` may run without an active JS callback frame.
+- The current `mem::forget` fallback in `actor_context.rs` keeps debug and release behavior aligned when no `Env` is available, but it leaks one JS object reference per actor wake cycle that created runtime state.
+- The intended fix is to create an actor-shared cleanup `ThreadsafeFunction` the first time `runtime_state(env)` has an `Env`. Stale `Ref<()>` values should be wrapped in a payload whose `Drop` forgets the reference only if it was never successfully unreffed, then queued to that TSF from `reset_runtime_state()` and `Drop`.
+- The TSF callback must run on the JS thread, call `ref.unref(ctx.env)`, and avoid invoking user callbacks. The TSF itself should be unreffed from the event loop so it does not keep Node alive.
+- Shutdown is the hard edge: if the TSF is closing or Node supplies a null `Env` during addon teardown, the payload must fall back to the existing bounded process-lifetime leak instead of dropping a live `Ref<()>` and tripping napi-rs debug assertions.
+- Before replacing the fallback, add a NAPI integration test that creates runtime state across many actor wake/destroy cycles, waits for the cleanup TSF to drain, and verifies native reference counts return to zero.
+
 ## Cancellation bridging
 
 - For non-idempotent native waits like `queue.enqueueAndWait()`, bridge JS `AbortSignal` through a standalone native `CancellationToken`. Timeout-slicing is only safe for receive-style polling calls like `waitForNames()`.

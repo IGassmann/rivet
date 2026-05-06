@@ -4,9 +4,6 @@ export interface ActorMetricsLike {
 	totalKvReads: number;
 	totalKvWrites: number;
 	trackSql(query: string, durationMs: number): void;
-	setSqliteVfsMetricsSource(
-		source?: () => import("./native-database").SqliteVfsMetrics | null,
-	): void;
 }
 
 export type InferDatabaseClient<DBProvider extends AnyDatabaseProvider> =
@@ -21,15 +18,39 @@ export interface SqliteQueryResult {
 	rows: unknown[][];
 }
 
+export interface SqliteExecuteResult extends SqliteQueryResult {
+	changes: number;
+	lastInsertRowId?: number | null;
+}
+
+export interface SqliteNativeMetrics {
+	requestBuildNs: number;
+	serializeNs: number;
+	transportNs: number;
+	stateUpdateNs: number;
+	totalNs: number;
+	commitCount: number;
+	pageCacheEntries: number;
+	pageCacheWeightedSize: number;
+	pageCacheCapacityPages: number;
+	writeBufferDirtyPages: number;
+	dbSizePages: number;
+}
+
 export interface SqliteDatabase {
 	exec(
 		sql: string,
 		callback?: (row: unknown[], columns: string[]) => void,
 	): Promise<void>;
+	execute(
+		sql: string,
+		params?: SqliteBindings,
+	): Promise<SqliteExecuteResult>;
 	run(sql: string, params?: SqliteBindings): Promise<void>;
 	query(sql: string, params?: SqliteBindings): Promise<SqliteQueryResult>;
-	getSqliteVfsMetrics?: () =>
-		| import("./native-database").SqliteVfsMetrics
+	nativeMetrics?():
+		| SqliteNativeMetrics
+		| Promise<SqliteNativeMetrics | null>
 		| null;
 	close(): Promise<void>;
 }
@@ -128,6 +149,13 @@ export type RawAccess = {
 	 * Executes a raw SQL query.
 	 */
 	execute: ExecuteFunction;
+	/**
+	 * Returns native SQLite metrics when the active runtime supports them.
+	 */
+	nativeMetrics?: () =>
+		| SqliteNativeMetrics
+		| Promise<SqliteNativeMetrics | null>
+		| null;
 	/**
 	 * Closes the database connection and releases resources.
 	 */

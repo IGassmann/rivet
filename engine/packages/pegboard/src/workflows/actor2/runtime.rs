@@ -368,11 +368,10 @@ pub async fn send_outbound(ctx: &ActivityCtx, input: &SendOutboundInput) -> Resu
 						.as_ref()
 						.and_then(|x| BASE64_STANDARD.decode(x).ok()),
 				},
-				// Empty because request ids are ephemeral. This is intercepted by guard and
-				// populated before it reaches the runner
+				// Request ids are ephemeral. Pegboard-envoy refreshes this on the
+				// WebSocket send path immediately before the actor start reaches envoy.
 				hibernating_requests: Vec::new(),
 				preloaded_kv: None,
-				sqlite_startup_data: None,
 			});
 
 			// NOTE: Kinda jank but it works
@@ -583,19 +582,29 @@ pub async fn handle_stopped(
 			if let Some(allocation) = allocate_res.allocation {
 				state.generation += 1;
 
+				match &allocation {
+					Allocation::Serverless => {
+						state.transition = Transition::Allocating {
+							destroy_after_start: false,
+							lost_timeout_ts: allocate_res.now
+								+ ctx.config().pegboard().actor_allocation_threshold(),
+						};
+					}
+					Allocation::Serverful { envoy_key: _ } => {
+						state.transition = Transition::Starting {
+							destroy_after_start: false,
+							lost_timeout_ts: allocate_res.now
+								+ ctx.config().pegboard().actor_start_threshold(),
+						};
+					}
+				}
+
 				ctx.activity(SendOutboundInput {
 					generation: state.generation,
 					input: input.input.clone(),
 					allocation,
 				})
 				.await?;
-
-				// Transition to allocating
-				state.transition = Transition::Allocating {
-					destroy_after_start: false,
-					lost_timeout_ts: allocate_res.now
-						+ ctx.config().pegboard().actor_allocation_threshold(),
-				};
 			} else {
 				// Transition to retry backoff
 				state.transition = Transition::Reallocating {

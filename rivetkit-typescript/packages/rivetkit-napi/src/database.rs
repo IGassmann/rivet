@@ -1,7 +1,8 @@
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
 use rivetkit_core::sqlite::{
-	BindParam, ColumnValue, QueryResult as CoreQueryResult, SqliteDb as CoreSqliteDb,
+	BindParam, ColumnValue, ExecuteResult as CoreExecuteResult, QueryResult as CoreQueryResult,
+	SqliteDb as CoreSqliteDb,
 };
 
 use crate::{NapiInvalidArgument, napi_anyhow_error};
@@ -54,13 +55,26 @@ pub struct QueryResult {
 }
 
 #[napi(object)]
+pub struct NativeExecuteResult {
+	pub columns: Vec<String>,
+	pub rows: Vec<Vec<serde_json::Value>>,
+	pub changes: i64,
+	pub last_insert_row_id: Option<i64>,
+}
+
+#[napi(object)]
 pub struct JsSqliteVfsMetrics {
-	pub request_build_ns: i64,
-	pub serialize_ns: i64,
-	pub transport_ns: i64,
-	pub state_update_ns: i64,
-	pub total_ns: i64,
-	pub commit_count: i64,
+	pub request_build_ns: f64,
+	pub serialize_ns: f64,
+	pub transport_ns: f64,
+	pub state_update_ns: f64,
+	pub total_ns: f64,
+	pub commit_count: f64,
+	pub page_cache_entries: f64,
+	pub page_cache_weighted_size: f64,
+	pub page_cache_capacity_pages: f64,
+	pub write_buffer_dirty_pages: f64,
+	pub db_size_pages: f64,
 }
 
 #[napi]
@@ -71,14 +85,19 @@ impl JsNativeDatabase {
 	}
 
 	#[napi]
-	pub fn get_sqlite_vfs_metrics(&self) -> Option<JsSqliteVfsMetrics> {
+	pub fn metrics(&self) -> Option<JsSqliteVfsMetrics> {
 		self.db.metrics().map(|metrics| JsSqliteVfsMetrics {
-			request_build_ns: u64_to_i64(metrics.request_build_ns),
-			serialize_ns: u64_to_i64(metrics.serialize_ns),
-			transport_ns: u64_to_i64(metrics.transport_ns),
-			state_update_ns: u64_to_i64(metrics.state_update_ns),
-			total_ns: u64_to_i64(metrics.total_ns),
-			commit_count: u64_to_i64(metrics.commit_count),
+			request_build_ns: metrics.request_build_ns as f64,
+			serialize_ns: metrics.serialize_ns as f64,
+			transport_ns: metrics.transport_ns as f64,
+			state_update_ns: metrics.state_update_ns as f64,
+			total_ns: metrics.total_ns as f64,
+			commit_count: metrics.commit_count as f64,
+			page_cache_entries: metrics.page_cache_entries as f64,
+			page_cache_weighted_size: metrics.page_cache_weighted_size as f64,
+			page_cache_capacity_pages: metrics.page_cache_capacity_pages as f64,
+			write_buffer_dirty_pages: metrics.write_buffer_dirty_pages as f64,
+			db_size_pages: metrics.db_size_pages as f64,
 		})
 	}
 
@@ -112,6 +131,21 @@ impl JsNativeDatabase {
 			.await
 			.map_err(crate::napi_anyhow_error)?;
 		Ok(core_query_result_to_js(result))
+	}
+
+	#[napi]
+	pub async fn execute(
+		&self,
+		sql: String,
+		params: Option<Vec<JsBindParam>>,
+	) -> napi::Result<NativeExecuteResult> {
+		let params = params.map(js_bind_params_to_core).transpose()?;
+		let result = self
+			.db
+			.execute(sql, params)
+			.await
+			.map_err(crate::napi_anyhow_error)?;
+		Ok(core_execute_result_to_js(result))
 	}
 
 	#[napi]
@@ -162,6 +196,19 @@ fn core_query_result_to_js(result: CoreQueryResult) -> QueryResult {
 	}
 }
 
+fn core_execute_result_to_js(result: CoreExecuteResult) -> NativeExecuteResult {
+	NativeExecuteResult {
+		columns: result.columns,
+		rows: result
+			.rows
+			.into_iter()
+			.map(|row| row.into_iter().map(column_value_to_json).collect())
+			.collect(),
+		changes: result.changes,
+		last_insert_row_id: result.last_insert_row_id,
+	}
+}
+
 fn column_value_to_json(value: ColumnValue) -> serde_json::Value {
 	match value {
 		ColumnValue::Null => serde_json::Value::Null,
@@ -172,8 +219,4 @@ fn column_value_to_json(value: ColumnValue) -> serde_json::Value {
 			serde_json::Value::Array(value.into_iter().map(serde_json::Value::from).collect())
 		}
 	}
-}
-
-fn u64_to_i64(value: u64) -> i64 {
-	value.min(i64::MAX as u64) as i64
 }

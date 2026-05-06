@@ -303,7 +303,7 @@ export const manyQueueRunParentActor = actor({
 	},
 	actions: {
 		queueSpawn: async (c, key: string) => {
-			await c.queue.send("spawn", { key });
+			await c.queue.enqueueAndWait("spawn", { key }, { timeout: 10_000 });
 			return { queued: true };
 		},
 		getSpawned: (c) => c.state.spawned,

@@ -179,6 +179,11 @@ pub(crate) fn err_into_response(err: anyhow::Error) -> Result<Response<ResponseB
 				("guard", "retry_attempts_exceeded") => StatusCode::BAD_GATEWAY,
 				("actor", "not_found") => StatusCode::NOT_FOUND,
 				("guard", "service_unavailable") => StatusCode::SERVICE_UNAVAILABLE,
+				("guard", "actor_stopped_while_waiting") => StatusCode::SERVICE_UNAVAILABLE,
+				("guard", "tunnel_request_aborted") => StatusCode::SERVICE_UNAVAILABLE,
+				("guard", "tunnel_message_timeout") => StatusCode::GATEWAY_TIMEOUT,
+				("guard", "tunnel_response_closed") => StatusCode::SERVICE_UNAVAILABLE,
+				("guard", "gateway_response_start_timeout") => StatusCode::GATEWAY_TIMEOUT,
 				("guard", "actor_ready_timeout") => StatusCode::SERVICE_UNAVAILABLE,
 				("guard", "no_route") => StatusCode::NOT_FOUND,
 				("guard", "invalid_request_body") => StatusCode::PAYLOAD_TOO_LARGE,
@@ -218,7 +223,7 @@ pub(crate) fn should_retry_request(res: &Result<Response<ResponseBody>>) -> bool
 		Ok(resp) => should_retry_request_inner(resp.status(), resp.headers()),
 		Err(err) => {
 			if let Some(rivet_err) = err.chain().find_map(|x| x.downcast_ref::<RivetError>()) {
-				rivet_err.group() == "guard" && rivet_err.code() == "service_unavailable"
+				rivet_err.group() == "guard" && is_retryable_guard_http_error(rivet_err.code())
 			} else {
 				false
 			}
@@ -226,9 +231,27 @@ pub(crate) fn should_retry_request(res: &Result<Response<ResponseBody>>) -> bool
 	}
 }
 
-// Determine if a response should trigger a retry: 503 + x-rivet-error
+fn is_retryable_guard_http_error(code: &str) -> bool {
+	matches!(
+		code,
+		"service_unavailable"
+			| "actor_ready_timeout"
+			| "actor_stopped_while_waiting"
+			| "tunnel_request_aborted"
+			| "tunnel_message_timeout"
+			| "tunnel_response_closed"
+			| "gateway_response_start_timeout"
+	)
+}
+
+// Determine if a response should trigger a retry: transient status and x-rivet-error.
 pub(crate) fn should_retry_request_inner(status: StatusCode, headers: &hyper::HeaderMap) -> bool {
-	status == StatusCode::SERVICE_UNAVAILABLE && headers.contains_key(X_RIVET_ERROR)
+	(status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::GATEWAY_TIMEOUT)
+		&& headers
+			.get(X_RIVET_ERROR)
+			.and_then(|value| value.to_str().ok())
+			.and_then(|value| value.split_once('.'))
+			.is_some_and(|(group, code)| group == "guard" && is_retryable_guard_http_error(code))
 }
 
 // Determine if a websocket error is retryable (e.g., transient UPS/tunnel issues)
@@ -294,3 +317,7 @@ pub(crate) fn to_hyper_close(frame: Option<CloseFrame>) -> hyper_tungstenite::tu
 		))
 	}
 }
+
+#[cfg(test)]
+#[path = "utils/tests.rs"]
+mod tests;

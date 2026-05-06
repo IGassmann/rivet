@@ -39,12 +39,13 @@ pub enum UserTaskKind {
 	ScheduledAction,
 	DisconnectCallback,
 	WaitUntil,
+	RegisteredTask,
 	SleepFinalize,
 	DestroyRequest,
 }
 
 impl UserTaskKind {
-	pub(crate) const ALL: [Self; 10] = [
+	pub(crate) const ALL: [Self; 11] = [
 		Self::Action,
 		Self::Http,
 		Self::WebSocketLifetime,
@@ -53,6 +54,7 @@ impl UserTaskKind {
 		Self::ScheduledAction,
 		Self::DisconnectCallback,
 		Self::WaitUntil,
+		Self::RegisteredTask,
 		Self::SleepFinalize,
 		Self::DestroyRequest,
 	];
@@ -67,6 +69,7 @@ impl UserTaskKind {
 			Self::ScheduledAction => "scheduled_action",
 			Self::DisconnectCallback => "disconnect_callback",
 			Self::WaitUntil => "wait_until",
+			Self::RegisteredTask => "registered_task",
 			Self::SleepFinalize => "sleep_finalize",
 			Self::DestroyRequest => "destroy_request",
 		}

@@ -9,6 +9,8 @@ ARG BUILD_TARGET=engine
 ARG BUILD_MODE=release
 ARG BUILD_FRONTEND=false
 ARG VITE_APP_API_URL=__SAME__
+ARG VITE_FEATURE_FLAGS=
+ARG RUST_TOOLCHAIN=1.91.1
 
 ENV OPENSSL_DIR=/musl-aarch64 \
     OPENSSL_INCLUDE_DIR=/musl-aarch64/include \
@@ -24,15 +26,16 @@ ENV RUSTC_WRAPPER=sccache \
 WORKDIR /build
 COPY . .
 
+RUN rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal && \
+    rustup default "${RUST_TOOLCHAIN}" && \
+    rustup target add aarch64-unknown-linux-musl
+
 RUN if [ "$BUILD_TARGET" = "engine" ] && [ "$BUILD_FRONTEND" = "true" ]; then \
         export NODE_OPTIONS="--max-old-space-size=8192" && \
         export SKIP_NAPI_BUILD=1 && \
+        export SKIP_WASM_BUILD=1 && \
         pnpm install --ignore-scripts && \
-        if [ -n "$VITE_APP_API_URL" ]; then \
-            VITE_APP_API_URL="${VITE_APP_API_URL}" npx turbo build:engine -F @rivetkit/engine-frontend; \
-        else \
-            npx turbo build:engine -F @rivetkit/engine-frontend; \
-        fi; \
+        VITE_APP_API_URL="${VITE_APP_API_URL}" VITE_FEATURE_FLAGS="${VITE_FEATURE_FLAGS}" npx turbo build -F @rivetkit/engine-frontend; \
     fi
 
 RUN --mount=type=cache,id=cargo-registry-linux-arm64-musl,target=/usr/local/cargo/registry,sharing=locked \
@@ -59,7 +62,7 @@ RUN --mount=type=cache,id=cargo-registry-linux-arm64-musl,target=/usr/local/carg
     mkdir -p /artifacts && \
     if [ "$BUILD_TARGET" = "engine" ]; then \
         RUSTFLAGS="--cfg tokio_unstable -C target-feature=+crt-static -C link-arg=-static-libgcc" \
-            cargo build --bin rivet-engine $CARGO_FLAG --target aarch64-unknown-linux-musl && \
+            cargo build -p rivet-engine --bin rivet-engine $CARGO_FLAG --target aarch64-unknown-linux-musl && \
         cp target/aarch64-unknown-linux-musl/$PROFILE_DIR/rivet-engine /artifacts/rivet-engine-aarch64-unknown-linux-musl; \
     elif [ "$BUILD_TARGET" = "rivetkit-napi" ]; then \
         cd rivetkit-typescript/packages/rivetkit-napi && \

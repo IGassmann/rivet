@@ -5,12 +5,15 @@ mod moved_tests {
 	use std::sync::Arc as StdArc;
 	use std::time::Duration;
 
-	use rivet_error::RivetError as RivetTransportError;
+	use rivet_error::{RivetError as RivetTransportError, RivetErrorSchema};
+	use rivetkit_actor_persist::versioned as persist_versioned;
 	use rivetkit_core::Kv;
-	use rivetkit_core::actor::state::{PERSIST_DATA_KEY, PersistedActor};
 	use tokio::sync::oneshot;
+	use vbare::OwnedVersionedData;
 
 	use super::*;
+
+	const PERSIST_DATA_KEY: &[u8] = &[1];
 
 	fn test_adapter_config() -> AdapterConfig {
 		let timeout = Duration::from_secs(1);
@@ -59,6 +62,28 @@ mod moved_tests {
 	fn assert_error_code(error: anyhow::Error, code: &str) {
 		let error = RivetTransportError::extract(&error);
 		assert_eq!(error.code(), code);
+	}
+
+	#[test]
+	fn startup_snapshot_recovery_only_treats_empty_stateful_snapshot_as_new() {
+		assert_eq!(normalize_startup_snapshot(true, Some(Vec::new())), None);
+		assert_eq!(
+			normalize_startup_snapshot(false, Some(Vec::new())),
+			Some(Vec::new())
+		);
+		assert_eq!(
+			normalize_startup_snapshot(true, Some(vec![1, 2, 3])),
+			Some(vec![1, 2, 3])
+		);
+		assert_eq!(normalize_startup_snapshot(true, None), None);
+	}
+
+	fn schema_ptr(error: &anyhow::Error) -> *const RivetErrorSchema {
+		error
+			.chain()
+			.find_map(|cause| cause.downcast_ref::<RivetTransportError>())
+			.map(|error| error.schema as *const RivetErrorSchema)
+			.expect("expected rivet error")
 	}
 
 	#[tokio::test(flavor = "current_thread")]
@@ -167,6 +192,17 @@ mod moved_tests {
 		assert_eq!(error.code(), "action_not_found");
 	}
 
+	#[test]
+	fn action_not_found_reuses_static_schema() {
+		let first = action_not_found("missing-first".to_owned());
+		let first_schema = schema_ptr(&first);
+
+		for i in 0..100 {
+			let error = action_not_found(format!("missing-{i}"));
+			assert_eq!(schema_ptr(&error), first_schema);
+		}
+	}
+
 	#[tokio::test]
 	async fn subscribe_request_without_guard_is_allowed() {
 		let bindings = Arc::new(empty_bindings());
@@ -219,7 +255,7 @@ mod moved_tests {
 		let conn = rivetkit_core::ConnHandle::new("conn-open", vec![1, 2, 3], Vec::new(), false);
 
 		dispatch_event(
-			ActorEvent::ConnectionOpen {
+			ActorEvent::ConnectionPreflight {
 				conn: conn.clone(),
 				params: vec![4, 5, 6],
 				request: None,
@@ -369,6 +405,17 @@ mod moved_tests {
 		assert_eq!(error.message(), "Action timed out");
 	}
 
+	#[test]
+	fn unknown_structured_timeout_schema_is_interned_by_group_and_code() {
+		let first = structured_timeout_schema("test", "slow_callback", "first message");
+
+		for i in 0..100 {
+			let schema =
+				structured_timeout_schema("test", "slow_callback", &format!("message {i}"));
+			assert!(std::ptr::eq(schema, first));
+		}
+	}
+
 	#[tokio::test]
 	async fn run_adapter_loop_resets_stale_shared_end_reason_before_wake() {
 		let bindings = Arc::new(empty_bindings());
@@ -459,8 +506,11 @@ mod moved_tests {
 			.expect("persisted actor bytes should exist");
 		let embedded_version = u16::from_le_bytes([persisted_bytes[0], persisted_bytes[1]]);
 		assert!(matches!(embedded_version, 3 | 4));
-		let persisted: PersistedActor =
-			serde_bare::from_slice(&persisted_bytes[2..]).expect("persisted actor should decode");
+		let persisted =
+			<persist_versioned::Actor as OwnedVersionedData>::deserialize_with_embedded_version(
+				&persisted_bytes,
+			)
+			.expect("persisted actor should decode");
 		assert!(persisted.has_initialized);
 
 		let second_core_ctx = rivetkit_core::ActorContext::new_with_kv(

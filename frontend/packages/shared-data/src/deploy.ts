@@ -1,6 +1,7 @@
 import {
 	faAws,
 	faCloudflare,
+	faFunction,
 	faGoogleCloud,
 	faHetznerH,
 	faKubernetes,
@@ -37,24 +38,41 @@ export const deployOptions = [
 		displayName: "Vercel",
 		name: "vercel" as const,
 		href: "/docs/connect/vercel",
-		description:
-			"Deploy Next.js + RivetKit apps to Vercel's edge network",
+		description: "Deploy Next.js + RivetKit apps to Vercel's edge network",
 		icon: faVercel as any,
+	},
+	{
+		displayName: "Cloudflare Workers",
+		shortTitle: "Cloudflare",
+		name: "cloudflare-workers" as const,
+		href: "/docs/connect/cloudflare",
+		description:
+			"Run RivetKit on Cloudflare Workers with the WebAssembly runtime",
+		icon: faCloudflare as any,
+		specializedPlatform: true,
+	},
+	{
+		displayName: "Supabase Functions",
+		shortTitle: "Supabase",
+		name: "supabase-functions" as const,
+		href: "/docs/connect/supabase",
+		description:
+			"Run RivetKit on Supabase Edge Functions with the WebAssembly runtime",
+		icon: faFunction as any,
+		specializedPlatform: true,
 	},
 	{
 		displayName: "Railway",
 		name: "railway" as const,
 		href: "/docs/connect/railway",
-		description:
-			"Deploy containers to Railway's managed infrastructure",
+		description: "Deploy containers to Railway's managed infrastructure",
 		icon: faRailway as any,
 	},
 	{
 		displayName: "Kubernetes",
 		name: "kubernetes" as const,
 		href: "/docs/connect/kubernetes",
-		description:
-			"Deploy to any Kubernetes cluster with container images",
+		description: "Deploy to any Kubernetes cluster with container images",
 		icon: faKubernetes as any,
 	},
 	{
@@ -71,16 +89,14 @@ export const deployOptions = [
 		shortTitle: "GCP",
 		name: "gcp-cloud-run" as const,
 		href: "/docs/connect/gcp-cloud-run",
-		description:
-			"Deploy containers to Google Cloud Run for auto-scaling",
+		description: "Deploy containers to Google Cloud Run for auto-scaling",
 		icon: faGoogleCloud,
 	},
 	{
 		displayName: "Hetzner",
 		name: "hetzner" as const,
 		href: "/docs/connect/hetzner",
-		description:
-			"Deploy to Hetzner's cost-effective cloud infrastructure",
+		description: "Deploy to Hetzner's cost-effective cloud infrastructure",
 		icon: faHetznerH as any,
 	},
 	{
@@ -102,4 +118,4 @@ export const deployOptions = [
 	},
 ] satisfies DeployOption[];
 
-export type Provider = typeof deployOptions[number]["name"];
+export type Provider = (typeof deployOptions)[number]["name"];

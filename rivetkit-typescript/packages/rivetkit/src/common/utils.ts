@@ -1,7 +1,7 @@
 import type { Next } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import * as errors from "@/actor/errors";
-import { EXTRA_ERROR_LOG, VERSION } from "@/utils";
+import { EXTRA_ERROR_LOG } from "@/utils";
 import { getLogErrorStack } from "@/utils/env-vars";
 import type { Logger } from "./log";
 
@@ -345,7 +345,13 @@ export function deconstructError(
 export function stringifyError(error: unknown): string {
 	if (error instanceof Error) {
 		if (typeof process !== "undefined" && getLogErrorStack()) {
-			return `${error.name}: ${error.message}${error.stack ? `\n${error.stack}` : ""}`;
+			let stack: string | undefined;
+			try {
+				stack = error.stack;
+			} catch {
+				stack = undefined;
+			}
+			return `${error.name}: ${error.message}${stack ? `\n${stack}` : ""}`;
 		} else {
 			return `${error.name}: ${error.message}`;
 		}

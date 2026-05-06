@@ -308,8 +308,8 @@ impl NamespaceRunnerConfig {
 							request_lifespan: serverless.request_lifespan,
 							// Default to max_runners for v4 -> v5 migration
 							max_concurrent_actors: serverless.max_runners as u64,
-							// Default to deprecated config value (config.pegboard.serverless_drain_grace_period)
-							drain_grace_period: 10,
+							// Default to the runner stop window.
+							drain_grace_period: 30 * 60,
 							slots_per_runner: serverless.slots_per_runner,
 							min_runners: serverless.min_runners,
 							max_runners: serverless.max_runners,

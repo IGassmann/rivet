@@ -125,6 +125,17 @@ export interface SerializableCronJobOptions {
 	overlap?: "allow" | "skip" | "queue";
 }
 
+export interface SerializableCronJobInfo {
+	id: string;
+	schedule: string;
+	action: SerializableCronAction;
+	overlap: "allow" | "skip" | "queue";
+	lastRun?: string;
+	nextRun?: string;
+	runCount: number;
+	running: boolean;
+}
+
 // --- Action context alias ---
 
 export type AgentOsActionContext<TConnParams = undefined> = ActionContext<

@@ -54,6 +54,12 @@ export function decodeCborCompat<T>(buffer: Uint8Array): T {
 	return reviveJsonCompatValue(cbor.decode(buffer)) as T;
 }
 
+export function decodeCborJsonCompat<T>(buffer: Uint8Array): T {
+	return reviveJsonCompatValue(cbor.decode(buffer), {
+		coerceSafeIntegerBigInts: true,
+	}) as T;
+}
+
 export function wsBinaryTypeForEncoding(
 	encoding: Encoding,
 ): "arraybuffer" | "blob" {

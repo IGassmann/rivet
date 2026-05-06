@@ -5,25 +5,30 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use http::StatusCode;
-use reqwest::Url;
-use rivet_envoy_client::config::EnvoyConfig;
-use rivet_envoy_client::envoy::start_envoy;
+use rivet_envoy_client::config::{ActorName as EnvoyActorName, EnvoyConfig};
+use rivet_envoy_client::envoy::start_envoy as start_envoy_client;
 use rivet_envoy_client::handle::EnvoyHandle;
 use rivet_envoy_client::protocol;
 use rivetkit_shared_types::serverless_metadata::{
-	ActorName, ServerlessMetadataEnvoy, ServerlessMetadataPayload,
+	ActorName, ServerlessMetadataEnvoy, ServerlessMetadataEnvoyKind, ServerlessMetadataPayload,
 };
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 use crate::actor::factory::ActorFactory;
+#[cfg(feature = "native-runtime")]
 use crate::engine_process::EngineProcessManager;
 use crate::registry::{RegistryCallbacks, RegistryDispatcher, ServeConfig};
+use crate::runtime::RuntimeSpawner;
+use crate::time::{sleep, timeout};
 
 const DEFAULT_BASE_PATH: &str = "/api/rivet";
 const SSE_PING_INTERVAL: Duration = Duration::from_secs(1);
+const SSE_PING_FRAME: &[u8] = b"event: ping\ndata:\n\n";
+const SSE_STOPPING_FRAME: &[u8] = b"event: stopping\ndata:\n\n";
 /// Bound on `handle.shutdown_and_wait` inside teardown paths. If envoy cannot
 /// reach the engine (reconnect loop stuck), we fall back to immediate `Stop`
 /// rather than hanging indefinitely. Must stay below the outer TS grace ceiling.
@@ -34,6 +39,7 @@ pub struct CoreServerlessRuntime {
 	settings: Arc<ServerlessSettings>,
 	dispatcher: Arc<RegistryDispatcher>,
 	envoy: Arc<TokioMutex<Option<EnvoyHandle>>>,
+	#[cfg(feature = "native-runtime")]
 	_engine_process: Arc<TokioMutex<Option<EngineProcessManager>>>,
 	shutting_down: Arc<AtomicBool>,
 }
@@ -42,7 +48,6 @@ pub struct CoreServerlessRuntime {
 struct ServerlessSettings {
 	version: u32,
 	configured_endpoint: String,
-	configured_token: Option<String>,
 	configured_namespace: String,
 	base_path: String,
 	package_version: String,
@@ -51,6 +56,7 @@ struct ServerlessSettings {
 	client_token: Option<String>,
 	validate_endpoint: bool,
 	max_start_payload_bytes: usize,
+	cache_envoy: bool,
 }
 
 #[derive(Debug)]
@@ -79,7 +85,7 @@ pub struct ServerlessStreamError {
 #[derive(Debug)]
 struct StartHeaders {
 	endpoint: String,
-	token: String,
+	token: Option<String>,
 	pool_name: String,
 	namespace: String,
 }
@@ -148,12 +154,17 @@ impl CoreServerlessRuntime {
 		factories: HashMap<String, Arc<ActorFactory>>,
 		config: ServeConfig,
 	) -> Result<Self> {
+		#[cfg(feature = "native-runtime")]
 		let engine_process = match config.engine_binary_path.as_ref() {
 			Some(binary_path) => {
 				Some(EngineProcessManager::start(binary_path, &config.endpoint).await?)
 			}
 			None => None,
 		};
+		#[cfg(not(feature = "native-runtime"))]
+		if config.engine_binary_path.is_some() {
+			anyhow::bail!("engine process spawning requires the `native-runtime` feature");
+		}
 
 		let dispatcher = Arc::new(RegistryDispatcher::new(
 			factories,
@@ -165,7 +176,6 @@ impl CoreServerlessRuntime {
 			settings: Arc::new(ServerlessSettings {
 				version: config.version,
 				configured_endpoint: config.endpoint,
-				configured_token: config.token,
 				configured_namespace: config.namespace,
 				base_path,
 				package_version: config.serverless_package_version,
@@ -174,9 +184,11 @@ impl CoreServerlessRuntime {
 				client_token: config.serverless_client_token,
 				validate_endpoint: config.serverless_validate_endpoint,
 				max_start_payload_bytes: config.serverless_max_start_payload_bytes,
+				cache_envoy: config.serverless_cache_envoy,
 			}),
 			dispatcher,
 			envoy: Arc::new(TokioMutex::new(None)),
+			#[cfg(feature = "native-runtime")]
 			_engine_process: Arc::new(TokioMutex::new(engine_process)),
 			shutting_down: Arc::new(AtomicBool::new(false)),
 		})
@@ -192,7 +204,7 @@ impl CoreServerlessRuntime {
 		self.shutting_down.store(true, Ordering::Release);
 		let handle = { self.envoy.lock().await.take() };
 		let Some(handle) = handle else { return };
-		match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, handle.shutdown_and_wait(false)).await {
+		match timeout(SHUTDOWN_DRAIN_TIMEOUT, handle.shutdown_and_wait(false)).await {
 			Ok(()) => {}
 			Err(_) => {
 				tracing::warn!(
@@ -202,6 +214,14 @@ impl CoreServerlessRuntime {
 				handle.wait_stopped().await;
 			}
 		}
+	}
+
+	pub async fn active_envoy_actor_count(&self) -> Option<usize> {
+		self.envoy
+			.lock()
+			.await
+			.as_ref()
+			.map(EnvoyHandle::active_actor_count)
 	}
 
 	pub async fn handle_request(&self, req: ServerlessRequest) -> ServerlessResponse {
@@ -236,7 +256,7 @@ impl CoreServerlessRuntime {
 				}),
 			)),
 			("GET", "/metadata") => Ok(self.metadata_response()),
-			("POST", "/start") => self.start_response(req).await,
+			("GET", "/start") | ("POST", "/start") => self.start_response(req).await,
 			("OPTIONS", _) => Ok(bytes_response(
 				StatusCode::NO_CONTENT,
 				HashMap::new(),
@@ -260,14 +280,22 @@ impl CoreServerlessRuntime {
 			}
 			.build());
 		}
+
 		let handle = self.ensure_envoy(&headers).await?;
 		let payload = req.body;
+		let actor_start = handle.decode_serverless_actor_start(&payload)?;
 		let cancel_token = req.cancel_token;
+		let cache_envoy = self.settings.cache_envoy;
 		let (tx, rx) = mpsc::channel(16);
+		let _ = tx.try_send(Ok(SSE_PING_FRAME.to_vec()));
 
-		tokio::spawn(async move {
+		RuntimeSpawner::spawn(async move {
+			let shutdown_handle = handle.clone();
 			let result = tokio::select! {
 				_ = cancel_token.cancelled() => {
+					if !cache_envoy {
+						shutdown_handle.shutdown_and_wait(false).await;
+					}
 					return;
 				}
 				result = handle.start_serverless_actor(&payload) => result,
@@ -275,6 +303,9 @@ impl CoreServerlessRuntime {
 			if let Err(error) = result {
 				let error = stream_error(error);
 				let _ = tx.send(Err(error)).await;
+				if !cache_envoy {
+					handle.shutdown_and_wait(false).await;
+				}
 				return;
 			}
 
@@ -283,12 +314,20 @@ impl CoreServerlessRuntime {
 					_ = cancel_token.cancelled() => {
 						break;
 					}
-					_ = tokio::time::sleep(SSE_PING_INTERVAL) => {
-						if tx.send(Ok(b"event: ping\ndata:\n\n".to_vec())).await.is_err() {
+					_ = handle.wait_actor_registered_then_stopped(&actor_start.actor_id, actor_start.generation) => {
+						let _ = tx.send(Ok(SSE_STOPPING_FRAME.to_vec())).await;
+						break;
+					}
+					_ = sleep(SSE_PING_INTERVAL) => {
+						if tx.send(Ok(SSE_PING_FRAME.to_vec())).await.is_err() {
 							break;
 						}
 					}
 				}
+			}
+
+			if !cache_envoy {
+				handle.shutdown_and_wait(false).await;
 			}
 		});
 
@@ -306,48 +345,13 @@ impl CoreServerlessRuntime {
 	fn metadata_response(&self) -> ServerlessResponse {
 		let actor_names = self
 			.dispatcher
-			.factories
-			.iter()
-			.map(|(actor_name, factory): (&String, &Arc<ActorFactory>)| {
-				let config = factory.config();
-				let mut metadata = serde_json::Map::new();
-				if let Some(icon) = &config.icon {
-					metadata.insert("icon".to_owned(), json!(icon));
-				}
-				if let Some(name) = &config.name {
-					metadata.insert("name".to_owned(), json!(name));
-				}
-				metadata.insert(
-					"preload".to_owned(),
-					json!({
-						"keys": [
-							[1],
-							[3],
-							[5, 1, 1],
-						],
-						"prefixes": [
-							{
-								"prefix": [6, 1],
-								"maxBytes": config.preload_max_workflow_bytes.unwrap_or(131_072),
-								"partial": false,
-							},
-							{
-								"prefix": [2],
-								"maxBytes": config.preload_max_connections_bytes.unwrap_or(65_536),
-								"partial": false,
-							},
-							{
-								"prefix": [5, 1, 2],
-								"maxBytes": 65_536,
-								"partial": false,
-							},
-						],
-					}),
-				);
+			.build_actor_metadata_map()
+			.into_iter()
+			.map(|(name, metadata)| {
 				(
-					actor_name.clone(),
+					name,
 					ActorName {
-						metadata: Some(serde_json::Value::Object(metadata)),
+						metadata: Some(metadata),
 					},
 				)
 			})
@@ -359,33 +363,16 @@ impl CoreServerlessRuntime {
 			envoy_protocol_version: Some(protocol::PROTOCOL_VERSION),
 			actor_names,
 			envoy: Some(ServerlessMetadataEnvoy {
+				kind: Some(ServerlessMetadataEnvoyKind::Serverless {}),
 				version: Some(self.settings.version),
 			}),
 			runner: None,
+			client_endpoint: self.settings.client_endpoint.clone(),
+			client_namespace: self.settings.client_namespace.clone(),
+			client_token: self.settings.client_token.clone(),
 		};
 
-		let mut response = serde_json::to_value(payload).unwrap_or_else(|_| json!({}));
-
-		if let serde_json::Value::Object(object) = &mut response {
-			if object.get("runner").is_some_and(serde_json::Value::is_null) {
-				object.remove("runner");
-			}
-			if let Some(envoy) = object
-				.get_mut("envoy")
-				.and_then(|value| value.as_object_mut())
-			{
-				envoy.insert("kind".to_owned(), json!({ "serverless": {} }));
-			}
-			if let Some(client_endpoint) = &self.settings.client_endpoint {
-				object.insert("clientEndpoint".to_owned(), json!(client_endpoint));
-			}
-			if let Some(client_namespace) = &self.settings.client_namespace {
-				object.insert("clientNamespace".to_owned(), json!(client_namespace));
-			}
-			if let Some(client_token) = &self.settings.client_token {
-				object.insert("clientToken".to_owned(), json!(client_token));
-			}
-		}
+		let response = serde_json::to_value(payload).unwrap_or_else(|_| json!({}));
 
 		json_response(StatusCode::OK, response)
 	}
@@ -426,8 +413,13 @@ impl CoreServerlessRuntime {
 		if self.shutting_down.load(Ordering::Acquire) {
 			return Err(RuntimeShutDown.build());
 		}
+		if !self.settings.cache_envoy {
+			return self.start_envoy(headers).await;
+		}
 		let mut guard = self.envoy.lock().await;
 		if let Some(handle) = guard.as_ref() {
+			// The start request token authenticates the serverless callback. It is not part
+			// of envoy identity, and may differ from the token used for the engine connection.
 			if !endpoints_match(handle.endpoint(), &headers.endpoint)
 				|| handle.namespace() != headers.namespace
 				|| handle.pool_name() != headers.pool_name
@@ -437,34 +429,13 @@ impl CoreServerlessRuntime {
 			return Ok(handle.clone());
 		}
 
-		let callbacks = Arc::new(RegistryCallbacks {
-			dispatcher: self.dispatcher.clone(),
-		});
-		// not_global: true to avoid caching the handle in the process-wide
-		// `GLOBAL_ENVOY` OnceLock. Without this, a shutdown-during-build race
-		// (spec §3 step 7) leaves a dead handle cached for the life of the
-		// process and any subsequent consumer gets it back.
-		let handle = start_envoy(EnvoyConfig {
-			version: self.settings.version,
-			endpoint: headers.endpoint.clone(),
-			token: Some(headers.token.clone()),
-			namespace: headers.namespace.clone(),
-			pool_name: headers.pool_name.clone(),
-			prepopulate_actor_names: HashMap::new(),
-			metadata: None,
-			not_global: true,
-			debug_latency_ms: None,
-			callbacks,
-		})
-		.await;
+		let handle = self.start_envoy(headers).await?;
 		// Re-check under the lock: shutdown may have run while we were awaiting
 		// `start_envoy`. If so, tear down the freshly-built envoy rather than
 		// installing it into the cache.
 		if self.shutting_down.load(Ordering::Acquire) {
 			drop(guard);
-			match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, handle.shutdown_and_wait(false))
-				.await
-			{
+			match timeout(SHUTDOWN_DRAIN_TIMEOUT, handle.shutdown_and_wait(false)).await {
 				Ok(()) => {}
 				Err(_) => {
 					handle.shutdown(true);
@@ -475,6 +446,37 @@ impl CoreServerlessRuntime {
 		}
 		*guard = Some(handle.clone());
 		Ok(handle)
+	}
+
+	async fn start_envoy(&self, headers: &StartHeaders) -> Result<EnvoyHandle> {
+		let callbacks = Arc::new(RegistryCallbacks {
+			dispatcher: self.dispatcher.clone(),
+		});
+		let prepopulate_actor_names = self
+			.dispatcher
+			.build_actor_metadata_map()
+			.into_iter()
+			.map(|(name, metadata)| (name, EnvoyActorName { metadata }))
+			.collect();
+		// not_global: true to avoid caching the handle in the process-wide
+		// `GLOBAL_ENVOY` OnceLock. Without this, a shutdown-during-build race
+		// (spec §3 step 7) leaves a dead handle cached for the life of the
+		// process and any subsequent consumer gets it back.
+		Ok(start_envoy_client(EnvoyConfig {
+			version: self.settings.version,
+			endpoint: headers.endpoint.clone(),
+			token: headers.token.clone(),
+			namespace: headers.namespace.clone(),
+			pool_name: headers.pool_name.clone(),
+			prepopulate_actor_names,
+			metadata: Some(json!({
+				"rivetkit": { "version": self.settings.package_version },
+			})),
+			not_global: true,
+			debug_latency_ms: None,
+			callbacks,
+		})
+		.await)
 	}
 }
 
@@ -492,10 +494,20 @@ fn route_path(base_path: &str, url: &str) -> Result<String> {
 }
 
 fn parse_start_headers(headers: &HashMap<String, String>) -> Result<StartHeaders> {
+	let pool_name = match optional_header(headers, "x-rivet-pool-name") {
+		Some(pool_name) => pool_name,
+		None => optional_header(headers, "x-rivet-runner-name").ok_or_else(|| {
+			InvalidRequest {
+				reason: "x-rivet-pool-name header is required".to_string(),
+			}
+			.build()
+		})?,
+	};
+
 	Ok(StartHeaders {
 		endpoint: required_header(headers, "x-rivet-endpoint")?,
-		token: required_header(headers, "x-rivet-token")?,
-		pool_name: required_header(headers, "x-rivet-pool-name")?,
+		token: optional_header(headers, "x-rivet-token"),
+		pool_name,
 		namespace: required_header(headers, "x-rivet-namespace-name")?,
 	})
 }
@@ -596,9 +608,7 @@ fn bytes_response(
 	body: Vec<u8>,
 ) -> ServerlessResponse {
 	let (tx, rx) = mpsc::channel(1);
-	tokio::spawn(async move {
-		let _ = tx.send(Ok(body)).await;
-	});
+	let _ = tx.try_send(Ok(body));
 	ServerlessResponse {
 		status: status.as_u16(),
 		headers,
@@ -658,11 +668,23 @@ pub fn normalize_endpoint_url(url: &str) -> Option<String> {
 	Some(format!("{}://{}{}", parsed.scheme(), host, pathname))
 }
 
+fn normalized_endpoint_candidates(value: &str) -> Vec<String> {
+	value
+		.split(',')
+		.map(str::trim)
+		.filter(|candidate| !candidate.is_empty())
+		.map(|candidate| normalize_endpoint_url(candidate).unwrap_or_else(|| candidate.to_owned()))
+		.collect()
+}
+
 pub fn endpoints_match(a: &str, b: &str) -> bool {
-	match (normalize_endpoint_url(a), normalize_endpoint_url(b)) {
-		(Some(a), Some(b)) => a == b,
-		_ => a == b,
-	}
+	let a_candidates = normalized_endpoint_candidates(a);
+	let b_candidates = normalized_endpoint_candidates(b);
+	a_candidates.iter().any(|a_candidate| {
+		b_candidates
+			.iter()
+			.any(|b_candidate| a_candidate == b_candidate)
+	})
 }
 
 fn normalize_regional_hostname(hostname: &str) -> String {

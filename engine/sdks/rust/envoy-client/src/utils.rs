@@ -1,7 +1,13 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use rand::Rng;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::{JsCast, JsValue};
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_futures::JsFuture;
 
 /// Convert an ID (byte slice) to a hex string.
 pub fn id_to_str(id: &[u8]) -> String {
@@ -25,13 +31,81 @@ impl std::fmt::Display for EnvoyShutdownError {
 
 impl std::error::Error for EnvoyShutdownError {}
 
+/// Error returned when a sent remote SQLite request may have completed but the
+/// WebSocket closed before the response arrived.
+#[derive(Debug)]
+pub struct RemoteSqliteIndeterminateResultError {
+	pub operation: &'static str,
+}
+
+impl std::fmt::Display for RemoteSqliteIndeterminateResultError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"remote sqlite {} result is indeterminate after envoy disconnect",
+			self.operation
+		)
+	}
+}
+
+impl std::error::Error for RemoteSqliteIndeterminateResultError {}
+
 /// Inject artificial latency for testing.
 pub async fn inject_latency(ms: Option<u64>) {
 	if let Some(ms) = ms {
 		if ms > 0 {
-			tokio::time::sleep(Duration::from_millis(ms)).await;
+			sleep(Duration::from_millis(ms)).await;
 		}
 	}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub type SleepFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+#[cfg(target_arch = "wasm32")]
+pub type SleepFuture = Pin<Box<dyn Future<Output = ()>>>;
+
+pub fn boxed_sleep(duration: Duration) -> SleepFuture {
+	Box::pin(sleep(duration))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn sleep(duration: Duration) {
+	tokio::time::sleep(duration).await;
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn sleep(duration: Duration) {
+	let delay_ms = duration.as_millis().min(u32::MAX as u128) as f64;
+	let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+		let global = js_sys::global();
+		let set_timeout = js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout"))
+			.ok()
+			.and_then(|value| value.dyn_into::<js_sys::Function>().ok());
+
+		if let Some(set_timeout) = set_timeout {
+			let _ = set_timeout.call2(&global, &resolve, &JsValue::from_f64(delay_ms));
+		} else {
+			let _ = resolve.call0(&JsValue::UNDEFINED);
+		}
+	});
+
+	let _ = JsFuture::from(promise).await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn spawn_detached<F>(future: F)
+where
+	F: Future<Output = ()> + Send + 'static,
+{
+	tokio::spawn(future);
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_detached<F>(future: F)
+where
+	F: Future<Output = ()> + 'static,
+{
+	tokio::task::spawn_local(future);
 }
 
 pub struct BackoffOptions {

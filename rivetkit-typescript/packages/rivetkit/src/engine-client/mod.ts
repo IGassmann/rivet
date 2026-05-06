@@ -2,19 +2,26 @@ import type { Context as HonoContext } from "hono";
 import invariant from "invariant";
 import { deserializeActorKey, serializeActorKey } from "@/actor/keys";
 import type { ClientConfig } from "@/client/client";
-import { noopNext } from "@/common/utils";
 import {
-	type ActorOutput,
-	type CreateInput,
-	type GatewayTarget,
-	type GetForIdInput,
-	type GetOrCreateWithKeyInput,
-	type GetWithKeyInput,
-	type ListActorsInput,
-	type RuntimeDisplayInformation,
-	type EngineControlClient,
-} from "@/engine-client/driver";
+	PATH_CONNECT,
+	PATH_WEBSOCKET_BASE,
+	PATH_WEBSOCKET_PREFIX,
+} from "@/common/actor-router-consts";
+import { noopNext } from "@/common/utils";
 import type { Actor as ApiActor } from "@/engine-api/actors";
+import { shouldSkipReadyWait } from "@/engine-client/driver";
+import type {
+	ActorOutput,
+	CreateInput,
+	EngineControlClient,
+	GatewayRequestOptions,
+	GatewayTarget,
+	GetForIdInput,
+	GetOrCreateWithKeyInput,
+	GetWithKeyInput,
+	ListActorsInput,
+	RuntimeDisplayInformation,
+} from "@/engine-client/driver";
 import type { Encoding, UniversalWebSocket } from "@/mod";
 import { encodeCborCompat, uint8ArrayToBase64 } from "@/serde";
 import { combineUrlPath, type GetUpgradeWebSocket } from "@/utils";
@@ -246,15 +253,29 @@ export class RemoteEngineControlClient implements EngineControlClient {
 	async sendRequest(
 		target: GatewayTarget,
 		actorRequest: Request,
+		options: GatewayRequestOptions = {},
 	): Promise<Response> {
 		await this.#metadataPromise;
 
+		const path = requestPath(actorRequest);
 		const gatewayUrl = this.#buildGatewayUrlForTarget(
 			target,
-			requestPath(actorRequest),
+			path,
+			options,
 		);
+		const httpOptions = {
+			...options,
+			directActorId: shouldSkipReadyWait(options)
+				? directActorIdFromTarget(target)
+				: undefined,
+		};
 
-		return sendHttpRequestToGateway(this.#config, gatewayUrl, actorRequest);
+		return sendHttpRequestToGateway(
+			this.#config,
+			gatewayUrl,
+			actorRequest,
+			httpOptions,
+		);
 	}
 
 	async openWebSocket(
@@ -262,22 +283,36 @@ export class RemoteEngineControlClient implements EngineControlClient {
 		target: GatewayTarget,
 		encoding: Encoding,
 		params: unknown,
+		options: GatewayRequestOptions = {},
 	): Promise<UniversalWebSocket> {
 		await this.#metadataPromise;
 
-		const gatewayUrl = this.#buildGatewayUrlForTarget(target, path);
+		const gatewayUrl = this.#buildGatewayUrlForTarget(
+			target,
+			path,
+			options,
+		);
 
 		return openWebSocketToGateway(
 			this.#config,
 			gatewayUrl,
 			encoding,
 			params,
+			{
+				...options,
+				directActorId: shouldSkipReadyWait(options)
+					? directActorIdFromTarget(target)
+					: undefined,
+			},
 		);
 	}
 
-	async buildGatewayUrl(target: GatewayTarget): Promise<string> {
+	async buildGatewayUrl(
+		target: GatewayTarget,
+		options: GatewayRequestOptions = {},
+	): Promise<string> {
 		await this.#metadataPromise;
-		return this.#buildGatewayUrlForTarget(target, "");
+		return this.#buildGatewayUrlForTarget(target, "", options);
 	}
 
 	async proxyRequest(
@@ -382,8 +417,20 @@ export class RemoteEngineControlClient implements EngineControlClient {
 		this.#config.getUpgradeWebSocket = getUpgradeWebSocket;
 	}
 
-	#buildGatewayUrlForTarget(target: GatewayTarget, path: string): string {
+	#buildGatewayUrlForTarget(
+		target: GatewayTarget,
+		path: string,
+		options: GatewayRequestOptions = {},
+	): string {
 		const endpoint = getEndpoint(this.#config);
+
+		if (
+			shouldSkipReadyWait(options) &&
+			directActorIdFromTarget(target) &&
+			canUseDirectSkipReadyWaitPath(path)
+		) {
+			return combineUrlPath(endpoint, path);
+		}
 
 		if ("directId" in target) {
 			return buildActorGatewayUrl(
@@ -415,6 +462,7 @@ export class RemoteEngineControlClient implements EngineControlClient {
 				"getOrCreateForKey" in target
 					? this.#config.poolName
 					: undefined,
+				options,
 			);
 		}
 
@@ -426,6 +474,39 @@ export class RemoteEngineControlClient implements EngineControlClient {
 
 		throw new Error("unreachable: unknown gateway target type");
 	}
+}
+
+function canUseDirectSkipReadyWaitPath(path: string): boolean {
+	return (
+		isActorHttpRequestPath(path) ||
+		isPathOrQuery(path, PATH_CONNECT) ||
+		isPathOrQuery(path, PATH_WEBSOCKET_BASE) ||
+		path.startsWith(PATH_WEBSOCKET_PREFIX)
+	);
+}
+
+function isPathOrQuery(path: string, basePath: string): boolean {
+	return path === basePath || path.startsWith(`${basePath}?`);
+}
+
+function isActorHttpRequestPath(path: string): boolean {
+	const stripped = path.slice("/request".length);
+	return (
+		path.startsWith("/request") &&
+		(stripped.length === 0 ||
+			stripped.startsWith("/") ||
+			stripped.startsWith("?"))
+	);
+}
+
+function directActorIdFromTarget(target: GatewayTarget): string | undefined {
+	if ("directId" in target) {
+		return target.directId;
+	}
+	if ("getForId" in target) {
+		return target.getForId.actorId;
+	}
+	return undefined;
 }
 
 function requestPath(req: Request): string {

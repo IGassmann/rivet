@@ -1,12 +1,15 @@
 import { z } from "zod/v4";
 import { getRivetPublicEndpoint, getRivetPublicToken } from "@/utils/env-vars";
 
+export const DEFAULT_SERVERLESS_MAX_START_PAYLOAD_BYTES = 16 * 1024 * 1024;
+
 export const ConfigurePoolSchema = z
 	.object({
 		name: z.string().optional(),
 		url: z.string(),
 		headers: z.record(z.string(), z.string()).optional(),
 		requestLifespan: z.number().optional(),
+		drainGracePeriod: z.number().optional(),
 		metadata: z.record(z.string(), z.unknown()).optional(),
 		metadataPollInterval: z.number().optional(),
 		drainOnVersionUpgrade: z.boolean().optional(),
@@ -16,7 +19,10 @@ export const ConfigurePoolSchema = z
 export const ServerlessConfigSchema = z.object({
 	// MARK: Routing
 	basePath: z.string().optional().default("/api/rivet"),
-	maxStartPayloadBytes: z.number().optional().default(1_048_576),
+	maxStartPayloadBytes: z
+		.number()
+		.optional()
+		.default(DEFAULT_SERVERLESS_MAX_START_PAYLOAD_BYTES),
 
 	// MARK: Public Endpoint Configuration
 	/**

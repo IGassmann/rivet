@@ -67,8 +67,8 @@ impl Into<rivet_types::runner_configs::RunnerConfig> for RunnerConfig {
 				headers: headers.unwrap_or_default(),
 				request_lifespan,
 				max_concurrent_actors: max_concurrent_actors.unwrap_or(max_runners as u64),
-				// Default to deprecated config value (config.pegboard.serverless_drain_grace_period)
-				drain_grace_period: drain_grace_period.unwrap_or(10),
+				// Default to the runner stop window.
+				drain_grace_period: drain_grace_period.unwrap_or(30 * 60),
 				slots_per_runner,
 				min_runners: min_runners.unwrap_or_default(),
 				max_runners,

@@ -30,7 +30,7 @@ pub enum QueryActorQuery {
 		namespace: String,
 		name: String,
 		key: Vec<String>,
-		bypass_connectable: bool,
+		skip_ready_wait: bool,
 	},
 	GetOrCreate {
 		namespace: String,
@@ -40,19 +40,19 @@ pub enum QueryActorQuery {
 		input: Option<Vec<u8>>,
 		region: Option<String>,
 		crash_policy: Option<CrashPolicy>,
-		bypass_connectable: bool,
+		skip_ready_wait: bool,
 	},
 }
 
 impl QueryActorQuery {
-	pub fn bypass_connectable(&self) -> bool {
+	pub fn skip_ready_wait(&self) -> bool {
 		match self {
 			QueryActorQuery::Get {
-				bypass_connectable, ..
+				skip_ready_wait, ..
 			}
 			| QueryActorQuery::GetOrCreate {
-				bypass_connectable, ..
-			} => *bypass_connectable,
+				skip_ready_wait, ..
+			} => *skip_ready_wait,
 		}
 	}
 }
@@ -61,6 +61,20 @@ impl QueryActorQuery {
 pub enum ParsedActorPath {
 	Direct(ActorPathInfo),
 	Query(QueryActorPathInfo),
+}
+
+pub fn is_actor_gateway_path(path: &str) -> bool {
+	let (base_path, _) = split_path_and_query(path);
+
+	if base_path.contains("//") {
+		return false;
+	}
+
+	base_path
+		.split('/')
+		.filter(|segment| !segment.is_empty())
+		.next()
+		== Some("gateway")
 }
 
 /// Parsed rvt-* query parameters.
@@ -83,8 +97,8 @@ struct RvtParams {
 	crash_policy: Option<String>,
 	#[serde(default)]
 	token: Option<String>,
-	#[serde(default)]
-	bypass_connectable: bool,
+	#[serde(default, rename = "skip-ready-wait")]
+	skip_ready_wait: bool,
 }
 
 /// Parse actor routing information from path.
@@ -229,10 +243,13 @@ fn extract_rvt_params(rvt_params: &[(String, String)]) -> Result<RvtParams> {
 			}
 			.build());
 		}
-		map.insert(
-			stripped.to_string(),
-			serde_json::Value::String(value.clone()),
-		);
+		let value = match stripped {
+			"skip-ready-wait" => parse_query_bool(value)
+				.map(serde_json::Value::Bool)
+				.unwrap_or_else(|| serde_json::Value::String(value.clone())),
+			_ => serde_json::Value::String(value.clone()),
+		};
+		map.insert(stripped.to_string(), value);
 	}
 
 	serde_json::from_value(serde_json::Value::Object(map)).map_err(|e| {
@@ -241,6 +258,14 @@ fn extract_rvt_params(rvt_params: &[(String, String)]) -> Result<RvtParams> {
 		}
 		.build()
 	})
+}
+
+fn parse_query_bool(value: &str) -> Option<bool> {
+	match value {
+		"true" | "1" => Some(true),
+		"false" | "0" => Some(false),
+		_ => None,
+	}
 }
 
 /// Split a comma-separated key string into components.
@@ -269,7 +294,7 @@ fn build_actor_query(name: &str, rvt: RvtParams) -> Result<QueryActorQuery> {
 				namespace: rvt.namespace,
 				name: name.to_string(),
 				key,
-				bypass_connectable: rvt.bypass_connectable,
+				skip_ready_wait: rvt.skip_ready_wait,
 			})
 		}
 		"getOrCreate" => {
@@ -294,7 +319,7 @@ fn build_actor_query(name: &str, rvt: RvtParams) -> Result<QueryActorQuery> {
 				input,
 				region: rvt.region,
 				crash_policy,
-				bypass_connectable: rvt.bypass_connectable,
+				skip_ready_wait: rvt.skip_ready_wait,
 			})
 		}
 		other => Err(errors::QueryInvalidParams {

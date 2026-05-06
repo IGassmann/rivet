@@ -5,12 +5,12 @@ pub trait Signal {
 /// Creates an enum that implements `Listen` and selects one of X signals.
 ///
 /// Example:
-/// ```rust
+/// ```rust,ignore
 /// #[signal("my_signal")]
 /// struct MySignal {
 /// 	x: i64,
 /// }
-
+///
 /// #[signal("my_signal2")]
 /// struct MySignal2 {
 /// 	y: i64,
@@ -38,7 +38,7 @@ pub trait Signal {
 /// join_signal!(MyJoinSignal {
 /// 	MySignal,
 /// 	MySignal2(some_pkg::Signal),
-/// }
+/// });
 /// ```
 #[macro_export]
 macro_rules! join_signal {

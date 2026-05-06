@@ -104,6 +104,30 @@ describeDriverMatrix("Actor Destroy", (driverTestConfig) => {
 			expect(newValue).toBe(0);
 		});
 
+		test("ctx.destroy does not synchronously abort actor signal", async (c) => {
+			const { client } = await setupDriverTest(c, driverTestConfig);
+			const actorKey = `test-destroy-abort-signal-${crypto.randomUUID()}`;
+			const observer = client.destroyObserver.getOrCreate(["observer"]);
+			await observer.reset();
+
+			const result = await client.destroyAbortSignalActor
+				.getOrCreate([actorKey])
+				.requestDestroy();
+
+			expect(result).toEqual({
+				beforeDestroyAborted: false,
+				beforeDestroySignalAborted: false,
+				afterDestroyAborted: false,
+				afterDestroySignalAborted: false,
+				abortEventCountAfterDestroy: 0,
+			});
+
+			// Poll until onDestroy records so this action covered the real destroy path.
+			await vi.waitFor(async () => {
+				expect(await observer.wasDestroyed(actorKey)).toBe(true);
+			});
+		});
+
 		test("actor destroy clears ephemeral vars on same-key recreation", async (c) => {
 			const { client } = await setupDriverTest(c, driverTestConfig);
 

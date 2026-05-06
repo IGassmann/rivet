@@ -1,6 +1,6 @@
 {
 	"name": "rivetkit",
-	"version": "2.3.0-rc.4",
+	"version": "2.3.0-rc.5",
 	"description": "Lightweight libraries for building stateful actors on edge platforms",
 	"license": "Apache-2.0",
 	"keywords": [
@@ -161,6 +161,7 @@
 		"format": "biome format .",
 		"format:write": "biome format --write .",
 		"test": "vitest run",
+		"test:platforms": "pnpm run build && RIVETKIT_INCLUDE_PLATFORM_TESTS=1 vitest run tests/platforms --passWithNoTests",
 		"test:watch": "vitest",
 		"dump-asyncapi": "tsx scripts/dump-asyncapi.ts",
 		"registry-config-schema-gen": "tsx scripts/registry-config-schema-gen.ts",
@@ -175,6 +176,7 @@
 		"@rivetkit/engine-cli": "workspace:*",
 		"@rivetkit/engine-envoy-protocol": "workspace:*",
 		"@rivetkit/rivetkit-napi": "workspace:*",
+		"@rivetkit/rivetkit-wasm": "workspace:*",
 		"@rivetkit/traces": "workspace:*",
 		"@rivetkit/virtual-websocket": "workspace:*",
 		"@rivetkit/workflow-engine": "workspace:*",

@@ -1,5 +1,8 @@
 import { describe, expect, test } from "vitest";
-import { describeDriverMatrix } from "./shared-matrix";
+import {
+	describeDriverMatrix,
+	SQLITE_DRIVER_MATRIX_OPTIONS,
+} from "./shared-matrix";
 import { setupDriverTest, waitFor } from "./shared-utils";
 
 const REAL_TIMER_DB_TIMEOUT_MS = 180_000;
@@ -153,4 +156,4 @@ describeDriverMatrix("Actor Db Init Order", (driverTestConfig) => {
 			dbTestTimeout,
 		);
 	});
-});
+}, SQLITE_DRIVER_MATRIX_OPTIONS);

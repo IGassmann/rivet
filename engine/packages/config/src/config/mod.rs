@@ -15,6 +15,7 @@ pub mod metrics;
 pub mod pegboard;
 pub mod pubsub;
 pub mod runtime;
+pub mod sqlite;
 pub mod telemetry;
 pub mod topology;
 
@@ -30,6 +31,7 @@ pub use metrics::*;
 pub use pegboard::*;
 pub use pubsub::PubSub;
 pub use runtime::*;
+pub use sqlite::*;
 pub use telemetry::*;
 pub use topology::*;
 
@@ -104,6 +106,9 @@ pub struct Root {
 	pub runtime: Runtime,
 
 	#[serde(default)]
+	pub sqlite: Option<Sqlite>,
+
+	#[serde(default)]
 	pub metrics: Metrics,
 }
 
@@ -123,6 +128,7 @@ impl Default for Root {
 			clickhouse: None,
 			telemetry: Default::default(),
 			runtime: Default::default(),
+			sqlite: None,
 			metrics: Default::default(),
 		}
 	}
@@ -167,6 +173,11 @@ impl Root {
 	pub fn pubsub(&self) -> &PubSub {
 		static DEFAULT: LazyLock<PubSub> = LazyLock::new(PubSub::default);
 		self.pubsub.as_ref().unwrap_or(&DEFAULT)
+	}
+
+	pub fn sqlite(&self) -> &Sqlite {
+		static DEFAULT: LazyLock<Sqlite> = LazyLock::new(Sqlite::default);
+		self.sqlite.as_ref().unwrap_or(&DEFAULT)
 	}
 
 	pub fn cache(&self) -> &Cache {

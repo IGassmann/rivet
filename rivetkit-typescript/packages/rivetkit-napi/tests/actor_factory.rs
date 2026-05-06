@@ -6,11 +6,19 @@ mod moved_tests {
 	use std::sync::Arc;
 
 	use parking_lot::Mutex;
-	use rivet_error::{RivetError, RivetErrorSchema};
+	use rivet_error::{MacroMarker, RivetError, RivetErrorSchema};
 	use tracing::Level;
 	use tracing_subscriber::fmt::MakeWriter;
 
 	use super::{BRIDGE_RIVET_ERROR_PREFIX, parse_bridge_rivet_error};
+
+	static AUTH_FORBIDDEN_SCHEMA: RivetErrorSchema = RivetErrorSchema {
+		group: "auth",
+		code: "forbidden",
+		default_message: "Forbidden",
+		meta_type: None,
+		_macro_marker: MacroMarker { _private: () },
+	};
 
 	#[derive(Clone, Default)]
 	struct LogCapture(Arc<Mutex<Vec<u8>>>);
@@ -65,7 +73,34 @@ mod moved_tests {
 		let first = parse_bridge_rivet_error(&reason).expect("first parse should succeed");
 		let second = parse_bridge_rivet_error(&reason).expect("second parse should succeed");
 
+		assert_eq!(first.to_string(), "same message");
 		assert_eq!(schema_ptr(&first), schema_ptr(&second));
+	}
+
+	#[test]
+	fn napi_bridge_payload_promotes_known_core_error_status() {
+		let payload = crate::anyhow_to_bridge_rivet_error_payload(anyhow::Error::new(RivetError {
+			schema: &AUTH_FORBIDDEN_SCHEMA,
+			meta: None,
+			message: None,
+		}));
+
+		assert_eq!(
+			payload.get("group").and_then(|value| value.as_str()),
+			Some("auth")
+		);
+		assert_eq!(
+			payload.get("code").and_then(|value| value.as_str()),
+			Some("forbidden")
+		);
+		assert_eq!(
+			payload.get("public").and_then(|value| value.as_bool()),
+			Some(true)
+		);
+		assert_eq!(
+			payload.get("statusCode").and_then(|value| value.as_u64()),
+			Some(403)
+		);
 	}
 
 	#[test]

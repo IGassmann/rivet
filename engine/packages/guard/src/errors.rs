@@ -16,6 +16,18 @@ pub struct MissingHeader {
 #[derive(RivetError, Serialize)]
 #[error(
 	"guard",
+	"invalid_header",
+	"Invalid header value.",
+	"Invalid {header} header: {detail}."
+)]
+pub struct InvalidHeader {
+	pub header: String,
+	pub detail: String,
+}
+
+#[derive(RivetError, Serialize)]
+#[error(
+	"guard",
 	"missing_query_parameter",
 	"Missing query parameter required for routing.",
 	"Missing {parameter} query parameter."

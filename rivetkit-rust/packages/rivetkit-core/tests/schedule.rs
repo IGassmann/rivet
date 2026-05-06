@@ -26,7 +26,6 @@ mod moved_tests {
 			_generation: u32,
 			_config: protocol::ActorConfig,
 			_preloaded_kv: Option<protocol::PreloadedKv>,
-			_sqlite_startup_data: Option<protocol::SqliteStartupData>,
 		) -> BoxFuture<anyhow::Result<()>> {
 			Box::pin(async { Ok(()) })
 		}
@@ -89,6 +88,7 @@ mod moved_tests {
 			envoy_key: "test-envoy".to_string(),
 			envoy_tx,
 			actors: Arc::new(EnvoySharedMutex::new(HashMap::new())),
+			actors_notify: Arc::new(tokio::sync::Notify::new()),
 			live_tunnel_requests: Arc::new(EnvoySharedMutex::new(HashMap::new())),
 			pending_hibernation_restores: Arc::new(EnvoySharedMutex::new(HashMap::new())),
 			ws_tx: Arc::new(tokio::sync::Mutex::new(
@@ -180,9 +180,9 @@ mod moved_tests {
 		let future_ts = now_timestamp_ms() + 60_000;
 		schedule.set_scheduled_events(vec![PersistedScheduleEvent {
 			event_id: "event-1".to_owned(),
-			timestamp_ms: future_ts,
+			timestamp: future_ts,
 			action: "tick".to_owned(),
-			args: vec![1, 2, 3],
+			args: Some(vec![1, 2, 3]),
 		}]);
 
 		schedule.sync_future_alarm_logged();

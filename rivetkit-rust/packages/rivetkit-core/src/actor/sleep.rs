@@ -1,24 +1,34 @@
 use parking_lot::Mutex;
+use rivet_envoy_client::async_counter::AsyncCounter;
 use rivet_envoy_client::handle::EnvoyHandle;
-use rivet_util::async_counter::AsyncCounter;
 use std::future::Future;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize as TestAtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(not(feature = "wasm-runtime"))]
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-#[cfg(test)]
-use tokio::time::sleep_until;
-use tokio::time::{Instant, sleep};
 use tracing::Instrument;
 
 use crate::actor::config::ActorConfig;
 use crate::actor::context::ActorContext;
+use crate::actor::task_types::ShutdownKind;
+#[cfg(feature = "wasm-runtime")]
+use crate::actor::work_registry::LocalShutdownTask;
 use crate::actor::work_registry::{CountGuard, RegionGuard, WorkRegistry};
+#[cfg(feature = "wasm-runtime")]
+use crate::runtime::RuntimeSpawner;
+#[cfg(test)]
+use crate::time::sleep_until;
+use crate::time::{Instant, sleep};
 #[cfg(test)]
 use crate::types::ActorKey;
+#[cfg(feature = "wasm-runtime")]
+use futures::channel::oneshot as futures_oneshot;
+#[cfg(feature = "wasm-runtime")]
+use futures::future::{AbortHandle, Abortable};
 
 /// Per-actor sleep state.
 ///
@@ -247,8 +257,11 @@ impl ActorContext {
 		CanSleep::Yes
 	}
 
-	pub(crate) fn can_finalize_sleep(&self) -> bool {
+	pub(crate) fn can_finalize_shutdown(&self, reason: ShutdownKind) -> bool {
 		self.0.sleep.work.core_dispatched_hooks.load() == 0
+			// Sleep is a reversible pause, so let the actor run handler finish
+			// naturally during grace. Destroy is terminal and may cut through it.
+			&& (matches!(reason, ShutdownKind::Destroy) || !self.run_handler_active())
 			&& self.shutdown_task_count() == 0
 			&& self.sleep_keep_awake_count() == 0
 			&& self.sleep_internal_keep_awake_count() == 0
@@ -267,6 +280,7 @@ impl ActorContext {
 	pub(crate) fn reset_sleep_timer_state(&self) {
 		self.cancel_sleep_timer();
 
+		#[cfg(not(feature = "wasm-runtime"))]
 		let Ok(runtime) = Handle::try_current() else {
 			tracing::debug!(
 				actor_id = %self.actor_id(),
@@ -282,7 +296,7 @@ impl ActorContext {
 		);
 
 		let ctx = self.clone();
-		let task = runtime.spawn(async move {
+		let task_body = async move {
 			let can_sleep = ctx.can_sleep().await;
 			if can_sleep != CanSleep::Yes {
 				tracing::debug!(
@@ -317,7 +331,13 @@ impl ActorContext {
 					"sleep idle timer elapsed but actor stayed awake"
 				);
 			}
-		});
+		};
+
+		#[cfg(not(feature = "wasm-runtime"))]
+		let task = runtime.spawn(task_body);
+
+		#[cfg(feature = "wasm-runtime")]
+		let task = RuntimeSpawner::spawn(task_body);
 
 		*self.0.sleep.sleep_timer.lock() = Some(task);
 	}
@@ -349,7 +369,7 @@ impl ActorContext {
 			tokio::pin!(idle);
 			idle.as_mut().enable();
 
-			if self.can_finalize_sleep() {
+			if self.can_finalize_shutdown(ShutdownKind::Sleep) {
 				return true;
 			}
 
@@ -413,7 +433,7 @@ impl ActorContext {
 		}
 	}
 
-	pub(crate) fn keep_awake_region(&self) -> RegionGuard {
+	pub(crate) fn keep_awake_region_state(&self) -> RegionGuard {
 		self.0.sleep.work.keep_awake_guard()
 	}
 
@@ -441,6 +461,7 @@ impl ActorContext {
 		self.0.sleep.work.websocket_callback.load()
 	}
 
+	#[cfg(not(feature = "wasm-runtime"))]
 	pub(crate) fn track_shutdown_task<F>(&self, fut: F) -> bool
 	where
 		F: Future<Output = ()> + Send + 'static,
@@ -458,18 +479,79 @@ impl ActorContext {
 		let counter = self.0.sleep.work.shutdown_counter.clone();
 		counter.increment();
 		let guard = CountGuard::from_incremented(counter);
+		let ctx = self.clone();
+		// The guard must drop before resetting the sleep timer so the lifecycle
+		// task observes the post-completion counter state on the wakeup.
 		shutdown_tasks.spawn(
 			async move {
-				let _guard = guard;
-				fut.await;
+				{
+					let _guard = guard;
+					fut.await;
+				}
+				ctx.reset_sleep_timer();
 			}
 			.in_current_span(),
 		);
+		drop(shutdown_tasks);
+		self.reset_sleep_timer();
+		true
+	}
+
+	#[cfg(feature = "wasm-runtime")]
+	pub(crate) fn track_shutdown_task<F>(&self, fut: F) -> bool
+	where
+		F: Future<Output = ()> + 'static,
+	{
+		let mut local_shutdown_tasks = self.0.sleep.work.local_shutdown_tasks.lock();
+		if self.0.sleep.work.teardown_started.load(Ordering::Acquire) {
+			tracing::warn!("shutdown task spawned after teardown; aborting immediately");
+			return false;
+		}
+		let counter = self.0.sleep.work.shutdown_counter.clone();
+		counter.increment();
+		let guard = CountGuard::from_incremented(counter);
+		let ctx = self.clone();
+		// Wasm tasks cannot be joined through Tokio. Store an explicit
+		// completion channel plus abort handle so teardown can either drain or
+		// cancel them using the same policy as native shutdown.
+		let (complete_tx, complete_rx) = futures_oneshot::channel();
+		let (abort_handle, abort_registration) = AbortHandle::new_pair();
+		local_shutdown_tasks.push(LocalShutdownTask {
+			abort_handle,
+			complete_rx,
+		});
+		drop(local_shutdown_tasks);
+		let ctx_for_task = ctx.clone();
+		wasm_bindgen_futures::spawn_local(
+			async move {
+				let task = async move {
+					{
+						let _guard = guard;
+						fut.await;
+					}
+					let _ = complete_tx.send(());
+					ctx_for_task.reset_sleep_timer();
+				};
+				if Abortable::new(task, abort_registration).await.is_err() {
+					ctx.reset_sleep_timer();
+				}
+			}
+			.in_current_span(),
+		);
+		self.reset_sleep_timer();
 		true
 	}
 
 	pub(crate) fn shutdown_task_count(&self) -> usize {
 		self.0.sleep.work.shutdown_counter.load()
+	}
+
+	pub(crate) fn mark_shutdown_deadline_reached(&self) {
+		self.0
+			.sleep
+			.work
+			.shutdown_deadline_reached
+			.store(true, Ordering::Release);
 	}
 
 	pub(crate) fn begin_core_dispatched_hook(&self) {
@@ -487,17 +569,91 @@ impl ActorContext {
 	}
 
 	pub(crate) async fn teardown_sleep_state(&self) {
-		self.0
+		let abort_remaining = self
+			.0
 			.sleep
 			.work
-			.teardown_started
-			.store(true, Ordering::Release);
-		let mut shutdown_tasks = {
-			let mut guard = self.0.sleep.work.shutdown_tasks.lock();
-			std::mem::take(&mut *guard)
-		};
-		shutdown_tasks.shutdown().await;
-		*self.0.sleep.work.shutdown_tasks.lock() = shutdown_tasks;
+			.shutdown_deadline_reached
+			.swap(false, Ordering::AcqRel);
+		// Normal shutdown drains tracked work. Once the grace deadline fires,
+		// teardown switches to cancellation so a stuck waitUntil cannot hold the
+		// actor instance forever.
+		if abort_remaining {
+			self.0
+				.sleep
+				.work
+				.teardown_started
+				.store(true, Ordering::Release);
+		}
+
+		#[cfg(feature = "wasm-runtime")]
+		{
+			loop {
+				let local_shutdown_tasks = {
+					let mut guard = self.0.sleep.work.local_shutdown_tasks.lock();
+					let taken = std::mem::take(&mut *guard);
+					if taken.is_empty() {
+						self.0
+							.sleep
+							.work
+							.teardown_started
+							.store(true, Ordering::Release);
+						return;
+					}
+					taken
+				};
+
+				if abort_remaining {
+					for task in local_shutdown_tasks {
+						task.abort_handle.abort();
+						if task.complete_rx.await.is_err() {
+							tracing::debug!("aborted shutdown task during teardown");
+						}
+					}
+					self.0
+						.sleep
+						.work
+						.teardown_started
+						.store(true, Ordering::Release);
+					return;
+				}
+
+				for task in local_shutdown_tasks {
+					if task.complete_rx.await.is_err() {
+						tracing::debug!("shutdown task completion dropped during teardown");
+					}
+				}
+			}
+		}
+
+		#[cfg(not(feature = "wasm-runtime"))]
+		loop {
+			let mut shutdown_tasks = {
+				let mut guard = self.0.sleep.work.shutdown_tasks.lock();
+				let taken = std::mem::take(&mut *guard);
+				if taken.is_empty() {
+					self.0
+						.sleep
+						.work
+						.teardown_started
+						.store(true, Ordering::Release);
+					return;
+				}
+				taken
+			};
+
+			if abort_remaining {
+				shutdown_tasks.shutdown().await;
+			} else {
+				while let Some(result) = shutdown_tasks.join_next().await {
+					if let Err(error) = result
+						&& !error.is_cancelled()
+					{
+						tracing::error!(?error, "shutdown task join failed during teardown");
+					}
+				}
+			}
+		}
 	}
 
 	pub(crate) fn sleep_state_config(&self) -> ActorConfig {

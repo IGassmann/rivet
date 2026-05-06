@@ -1,14 +1,15 @@
+import { ENGINE_ENDPOINT } from "@/common/engine";
+import { configureServerlessPool } from "@/serverless/configure";
+import { VERSION } from "@/utils";
 import {
 	type RegistryActors,
 	type RegistryConfig,
 	type RegistryConfigInput,
 	RegistryConfigSchema,
 } from "./config";
-import { ENGINE_ENDPOINT } from "@/common/engine";
 import { logger } from "./log";
-import { buildNativeRegistry } from "./native";
-import { configureServerlessPool } from "@/serverless/configure";
-import { VERSION } from "@/utils";
+import { buildConfiguredRegistry } from "./native";
+import type { RuntimeServerlessResponseHead } from "./runtime";
 
 type ShutdownSignal = "SIGINT" | "SIGTERM";
 
@@ -19,6 +20,11 @@ export type FetchHandler = (
 
 export interface ServerlessHandler {
 	fetch: FetchHandler;
+}
+
+export interface RegistryDiagnostics {
+	mode: string;
+	envoyActiveActorCount?: number | null;
 }
 
 export class Registry<A extends RegistryActors> {
@@ -32,8 +38,9 @@ export class Registry<A extends RegistryActors> {
 		return RegistryConfigSchema.parse(this.#config);
 	}
 
-	#nativeServePromise?: Promise<void>;
-	#nativeServerlessPromise?: ReturnType<typeof buildNativeRegistry>;
+	#runtimeServePromise?: Promise<void>;
+	#runtimeServeConfiguredPromise?: ReturnType<typeof buildConfiguredRegistry>;
+	#runtimeServerlessPromise?: ReturnType<typeof buildConfiguredRegistry>;
 	#configureServerlessPoolPromise?: Promise<void>;
 	#welcomePrinted = false;
 	#shutdownInstalled = false;
@@ -42,6 +49,22 @@ export class Registry<A extends RegistryActors> {
 
 	constructor(config: RegistryConfigInput<A>) {
 		this.#config = config;
+	}
+
+	#ensureServerlessPoolConfigured(config: RegistryConfig): Promise<void> | undefined {
+		if (!config.configurePool) return undefined;
+
+		if (!this.#configureServerlessPoolPromise) {
+			this.#configureServerlessPoolPromise = configureServerlessPool(config).catch(
+				(error) => {
+					this.#configureServerlessPoolPromise = undefined;
+					throw error;
+				},
+			);
+			this.#configureServerlessPoolPromise.catch(() => {});
+		}
+
+		return this.#configureServerlessPoolPromise;
 	}
 
 	/**
@@ -58,19 +81,44 @@ export class Registry<A extends RegistryActors> {
 		const config = this.parseConfig();
 		this.#printWelcome(config, "serverless");
 
-		if (config.configurePool && !this.#configureServerlessPoolPromise) {
-			this.#configureServerlessPoolPromise =
-				configureServerlessPool(config);
+		if (!this.#runtimeServerlessPromise) {
+			this.#runtimeServerlessPromise = buildConfiguredRegistry(config);
 		}
 
-		if (!this.#nativeServerlessPromise) {
-			this.#nativeServerlessPromise = buildNativeRegistry(config);
+		const { runtime, registry, serveConfig } =
+			await this.#runtimeServerlessPromise;
+		const isStartRequest = isServerlessStartRequest(
+			request,
+			serveConfig.serverlessBasePath ?? "/api/rivet",
+		);
+		const isMetadataRequest = isServerlessMetadataRequest(
+			request,
+			serveConfig.serverlessBasePath ?? "/api/rivet",
+		);
+		const isEngineMetadataRequest =
+			request.headers.get("user-agent")?.startsWith("RivetEngine/") ?? false;
+
+		if (isStartRequest) {
+			try {
+				await this.#ensureServerlessPoolConfigured(config);
+			} catch (error) {
+				return new Response(
+					JSON.stringify({
+						group: "guard",
+						code: "service_unavailable",
+						message: "Serverless pool is not configured.",
+						metadata: null,
+					}),
+					{
+						status: 503,
+						headers: { "content-type": "application/json" },
+					},
+				);
+			}
 		}
 
-		const { bindings, registry, serveConfig } =
-			await this.#nativeServerlessPromise;
-		const cancelToken = new bindings.CancellationToken();
-		const abort = () => cancelToken.cancel();
+		const cancelToken = runtime.createCancellationToken();
+		const abort = () => runtime.cancelCancellationToken(cancelToken);
 		if (request.signal.aborted) {
 			abort();
 		} else {
@@ -79,14 +127,11 @@ export class Registry<A extends RegistryActors> {
 
 		const requestBody = await request.arrayBuffer();
 		if (
-			isServerlessStartRequest(
-				request,
-				serveConfig.serverlessBasePath ?? "/api/rivet",
-			) &&
+			isStartRequest &&
 			requestBody.byteLength > serveConfig.serverlessMaxStartPayloadBytes
 		) {
 			request.signal.removeEventListener("abort", abort);
-			cancelToken.cancel();
+			runtime.cancelCancellationToken(cancelToken);
 			return new Response(
 				JSON.stringify({
 					group: "message",
@@ -102,7 +147,9 @@ export class Registry<A extends RegistryActors> {
 		}
 
 		let settled = false;
-		let controllerRef: ReadableStreamDefaultController<Uint8Array> | undefined;
+		let controllerRef:
+			| ReadableStreamDefaultController<Uint8Array>
+			| undefined;
 		const backpressureWaiters: Array<() => void> = [];
 		const resolveBackpressure = () => {
 			while (
@@ -129,7 +176,7 @@ export class Registry<A extends RegistryActors> {
 			cancel() {
 				settled = true;
 				resolveBackpressure();
-				cancelToken.cancel();
+				runtime.cancelCancellationToken(cancelToken);
 			},
 		});
 
@@ -138,20 +185,21 @@ export class Registry<A extends RegistryActors> {
 			headers[key] = value;
 		});
 
-		let head;
+		let head: RuntimeServerlessResponseHead;
 		try {
-			head = await registry.handleServerlessRequest(
+			head = await runtime.handleServerlessRequest(
+				registry,
 				{
 					method: request.method,
 					url: request.url,
 					headers,
-					body: Buffer.from(requestBody),
+					body: new Uint8Array(requestBody),
 				},
 				async (
 					error: unknown,
 					event?: {
 						kind: "chunk" | "end";
-						chunk?: Buffer;
+						chunk?: Uint8Array;
 						error?: {
 							group: string;
 							code: string;
@@ -185,11 +233,30 @@ export class Registry<A extends RegistryActors> {
 				serveConfig,
 			);
 		} catch (err) {
-			// The NAPI call itself rejected (e.g. `registry_shut_down_error`).
+			// The runtime call itself rejected (e.g. `registry_shut_down_error`).
 			// Clean up the abort listener so it doesn't leak, then propagate.
 			request.signal.removeEventListener("abort", abort);
-			cancelToken.cancel();
+			runtime.cancelCancellationToken(cancelToken);
 			throw err;
+		}
+
+		if (isMetadataRequest && !isEngineMetadataRequest) {
+			try {
+				await this.#ensureServerlessPoolConfigured(config);
+			} catch (error) {
+				return new Response(
+					JSON.stringify({
+						group: "guard",
+						code: "service_unavailable",
+						message: "Serverless pool is not configured.",
+						metadata: null,
+					}),
+					{
+						status: 503,
+						headers: { "content-type": "application/json" },
+					},
+				);
+			}
 		}
 
 		return new Response(stream, {
@@ -212,29 +279,47 @@ export class Registry<A extends RegistryActors> {
 		};
 	}
 
+	public async diagnostics(): Promise<RegistryDiagnostics> {
+		const candidates = [
+			this.#runtimeServerlessPromise,
+			this.#runtimeServeConfiguredPromise,
+		].filter((candidate): candidate is ReturnType<typeof buildConfiguredRegistry> =>
+			candidate !== undefined
+		);
+
+		for (const candidate of candidates) {
+			const { runtime, registry } = await candidate;
+			const diagnostics = await runtime.registryDiagnostics?.(registry);
+			if (diagnostics) return diagnostics;
+		}
+
+		return { mode: "not_started", envoyActiveActorCount: null };
+	}
+
 	/**
 	 * Starts an actor envoy for standalone server deployments.
 	 */
 	#startEnvoy(config: RegistryConfig, printWelcome: boolean) {
-		if (!this.#nativeServePromise) {
-			const nativeRegistryPromise = buildNativeRegistry(config);
-			this.#nativeServePromise = nativeRegistryPromise
-				.then(async ({ registry, serveConfig }) => {
-					await registry.serve(serveConfig);
+		if (!this.#runtimeServePromise) {
+			const configuredRegistryPromise = buildConfiguredRegistry(config);
+			this.#runtimeServeConfiguredPromise = configuredRegistryPromise;
+			this.#runtimeServePromise = configuredRegistryPromise
+				.then(async ({ runtime, registry, serveConfig }) => {
+					await runtime.serveRegistry(registry, serveConfig);
 				})
 				.catch((err) => {
 					// Always-attached catch so the stored promise never leaves a
 					// rejection unhandled. Downstream awaits (e.g. #runShutdown's
 					// Promise.race) attach their own catches and still observe
 					// resolution via the race.
-					logger().warn({ err }, "native registry serve errored");
+					logger().warn({ err }, "runtime registry serve errored");
 				});
 			// Install signal handlers once an envoy lifecycle has begun. Only
 			// Mode A ever reaches here. Mode B (handler(request)) intentionally
 			// does not install handlers because it runs on Workers/Vercel/Deno
 			// Deploy where `process.on` is absent or forbidden; those platforms
 			// own their own signal policy.
-			this.#installSignalHandlers(config, nativeRegistryPromise);
+			this.#installSignalHandlers(config, configuredRegistryPromise);
 		}
 		if (printWelcome) {
 			this.#printWelcome(config, "serverful");
@@ -243,7 +328,7 @@ export class Registry<A extends RegistryActors> {
 
 	#installSignalHandlers(
 		config: RegistryConfig,
-		nativeRegistryPromise: ReturnType<typeof buildNativeRegistry>,
+		configuredRegistryPromise: ReturnType<typeof buildConfiguredRegistry>,
 	): void {
 		if (this.#shutdownInstalled) return;
 		if (config.shutdown?.disableSignalHandlers) return;
@@ -260,7 +345,11 @@ export class Registry<A extends RegistryActors> {
 
 		const install = (signal: ShutdownSignal) => {
 			const handler = () =>
-				this.#onShutdownSignal(signal, config, nativeRegistryPromise);
+				this.#onShutdownSignal(
+					signal,
+					config,
+					configuredRegistryPromise,
+				);
 			this.#signalHandlers[signal] = handler;
 			process.on(signal, handler);
 		};
@@ -271,7 +360,7 @@ export class Registry<A extends RegistryActors> {
 	#onShutdownSignal(
 		signal: ShutdownSignal,
 		config: RegistryConfig,
-		nativeRegistryPromise: ReturnType<typeof buildNativeRegistry>,
+		configuredRegistryPromise: ReturnType<typeof buildConfiguredRegistry>,
 	): void {
 		if (this.#shutdownInFlight !== null) {
 			// Second delivery of the same (or another) shutdown signal.
@@ -284,7 +373,7 @@ export class Registry<A extends RegistryActors> {
 		this.#shutdownInFlight = this.#runShutdown(
 			signal,
 			config,
-			nativeRegistryPromise,
+			configuredRegistryPromise,
 		).catch((err) => {
 			logger().warn({ err }, "shutdown error");
 		});
@@ -293,7 +382,7 @@ export class Registry<A extends RegistryActors> {
 	async #runShutdown(
 		signal: ShutdownSignal,
 		config: RegistryConfig,
-		nativeRegistryPromise: ReturnType<typeof buildNativeRegistry>,
+		configuredRegistryPromise: ReturnType<typeof buildConfiguredRegistry>,
 	): Promise<void> {
 		const gracePeriodMs = config.shutdown?.gracePeriodMs ?? 30_000;
 		// Race the entire drain sequence (both modes + serve promise) against
@@ -303,31 +392,34 @@ export class Registry<A extends RegistryActors> {
 		const drain = async () => {
 			// Shut down every live `CoreRegistry` we know about. Mode A
 			// (`start()`) and Mode B (`handler()`) each build a separate
-			// native registry, so one signal handler fans out to both to
+			// runtime registry, so one signal handler fans out to both to
 			// honor the spec invariant "single shutdown tears down both modes".
 			const registries: Promise<void>[] = [
 				(async () => {
 					try {
-						const { registry } = await nativeRegistryPromise;
-						await registry.shutdown();
+						const { runtime, registry } =
+							await configuredRegistryPromise;
+						await runtime.shutdownRegistry(registry);
 					} catch (err) {
 						logger().warn(
 							{ err },
-							"native registry shutdown errored (mode A)",
+							"runtime registry shutdown errored (mode A)",
 						);
 					}
 				})(),
 			];
-			if (this.#nativeServerlessPromise) {
+			const runtimeServerlessPromise = this.#runtimeServerlessPromise;
+			if (runtimeServerlessPromise !== undefined) {
 				registries.push(
 					(async () => {
 						try {
-							const { registry } = await this.#nativeServerlessPromise!;
-							await registry.shutdown();
+							const { runtime, registry } =
+								await runtimeServerlessPromise;
+							await runtime.shutdownRegistry(registry);
 						} catch (err) {
 							logger().warn(
 								{ err },
-								"native registry shutdown errored (mode B)",
+								"runtime registry shutdown errored (mode B)",
 							);
 						}
 					})(),
@@ -335,11 +427,12 @@ export class Registry<A extends RegistryActors> {
 			}
 			await Promise.all(registries);
 
-			if (this.#nativeServePromise) {
+			const runtimeServePromise = this.#runtimeServePromise;
+			if (runtimeServePromise !== undefined) {
 				// Swallow rejection so the race doesn't itself reject; the
 				// always-attached `.catch` at the promise assignment site has
 				// already logged any serve-side error.
-				await this.#nativeServePromise.catch(() => undefined);
+				await runtimeServePromise.catch(() => undefined);
 			}
 		};
 		await Promise.race([
@@ -353,10 +446,9 @@ export class Registry<A extends RegistryActors> {
 	}
 
 	#removeSignalHandlers(): void {
-		for (const [signal, handler] of Object.entries(this.#signalHandlers) as [
-			ShutdownSignal,
-			() => void,
-		][]) {
+		for (const [signal, handler] of Object.entries(
+			this.#signalHandlers,
+		) as [ShutdownSignal, () => void][]) {
 			if (handler) process.removeListener(signal, handler);
 		}
 		this.#signalHandlers = {};
@@ -367,7 +459,7 @@ export class Registry<A extends RegistryActors> {
 	}
 
 	/**
-	 * Starts the native actor envoy for standalone server deployments.
+	 * Starts the actor envoy for standalone server deployments.
 	 *
 	 * @example
 	 * ```ts
@@ -422,6 +514,14 @@ function isServerlessStartRequest(request: Request, basePath: string): boolean {
 	const normalizedBase =
 		basePath === "/" ? "" : `/${basePath.replace(/^\/+|\/+$/g, "")}`;
 	return parsed.pathname === `${normalizedBase}/start`;
+}
+
+function isServerlessMetadataRequest(request: Request, basePath: string): boolean {
+	if (request.method !== "GET") return false;
+	const parsed = new URL(request.url);
+	const normalizedBase =
+		basePath === "/" ? "" : `/${basePath.replace(/^\/+|\/+$/g, "")}`;
+	return parsed.pathname === `${normalizedBase}/metadata`;
 }
 
 export function setup<A extends RegistryActors>(

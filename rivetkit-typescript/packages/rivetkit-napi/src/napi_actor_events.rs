@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -9,6 +9,7 @@ use rivetkit_core::{
 	ActorContext as CoreActorContext, ActorEvent, ActorEvents, ActorLifecycle, ActorStart,
 	QueueSendResult, QueueSendStatus, Reply, SerializeStateReason, StateDelta,
 };
+use scc::HashMap as SccHashMap;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
@@ -85,6 +86,18 @@ static CALLBACK_TIMED_OUT_SCHEMA: RivetErrorSchema = RivetErrorSchema {
 	meta_type: None,
 	_macro_marker: MacroMarker { _private: () },
 };
+
+static ACTION_NOT_FOUND_SCHEMA: RivetErrorSchema = RivetErrorSchema {
+	group: "actor",
+	code: "action_not_found",
+	default_message: "Action not found",
+	meta_type: None,
+	_macro_marker: MacroMarker { _private: () },
+};
+
+static STRUCTURED_TIMEOUT_SCHEMAS: LazyLock<
+	SccHashMap<(&'static str, &'static str), &'static RivetErrorSchema>,
+> = LazyLock::new(SccHashMap::new);
 
 pub(crate) async fn run_adapter_loop(
 	bindings: Arc<CallbackBindings>,
@@ -196,6 +209,7 @@ async fn run_preamble(
 	snapshot: Option<Vec<u8>>,
 	hibernated: Vec<(rivetkit_core::ConnHandle, Vec<u8>)>,
 ) -> Result<RunHandlerSlot> {
+	let snapshot = normalize_startup_snapshot(bindings.create_state.is_some(), snapshot);
 	let is_new = snapshot.is_none();
 
 	// Run database migrations before any user lifecycle hook so `c.db` is
@@ -275,6 +289,18 @@ async fn run_preamble(
 	}
 
 	Ok(run_handler)
+}
+
+fn normalize_startup_snapshot(
+	has_create_state: bool,
+	snapshot: Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+	// Empty state with createState means a previous process persisted
+	// initialization before the runtime produced initial state.
+	match snapshot {
+		Some(bytes) if bytes.is_empty() && has_create_state => None,
+		other => other,
+	}
 }
 
 fn configure_run_handler(bindings: &CallbackBindings, ctx: &ActorContext) -> RunHandlerSlot {
@@ -474,17 +500,22 @@ pub(crate) async fn dispatch_event(
 				.await
 			});
 		}
-		ActorEvent::WebSocketOpen { ws, request, reply } => {
+		ActorEvent::WebSocketOpen {
+			conn,
+			ws,
+			request,
+			reply,
+		} => {
 			let Some(callback) = bindings.on_websocket.clone() else {
 				reply.send(Ok(()));
 				return;
 			};
 			let ctx = ctx.clone();
 			spawn_reply(tasks, abort.clone(), reply, async move {
-				call_on_websocket(&callback, &ctx, ws, request).await
+				call_on_websocket(&callback, &ctx, conn, ws, request).await
 			});
 		}
-		ActorEvent::ConnectionOpen {
+		ActorEvent::ConnectionPreflight {
 			conn,
 			params,
 			request,
@@ -492,9 +523,7 @@ pub(crate) async fn dispatch_event(
 		} => {
 			let on_before_connect = bindings.on_before_connect.clone();
 			let create_conn_state = bindings.create_conn_state.clone();
-			let on_connect = bindings.on_connect.clone();
 			let timeout = config.on_before_connect_timeout;
-			let connect_timeout = config.on_connect_timeout;
 			let create_conn_state_timeout = config.create_conn_state_timeout;
 			let ctx = ctx.clone();
 
@@ -524,6 +553,19 @@ pub(crate) async fn dispatch_event(
 					ctx.set_conn_state_initial(&conn, state)?;
 				}
 
+				Ok(())
+			});
+		}
+		ActorEvent::ConnectionOpen {
+			conn,
+			request,
+			reply,
+		} => {
+			let on_connect = bindings.on_connect.clone();
+			let connect_timeout = config.on_connect_timeout;
+			let ctx = ctx.clone();
+
+			spawn_reply(tasks, abort.clone(), reply, async move {
 				if let Some(callback) = on_connect {
 					with_timeout(
 						"onConnect",
@@ -853,13 +895,20 @@ fn structured_timeout_schema(
 	match (group, code) {
 		("actor", "action_timed_out") => &ACTION_TIMED_OUT_SCHEMA,
 		("actor", "callback_timed_out") => &CALLBACK_TIMED_OUT_SCHEMA,
-		_ => Box::leak(Box::new(RivetErrorSchema {
-			group,
-			code,
-			default_message: Box::leak(message.to_owned().into_boxed_str()),
-			meta_type: None,
-			_macro_marker: MacroMarker { _private: () },
-		})),
+		_ => match STRUCTURED_TIMEOUT_SCHEMAS.entry_sync((group, code)) {
+			scc::hash_map::Entry::Occupied(entry) => *entry.get(),
+			scc::hash_map::Entry::Vacant(entry) => {
+				let schema = Box::leak(Box::new(RivetErrorSchema {
+					group,
+					code,
+					default_message: Box::leak(message.to_owned().into_boxed_str()),
+					meta_type: None,
+					_macro_marker: MacroMarker { _private: () },
+				}));
+				entry.insert_entry(schema);
+				schema
+			}
+		},
 	}
 }
 
@@ -1118,6 +1167,7 @@ where
 async fn call_on_websocket(
 	callback: &crate::actor_factory::CallbackTsfn<WebSocketPayload>,
 	ctx: &ActorContext,
+	conn: rivetkit_core::ConnHandle,
 	ws: rivetkit_core::WebSocket,
 	request: Option<rivetkit_core::Request>,
 ) -> Result<()> {
@@ -1126,6 +1176,7 @@ async fn call_on_websocket(
 		callback,
 		WebSocketPayload {
 			ctx: ctx.inner().clone(),
+			conn,
 			ws,
 			request,
 		},
@@ -1259,16 +1310,8 @@ async fn call_on_disconnect_final(
 }
 
 fn action_not_found(name: String) -> anyhow::Error {
-	let schema = Box::leak(Box::new(RivetErrorSchema {
-		group: "actor",
-		code: "action_not_found",
-		default_message: "Action not found",
-		meta_type: None,
-		_macro_marker: MacroMarker { _private: () },
-	}));
-
 	anyhow::Error::new(RivetTransportError {
-		schema,
+		schema: &ACTION_NOT_FOUND_SCHEMA,
 		meta: None,
 		message: Some(format!("Action `{name}` was not found.")),
 	})

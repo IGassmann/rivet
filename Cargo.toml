@@ -14,6 +14,9 @@ members = [
   "engine/packages/config",
   "engine/packages/config-schema-gen",
   "engine/packages/datacenter",
+  "engine/packages/depot-client",
+  "engine/packages/depot-client-embedded",
+  "engine/packages/depot-client-types",
   "engine/packages/engine",
   "engine/packages/env",
   "engine/packages/epoxy",
@@ -38,7 +41,7 @@ members = [
   "engine/packages/runner-protocol",
   "engine/packages/runtime",
   "engine/packages/service-manager",
-  "engine/packages/sqlite-storage",
+  "engine/packages/depot",
   "engine/packages/telemetry",
   "engine/packages/test-deps",
   "engine/packages/test-deps-docker",
@@ -57,14 +60,18 @@ members = [
   "engine/sdks/rust/envoy-client",
   "engine/sdks/rust/envoy-protocol",
   "engine/sdks/rust/epoxy-protocol",
-  "engine/sdks/rust/sqlite-storage-protocol",
+  "engine/sdks/rust/depot-protocol",
   "engine/sdks/rust/test-envoy",
   "engine/sdks/rust/ups-protocol",
-  "rivetkit-rust/packages/shared-types"
+  "rivetkit-rust/packages/actor-persist",
+  "rivetkit-rust/packages/rivetkit-core",
+  "rivetkit-rust/packages/shared-types",
+  "rivetkit-typescript/packages/rivetkit-napi",
+  "rivetkit-typescript/packages/rivetkit-wasm"
 ]
 
   [workspace.package]
-  version = "2.3.0-rc.4"
+  version = "2.3.0-rc.5"
   edition = "2024"
   authors = [ "Rivet Gaming, LLC <developer@rivet.gg>" ]
   license = "Apache-2.0"
@@ -478,11 +485,11 @@ members = [
     [workspace.dependencies.rivet-runtime]
     path = "engine/packages/runtime"
 
+    [workspace.dependencies.depot]
+    path = "engine/packages/depot"
+
     [workspace.dependencies.rivet-service-manager]
     path = "engine/packages/service-manager"
-
-    [workspace.dependencies.sqlite-storage]
-    path = "engine/packages/sqlite-storage"
 
     [workspace.dependencies.rivet-telemetry]
     path = "engine/packages/telemetry"
@@ -535,21 +542,31 @@ members = [
 
     [workspace.dependencies.rivet-envoy-client]
     path = "engine/sdks/rust/envoy-client"
+    default-features = false
 
     [workspace.dependencies.rivet-envoy-protocol]
     path = "engine/sdks/rust/envoy-protocol"
 
-    [workspace.dependencies.rivet-sqlite-storage-protocol]
-    path = "engine/sdks/rust/sqlite-storage-protocol"
+    [workspace.dependencies.rivet-depot-protocol]
+    path = "engine/sdks/rust/depot-protocol"
 
     [workspace.dependencies.rivetkit-client-protocol]
     path = "rivetkit-rust/packages/client-protocol"
 
+    [workspace.dependencies.rivetkit-actor-persist]
+    path = "rivetkit-rust/packages/actor-persist"
+
     [workspace.dependencies.rivetkit-inspector-protocol]
     path = "rivetkit-rust/packages/inspector-protocol"
 
-    [workspace.dependencies.rivetkit-sqlite]
-    path = "rivetkit-rust/packages/rivetkit-sqlite"
+    [workspace.dependencies.depot-client]
+    path = "engine/packages/depot-client"
+
+    [workspace.dependencies.depot-client-embedded]
+    path = "engine/packages/depot-client-embedded"
+
+    [workspace.dependencies.depot-client-types]
+    path = "engine/packages/depot-client-types"
 
     [workspace.dependencies.rivetkit-core]
     path = "rivetkit-rust/packages/rivetkit-core"
@@ -568,14 +585,25 @@ members = [
 
 [profile.dev]
 overflow-checks = false
+# "line-tables-only" produces just the line-number DWARF needed for stack
+# traces, skipping variable/type info. Meaningfully faster debug builds
+# (~2 min per engine cross-compile) with no runtime cost.
 debug = "line-tables-only"
 lto = "off"
 
-  [profile.dev.build-override]
-  opt-level = 3
+[profile.dev.build-override]
+opt-level = 3
 
 [profile.release]
 debug = false
 lto = "fat"
 codegen-units = 1
 opt-level = 3
+
+[profile.quick]
+inherits = "dev"
+debug = false          # no debug info → faster link, smaller binary
+strip = "symbols"      # strip what's left
+opt-level = 1          # cheap optimizations, still fast to compile
+panic = "abort"        # drops unwinding tables
+codegen-units = 256    # max parallelism

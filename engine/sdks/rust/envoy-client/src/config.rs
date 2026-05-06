@@ -9,7 +9,11 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::handle::EnvoyHandle;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+#[cfg(target_arch = "wasm32")]
+pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T>>>;
 
 /// HTTP request/response types used by the envoy client.
 pub struct HttpRequest {
@@ -102,7 +106,6 @@ pub trait EnvoyCallbacks: Send + Sync + 'static {
 		generation: u32,
 		config: protocol::ActorConfig,
 		preloaded_kv: Option<protocol::PreloadedKv>,
-		sqlite_startup_data: Option<protocol::SqliteStartupData>,
 	) -> BoxFuture<anyhow::Result<()>>;
 
 	fn on_actor_stop(

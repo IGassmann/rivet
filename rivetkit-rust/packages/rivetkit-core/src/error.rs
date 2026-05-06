@@ -1,6 +1,29 @@
 use rivet_error::*;
 use serde::{Deserialize, Serialize};
 
+pub fn public_error_status_code(group: &str, code: &str) -> Option<u16> {
+	match (group, code) {
+		("auth", "forbidden") => Some(403),
+		("actor", "action_not_found") => Some(404),
+		("actor", "action_timed_out") => Some(408),
+		("actor", "aborted") => Some(400),
+		("message", "incoming_too_long" | "outgoing_too_long") => Some(400),
+		(
+			"queue",
+			"full"
+			| "message_too_large"
+			| "message_invalid"
+			| "invalid_payload"
+			| "invalid_completion_payload"
+			| "already_completed"
+			| "previous_message_not_completed"
+			| "complete_not_configured"
+			| "timed_out",
+		) => Some(400),
+		_ => None,
+	}
+}
+
 #[derive(RivetError, Debug, Clone, Deserialize, Serialize)]
 #[error("actor")]
 pub enum ActorLifecycle {
@@ -141,6 +164,34 @@ pub(crate) enum SqliteRuntimeError {
 		"Invalid SQLite bind parameter {name}: {reason}"
 	)]
 	InvalidBindParameter { name: String, reason: String },
+
+	#[error(
+		"remote_unavailable",
+		"Remote SQLite is unavailable.",
+		"Remote SQLite is unavailable: {reason}"
+	)]
+	RemoteUnavailable { reason: String },
+
+	#[error(
+		"remote_execution_failed",
+		"Remote SQLite execution failed.",
+		"Remote SQLite execution failed: {message}"
+	)]
+	RemoteExecutionFailed { message: String },
+
+	#[error(
+		"remote_indeterminate_result",
+		"Remote SQLite result is indeterminate.",
+		"Remote SQLite {operation} may have completed, but the envoy disconnected before returning a result."
+	)]
+	RemoteIndeterminateResult { operation: String },
+
+	#[error(
+		"remote_fence_mismatch",
+		"Remote SQLite generation is stale.",
+		"Remote SQLite generation is stale: {reason}"
+	)]
+	RemoteFenceMismatch { reason: String },
 }
 
 #[derive(RivetError, Debug, Clone, Deserialize, Serialize)]

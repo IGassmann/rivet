@@ -1,10 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
+#[cfg(not(target_arch = "wasm32"))]
+use parking_lot::Mutex;
+
+use crate::async_counter::AsyncCounter;
 use rivet_envoy_protocol as protocol;
-use rivet_util::async_counter::AsyncCounter;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -20,17 +24,24 @@ use crate::kv::{
 	handle_kv_response, process_unsent_kv_requests,
 };
 use crate::sqlite::{
-	SqliteRequest, SqliteRequestEntry, SqliteResponse, cleanup_old_sqlite_requests,
-	handle_sqlite_commit_finalize_response, handle_sqlite_commit_response,
-	handle_sqlite_commit_stage_begin_response, handle_sqlite_commit_stage_response,
-	handle_sqlite_get_pages_response, handle_sqlite_request, process_unsent_sqlite_requests,
+	RemoteSqliteRequest, RemoteSqliteRequestEntry, RemoteSqliteResponse, SqliteRequest,
+	SqliteRequestEntry, SqliteResponse, cleanup_old_remote_sqlite_requests,
+	cleanup_old_sqlite_requests, fail_remote_sqlite_requests_with_shutdown,
+	fail_sent_remote_sqlite_requests_with_indeterminate_result, fail_sqlite_requests_with_shutdown,
+	handle_remote_sqlite_exec_response, handle_remote_sqlite_execute_response,
+	handle_remote_sqlite_request, handle_sqlite_commit_response, handle_sqlite_get_pages_response,
+	handle_sqlite_request, process_unsent_remote_sqlite_requests, process_unsent_sqlite_requests,
 };
 use crate::tunnel::{
 	handle_tunnel_message, resend_buffered_tunnel_messages, send_hibernatable_ws_message_ack,
 };
-use crate::utils::{BufferMap, EnvoyShutdownError};
+use crate::utils::{BufferMap, EnvoyShutdownError, SleepFuture, boxed_sleep, spawn_detached};
 
-static GLOBAL_ENVOY: OnceLock<EnvoyHandle> = OnceLock::new();
+/// Process-wide envoy slot. Holds the handle inside a mutex so a stopped
+/// handle (e.g. from a shutdown-during-build race in serverless mode) can be
+/// replaced on the next `start_envoy_sync` call.
+#[cfg(not(target_arch = "wasm32"))]
+static GLOBAL_ENVOY: OnceLock<Mutex<Option<EnvoyHandle>>> = OnceLock::new();
 
 pub struct EnvoyContext {
 	pub shared: Arc<SharedContext>,
@@ -41,6 +52,8 @@ pub struct EnvoyContext {
 	pub next_kv_request_id: u32,
 	pub sqlite_requests: HashMap<u32, SqliteRequestEntry>,
 	pub next_sqlite_request_id: u32,
+	pub remote_sqlite_requests: HashMap<u32, RemoteSqliteRequestEntry>,
+	pub next_remote_sqlite_request_id: u32,
 	pub request_to_actor: BufferMap<String>,
 	pub buffered_messages: Vec<protocol::ToRivetTunnelMessage>,
 	/// Highest command index processed per `(actor_id, generation)`, used to
@@ -88,6 +101,10 @@ pub enum ToEnvoyMessage {
 	SqliteRequest {
 		request: SqliteRequest,
 		response_tx: oneshot::Sender<anyhow::Result<SqliteResponse>>,
+	},
+	RemoteSqliteRequest {
+		request: RemoteSqliteRequest,
+		response_tx: oneshot::Sender<anyhow::Result<RemoteSqliteResponse>>,
 	},
 	BufferTunnelMsg {
 		msg: protocol::ToRivetTunnelMessage,
@@ -166,6 +183,8 @@ impl EnvoyContext {
 				},
 			);
 
+		self.shared.actors_notify.notify_waiters();
+
 		if let Some(messages) = self.buffered_actor_messages.remove(&buffered_actor_id) {
 			for message in messages {
 				match message {
@@ -199,6 +218,7 @@ impl EnvoyContext {
 				shared.remove(actor_id);
 			}
 		}
+		self.shared.actors_notify.notify_waiters();
 	}
 
 	pub fn get_actor(&self, actor_id: &str, generation: Option<u32>) -> Option<&ActorEntry> {
@@ -245,12 +265,27 @@ pub async fn start_envoy(config: EnvoyConfig) -> EnvoyHandle {
 }
 
 pub fn start_envoy_sync(config: EnvoyConfig) -> EnvoyHandle {
-	if config.not_global {
+	#[cfg(target_arch = "wasm32")]
+	{
 		start_envoy_sync_inner(config)
-	} else {
-		GLOBAL_ENVOY
-			.get_or_init(|| start_envoy_sync_inner(config))
-			.clone()
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	{
+		if config.not_global {
+			return start_envoy_sync_inner(config);
+		}
+
+		let slot = GLOBAL_ENVOY.get_or_init(|| Mutex::new(None));
+		let mut guard = slot.lock();
+		if let Some(handle) = guard.as_ref() {
+			if !handle.is_stopped() {
+				return handle.clone();
+			}
+		}
+		let handle = start_envoy_sync_inner(config);
+		*guard = Some(handle.clone());
+		handle
 	}
 }
 
@@ -265,6 +300,7 @@ fn start_envoy_sync_inner(config: EnvoyConfig) -> EnvoyHandle {
 		envoy_key,
 		envoy_tx: envoy_tx.clone(),
 		actors: Arc::new(std::sync::Mutex::new(HashMap::new())),
+		actors_notify: Arc::new(tokio::sync::Notify::new()),
 		live_tunnel_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
 		pending_hibernation_restores: Arc::new(std::sync::Mutex::new(HashMap::new())),
 		ws_tx: Arc::new(tokio::sync::Mutex::new(None)),
@@ -289,6 +325,8 @@ fn start_envoy_sync_inner(config: EnvoyConfig) -> EnvoyHandle {
 		next_kv_request_id: 0,
 		sqlite_requests: HashMap::new(),
 		next_sqlite_request_id: 0,
+		remote_sqlite_requests: HashMap::new(),
+		next_remote_sqlite_request_id: 0,
 		request_to_actor: BufferMap::new(),
 		buffered_messages: Vec::new(),
 		processed_command_idx: HashMap::new(),
@@ -296,7 +334,7 @@ fn start_envoy_sync_inner(config: EnvoyConfig) -> EnvoyHandle {
 
 	tracing::info!("starting envoy");
 
-	tokio::spawn(envoy_loop(ctx, envoy_rx, start_tx));
+	spawn_detached(envoy_loop(ctx, envoy_rx, start_tx));
 
 	handle
 }
@@ -306,12 +344,10 @@ async fn envoy_loop(
 	mut rx: mpsc::UnboundedReceiver<ToEnvoyMessage>,
 	start_tx: tokio::sync::watch::Sender<()>,
 ) {
-	let mut ack_interval =
-		tokio::time::interval(std::time::Duration::from_millis(ACK_COMMANDS_INTERVAL_MS));
-	let mut kv_cleanup_interval =
-		tokio::time::interval(std::time::Duration::from_millis(KV_CLEANUP_INTERVAL_MS));
+	let mut ack_tick = boxed_sleep(std::time::Duration::from_millis(ACK_COMMANDS_INTERVAL_MS));
+	let mut kv_cleanup_tick = boxed_sleep(std::time::Duration::from_millis(KV_CLEANUP_INTERVAL_MS));
 
-	let mut lost_timeout: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+	let mut lost_timeout: Option<SleepFuture> = None;
 
 	loop {
 		tokio::select! {
@@ -323,6 +359,7 @@ async fn envoy_loop(
 						lost_timeout = handle_conn_message(&mut ctx, &start_tx, lost_timeout, message).await;
 					}
 					ToEnvoyMessage::ConnClose { evict } => {
+						fail_sent_remote_sqlite_requests_with_indeterminate_result(&mut ctx);
 						lost_timeout = handle_conn_close(&ctx, lost_timeout);
 						if evict { break; }
 					}
@@ -334,6 +371,9 @@ async fn envoy_loop(
 					}
 					ToEnvoyMessage::SqliteRequest { request, response_tx } => {
 						handle_sqlite_request(&mut ctx, request, response_tx).await;
+					}
+					ToEnvoyMessage::RemoteSqliteRequest { request, response_tx } => {
+						handle_remote_sqlite_request(&mut ctx, request, response_tx).await;
 					}
 					ToEnvoyMessage::BufferTunnelMsg { msg } => {
 						ctx.buffered_messages.push(msg);
@@ -388,12 +428,15 @@ async fn envoy_loop(
 					}
 				}
 			}
-			_ = ack_interval.tick() => {
+			_ = ack_tick.as_mut() => {
 				send_command_ack(&mut ctx).await;
+				ack_tick = boxed_sleep(std::time::Duration::from_millis(ACK_COMMANDS_INTERVAL_MS));
 			}
-			_ = kv_cleanup_interval.tick() => {
+			_ = kv_cleanup_tick.as_mut() => {
 				cleanup_old_kv_requests(&mut ctx);
 				cleanup_old_sqlite_requests(&mut ctx);
+				cleanup_old_remote_sqlite_requests(&mut ctx);
+				kv_cleanup_tick = boxed_sleep(std::time::Duration::from_millis(KV_CLEANUP_INTERVAL_MS));
 			}
 			_ = async {
 				match lost_timeout.as_mut() {
@@ -405,9 +448,8 @@ async fn envoy_loop(
 				for (_id, request) in ctx.kv_requests.drain() {
 					let _ = request.response_tx.send(Err(anyhow::anyhow!(EnvoyShutdownError)));
 				}
-				for (_id, request) in ctx.sqlite_requests.drain() {
-					let _ = request.response_tx.send(Err(anyhow::anyhow!(EnvoyShutdownError)));
-				}
+				fail_sqlite_requests_with_shutdown(&mut ctx);
+				fail_remote_sqlite_requests_with_shutdown(&mut ctx);
 
 				if !ctx.actors.is_empty() {
 					tracing::warn!("stopping all actors due to envoy lost threshold");
@@ -444,11 +486,8 @@ async fn envoy_loop(
 			.response_tx
 			.send(Err(anyhow::anyhow!("envoy shutting down")));
 	}
-	for (_id, request) in ctx.sqlite_requests.drain() {
-		let _ = request
-			.response_tx
-			.send(Err(anyhow::anyhow!("envoy shutting down")));
-	}
+	fail_sqlite_requests_with_shutdown(&mut ctx);
+	fail_remote_sqlite_requests_with_shutdown(&mut ctx);
 
 	ctx.actors.clear();
 	ctx.shared
@@ -470,9 +509,9 @@ async fn envoy_loop(
 async fn handle_conn_message(
 	ctx: &mut EnvoyContext,
 	start_tx: &tokio::sync::watch::Sender<()>,
-	mut lost_timeout: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+	mut lost_timeout: Option<SleepFuture>,
 	message: protocol::ToEnvoy,
-) -> Option<std::pin::Pin<Box<tokio::time::Sleep>>> {
+) -> Option<SleepFuture> {
 	match message {
 		protocol::ToEnvoy::ToEnvoyInit(init) => {
 			{
@@ -485,6 +524,7 @@ async fn handle_conn_message(
 			resend_unacknowledged_events(ctx).await;
 			process_unsent_kv_requests(ctx).await;
 			process_unsent_sqlite_requests(ctx).await;
+			process_unsent_remote_sqlite_requests(ctx).await;
 			resend_buffered_tunnel_messages(ctx).await;
 
 			let _ = start_tx.send(());
@@ -504,14 +544,11 @@ async fn handle_conn_message(
 		protocol::ToEnvoy::ToEnvoySqliteCommitResponse(response) => {
 			handle_sqlite_commit_response(ctx, response).await;
 		}
-		protocol::ToEnvoy::ToEnvoySqliteCommitStageBeginResponse(response) => {
-			handle_sqlite_commit_stage_begin_response(ctx, response).await;
+		protocol::ToEnvoy::ToEnvoySqliteExecResponse(response) => {
+			handle_remote_sqlite_exec_response(ctx, response).await;
 		}
-		protocol::ToEnvoy::ToEnvoySqliteCommitStageResponse(response) => {
-			handle_sqlite_commit_stage_response(ctx, response).await;
-		}
-		protocol::ToEnvoy::ToEnvoySqliteCommitFinalizeResponse(response) => {
-			handle_sqlite_commit_finalize_response(ctx, response).await;
+		protocol::ToEnvoy::ToEnvoySqliteExecuteResponse(response) => {
+			handle_remote_sqlite_execute_response(ctx, response).await;
 		}
 		protocol::ToEnvoy::ToEnvoyTunnelMessage(tunnel_msg) => {
 			handle_tunnel_message(ctx, tunnel_msg).await;
@@ -524,10 +561,7 @@ async fn handle_conn_message(
 	lost_timeout
 }
 
-fn handle_conn_close(
-	ctx: &EnvoyContext,
-	lost_timeout: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
-) -> Option<std::pin::Pin<Box<tokio::time::Sleep>>> {
+fn handle_conn_close(ctx: &EnvoyContext, lost_timeout: Option<SleepFuture>) -> Option<SleepFuture> {
 	if lost_timeout.is_some() {
 		return lost_timeout;
 	}
@@ -542,8 +576,8 @@ fn handle_conn_close(
 
 	tracing::debug!(ms = lost_threshold, "starting envoy lost timeout");
 
-	Some(Box::pin(tokio::time::sleep(
-		std::time::Duration::from_millis(lost_threshold),
+	Some(boxed_sleep(std::time::Duration::from_millis(
+		lost_threshold,
 	)))
 }
 
@@ -569,7 +603,7 @@ async fn handle_shutdown(ctx: &mut EnvoyContext) {
 		.collect();
 
 	let envoy_tx = ctx.shared.envoy_tx.clone();
-	tokio::spawn(async move {
+	spawn_detached(async move {
 		futures_util::future::join_all(actor_handles.iter().map(|h| h.closed())).await;
 		tracing::debug!("all actors stopped during graceful shutdown");
 		let _ = envoy_tx.send(ToEnvoyMessage::Stop);

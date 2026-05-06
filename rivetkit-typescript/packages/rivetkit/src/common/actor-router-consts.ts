@@ -21,6 +21,7 @@ export const HEADER_RIVET_TOKEN = "x-rivet-token";
 export const HEADER_RIVET_TARGET = "x-rivet-target";
 export const HEADER_RIVET_ACTOR = "x-rivet-actor";
 export const HEADER_RIVET_NAMESPACE = "x-rivet-namespace";
+export const HEADER_RIVET_SKIP_READY_WAIT = "x-rivet-skip-ready-wait";
 
 // MARK: WebSocket Protocol Prefixes
 /** Some servers (such as node-ws & Cloudflare) require explicitly match a certain WebSocket protocol. This gives us a static protocol to match against. */
@@ -30,6 +31,7 @@ export const WS_PROTOCOL_ACTOR = "rivet_actor.";
 export const WS_PROTOCOL_ENCODING = "rivet_encoding.";
 export const WS_PROTOCOL_CONN_PARAMS = "rivet_conn_params.";
 export const WS_PROTOCOL_TOKEN = "rivet_token.";
+export const WS_PROTOCOL_SKIP_READY_WAIT = "rivet_skip_ready_wait";
 export const WS_PROTOCOL_TEST_ACK_HOOK = "rivet_test_ack_hook.";
 
 // MARK: WebSocket Inline Test Protocol Prefixes
@@ -51,4 +53,5 @@ export const ALLOWED_PUBLIC_HEADERS = [
 	HEADER_RIVET_ACTOR,
 	HEADER_RIVET_NAMESPACE,
 	HEADER_RIVET_TOKEN,
+	HEADER_RIVET_SKIP_READY_WAIT,
 ];

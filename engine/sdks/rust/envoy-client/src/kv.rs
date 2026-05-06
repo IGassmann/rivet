@@ -9,7 +9,7 @@ pub struct KvRequestEntry {
 	pub data: protocol::KvRequestData,
 	pub response_tx: oneshot::Sender<anyhow::Result<protocol::KvResponseData>>,
 	pub sent: bool,
-	pub timestamp: std::time::Instant,
+	pub timestamp: crate::time::Instant,
 }
 
 pub const KV_EXPIRE_MS: u64 = 30_000;
@@ -29,7 +29,7 @@ pub async fn handle_kv_request(
 		data,
 		response_tx,
 		sent: false,
-		timestamp: std::time::Instant::now(),
+		timestamp: crate::time::Instant::now(),
 	};
 
 	ctx.kv_requests.insert(request_id, entry);
@@ -86,7 +86,7 @@ pub async fn send_single_kv_request(ctx: &mut EnvoyContext, request_id: u32) {
 	// Re-get after async call
 	if let Some(request) = ctx.kv_requests.get_mut(&request_id) {
 		request.sent = true;
-		request.timestamp = std::time::Instant::now();
+		request.timestamp = crate::time::Instant::now();
 	}
 }
 
@@ -113,7 +113,7 @@ pub async fn process_unsent_kv_requests(ctx: &mut EnvoyContext) {
 }
 
 pub fn cleanup_old_kv_requests(ctx: &mut EnvoyContext) {
-	let now = std::time::Instant::now();
+	let now = crate::time::Instant::now();
 	let mut to_delete = Vec::new();
 
 	for (request_id, request) in &ctx.kv_requests {

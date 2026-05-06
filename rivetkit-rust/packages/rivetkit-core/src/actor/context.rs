@@ -3,7 +3,9 @@ use std::future::Future;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use crate::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as AnyhowContext, Result};
 use futures::future::BoxFuture;
@@ -14,7 +16,6 @@ use scc::HashMap as SccHashMap;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OnceCell, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::ActorConfig;
@@ -31,9 +32,9 @@ use crate::actor::queue::{QueueInspectorUpdateCallback, QueueMetadata, QueueWait
 use crate::actor::schedule::{InternalKeepAwakeCallback, LocalAlarmCallback};
 use crate::actor::sleep::{CanSleep, SleepState};
 use crate::actor::state::{PendingSave, PersistedActor, RequestSaveOpts};
-use crate::actor::task::{
-	LIFECYCLE_EVENT_INBOX_CHANNEL, LifecycleEvent, actor_channel_overloaded_error,
-};
+use crate::actor::task::LifecycleEvent;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::actor::task::{LIFECYCLE_EVENT_INBOX_CHANNEL, actor_channel_overloaded_error};
 use crate::actor::task_types::UserTaskKind;
 use crate::actor::work_registry::RegionGuard;
 use crate::error::{ActorLifecycle as ActorLifecycleError, ActorRuntime};
@@ -69,8 +70,8 @@ pub(crate) struct ActorContextInner {
 	pub(super) save_requested: AtomicBool,
 	pub(super) save_requested_immediate: AtomicBool,
 	// Forced-sync: debounce bookkeeping is updated from sync save-request paths.
-	pub(super) save_requested_within_deadline: Mutex<Option<std::time::Instant>>,
-	pub(super) last_save_at: Mutex<Option<std::time::Instant>>,
+	pub(super) save_requested_within_deadline: Mutex<Option<crate::time::Instant>>,
+	pub(super) last_save_at: Mutex<Option<crate::time::Instant>>,
 	pub(super) pending_save: Mutex<Option<PendingSave>>,
 	pub(super) tracked_persist: Mutex<Option<JoinHandle<()>>>,
 	pub(super) save_guard: AsyncMutex<()>,
@@ -104,7 +105,7 @@ pub(crate) struct ActorContextInner {
 	// Forced-sync: queue config is read from sync public methods before blocking
 	// on async queue work.
 	pub(super) queue_config: Mutex<ActorConfig>,
-	pub(super) queue_abort_signal: Option<CancellationToken>,
+	pub(super) queue_abort_signal: Mutex<CancellationToken>,
 	pub(super) queue_initialize: OnceCell<()>,
 	// Forced-sync: startup installs preload before any queue method awaits init.
 	pub(super) queue_preloaded_kv: Mutex<Option<PreloadedKv>>,
@@ -132,7 +133,7 @@ pub(crate) struct ActorContextInner {
 	destroy_requested: AtomicBool,
 	destroy_completed: AtomicBool,
 	destroy_completion_notify: Notify,
-	abort_signal: CancellationToken,
+	abort_signal: Mutex<CancellationToken>,
 	shutdown_deadline: CancellationToken,
 	// Forced-sync: runtime wiring slots are configured through synchronous
 	// lifecycle setup and cloned before sending events.
@@ -225,6 +226,10 @@ impl ActorContext {
 		sql: SqliteDb,
 	) -> Self {
 		let metrics = ActorMetrics::new(actor_id.clone(), name.clone());
+		#[cfg(feature = "sqlite-local")]
+		let mut sql = sql;
+		#[cfg(feature = "sqlite-local")]
+		sql.set_vfs_metrics(Arc::new(metrics.clone()));
 		let diagnostics = ActorDiagnostics::new(actor_id.clone());
 		let lifecycle_event_inbox_capacity = config.lifecycle_event_inbox_capacity;
 		let state_save_interval = config.state_save_interval;
@@ -273,7 +278,7 @@ impl ActorContext {
 			#[cfg(test)]
 			schedule_driver_alarm_cancel_count: AtomicUsize::new(0),
 			queue_config: Mutex::new(config.clone()),
-			queue_abort_signal: Some(abort_signal.clone()),
+			queue_abort_signal: Mutex::new(abort_signal.clone()),
 			queue_initialize: OnceCell::new(),
 			queue_preloaded_kv: Mutex::new(None),
 			queue_preloaded_message_entries: Mutex::new(None),
@@ -296,7 +301,7 @@ impl ActorContext {
 			destroy_requested: AtomicBool::new(false),
 			destroy_completed: AtomicBool::new(false),
 			destroy_completion_notify: Notify::new(),
-			abort_signal,
+			abort_signal: Mutex::new(abort_signal),
 			shutdown_deadline,
 			inspector: RwLock::new(None),
 			inspector_attach_count: RwLock::new(None),
@@ -365,6 +370,10 @@ impl ActorContext {
 		self.0.sql.query_rows_cbor(sql, params).await
 	}
 
+	pub async fn db_execute(&self, sql: &str, params: Option<&[u8]>) -> Result<Vec<u8>> {
+		self.0.sql.execute_rows_cbor(sql, params).await
+	}
+
 	pub async fn db_run(&self, sql: &str, params: Option<&[u8]>) -> Result<()> {
 		self.0.sql.run_cbor(sql, params).await?;
 		Ok(())
@@ -403,8 +412,7 @@ impl ActorContext {
 			};
 		}
 		if self.0.sleep_requested.swap(true, Ordering::SeqCst) {
-			return Err(ActorLifecycleError::Stopping.build())
-				.context("sleep already requested for this generation");
+			return Ok(());
 		}
 		self.cancel_sleep_timer();
 		if Handle::try_current().is_ok() {
@@ -439,11 +447,14 @@ impl ActorContext {
 			return Err(ActorLifecycleError::Stopping.build())
 				.context("destroy already requested for this generation");
 		}
-		// Reuse the shared teardown sequence used by the registry shutdown
-		// path so future changes to `mark_destroy_requested` cannot drift.
-		// `destroy_requested` is already true from the swap above; the redundant
+		// Reuse the shared teardown sequence used by the registry shutdown path
+		// so future changes to `mark_destroy_requested` cannot drift.
+		// `destroy_requested` is already true from the swap above. The redundant
 		// `store(true)` inside is harmless.
+		#[cfg(not(feature = "wasm-runtime"))]
 		self.mark_destroy_requested();
+		#[cfg(feature = "wasm-runtime")]
+		self.mark_destroy_requested_without_spawn();
 
 		let ctx = self.clone();
 		if Handle::try_current().is_ok() {
@@ -467,22 +478,42 @@ impl ActorContext {
 		self.flush_on_shutdown();
 		self.0.destroy_requested.store(true, Ordering::SeqCst);
 		self.0.destroy_completed.store(false, Ordering::SeqCst);
-		self.0.abort_signal.cancel();
+	}
+
+	#[cfg(feature = "wasm-runtime")]
+	fn mark_destroy_requested_without_spawn(&self) {
+		self.cancel_sleep_timer();
+		self.0.destroy_requested.store(true, Ordering::SeqCst);
+		self.0.destroy_completed.store(false, Ordering::SeqCst);
 	}
 
 	#[doc(hidden)]
-	pub fn cancel_abort_signal_for_sleep(&self) {
-		self.0.abort_signal.cancel();
+	pub fn cancel_actor_abort_signal(&self) {
+		self.0.abort_signal.lock().cancel();
+	}
+
+	pub(crate) fn reset_abort_signal_for_start(&self) {
+		let mut abort_signal = self.0.abort_signal.lock();
+		if !abort_signal.is_cancelled() {
+			return;
+		}
+
+		// Sleep or destroy cancels the generation abort signal to break actor
+		// scoped waits. A restarted actor needs a fresh signal so the next
+		// generation can wait normally.
+		let next_signal = CancellationToken::new();
+		*abort_signal = next_signal.clone();
+		*self.0.queue_abort_signal.lock() = next_signal;
 	}
 
 	#[doc(hidden)]
 	pub fn actor_abort_signal(&self) -> CancellationToken {
-		self.0.abort_signal.clone()
+		self.0.abort_signal.lock().clone()
 	}
 
 	#[doc(hidden)]
 	pub fn actor_aborted(&self) -> bool {
-		self.0.abort_signal.is_cancelled()
+		self.0.abort_signal.lock().is_cancelled()
 	}
 
 	/// Fires when the shutdown grace deadline has elapsed and core is forcing
@@ -510,6 +541,7 @@ impl ActorContext {
 		false
 	}
 
+	#[cfg(not(feature = "wasm-runtime"))]
 	pub fn wait_until(&self, future: impl Future<Output = ()> + Send + 'static) {
 		if Handle::try_current().is_err() {
 			tracing::warn!("skipping wait_until without a tokio runtime");
@@ -525,7 +557,56 @@ impl ActorContext {
 			let started_at = Instant::now();
 			future.await;
 			ctx.record_user_task_finished(UserTaskKind::WaitUntil, started_at.elapsed());
+			ctx.reset_sleep_timer();
 		});
+	}
+
+	#[cfg(not(feature = "wasm-runtime"))]
+	pub fn register_task(&self, future: impl Future<Output = ()> + Send + 'static) {
+		let ctx = self.clone();
+		self.track_shutdown_task(async move {
+			Self::run_registered_task(ctx, future).await;
+		});
+	}
+
+	#[cfg(feature = "wasm-runtime")]
+	pub fn wait_until(&self, future: impl Future<Output = ()> + 'static) {
+		let ctx = self.clone();
+		self.track_shutdown_task(async move {
+			ctx.record_user_task_started(UserTaskKind::WaitUntil);
+			let started_at = Instant::now();
+			future.await;
+			ctx.record_user_task_finished(UserTaskKind::WaitUntil, started_at.elapsed());
+			ctx.reset_sleep_timer();
+		});
+	}
+
+	#[cfg(feature = "wasm-runtime")]
+	pub fn register_task(&self, future: impl Future<Output = ()> + 'static) {
+		let ctx = self.clone();
+		self.track_shutdown_task(async move {
+			Self::run_registered_task(ctx, future).await;
+		});
+	}
+
+	async fn run_registered_task<F>(ctx: ActorContext, future: F)
+	where
+		F: Future<Output = ()>,
+	{
+		let shutdown_deadline = ctx.shutdown_deadline_token();
+		ctx.record_user_task_started(UserTaskKind::RegisteredTask);
+		let started_at = Instant::now();
+		tokio::select! {
+			_ = future => {}
+			_ = shutdown_deadline.cancelled() => {
+				tracing::warn!(
+					actor_id = %ctx.actor_id(),
+					reason = "shutdown_deadline_elapsed",
+					"registered task cancelled by shutdown deadline"
+				);
+			}
+		}
+		ctx.record_user_task_finished(UserTaskKind::RegisteredTask, started_at.elapsed());
 	}
 
 	pub async fn keep_awake<F>(&self, future: F) -> F::Output
@@ -534,6 +615,12 @@ impl ActorContext {
 	{
 		let _guard = self.keep_awake_guard();
 		future.await
+	}
+
+	pub fn keep_awake_region(&self) -> KeepAwakeRegion {
+		KeepAwakeRegion {
+			guard: Some(self.keep_awake_guard()),
+		}
 	}
 
 	pub async fn internal_keep_awake<F>(&self, future: F) -> F::Output
@@ -647,8 +734,12 @@ impl ActorContext {
 	/// so overdue scheduled work enters the normal actor event loop.
 	pub async fn drain_overdue_scheduled_events(&self) -> Result<()> {
 		for event in self.due_scheduled_events(now_timestamp_ms()) {
-			self.dispatch_scheduled_action(&event.event_id, event.action, event.args)
-				.await;
+			self.dispatch_scheduled_action(
+				&event.event_id,
+				event.action,
+				event.args.unwrap_or_default(),
+			)
+			.await;
 		}
 
 		self.sync_alarm_logged();
@@ -810,6 +901,34 @@ impl ActorContext {
 	{
 		let conn = self
 			.connect_with_state(params, is_hibernatable, hibernation, request, create_state)
+			.await?;
+		self.record_connections_updated();
+		self.reset_sleep_timer();
+		Ok(conn)
+	}
+
+	pub(crate) async fn connect_conn_with_prepare<F, P>(
+		&self,
+		params: Vec<u8>,
+		is_hibernatable: bool,
+		hibernation: Option<HibernatableConnectionMetadata>,
+		request: Option<Request>,
+		create_state: F,
+		prepare_connection: P,
+	) -> Result<ConnHandle>
+	where
+		F: Future<Output = Result<Vec<u8>>> + Send,
+		P: FnOnce(&ConnHandle) -> Result<()>,
+	{
+		let conn = self
+			.connect_with_state_and_prepare(
+				params,
+				is_hibernatable,
+				hibernation,
+				request,
+				create_state,
+				prepare_connection,
+			)
 			.await?;
 		self.record_connections_updated();
 		self.reset_sleep_timer();
@@ -1178,6 +1297,10 @@ impl ActorContext {
 			return;
 		}
 
+		#[cfg(feature = "wasm-runtime")]
+		return;
+
+		#[cfg(not(feature = "wasm-runtime"))]
 		self.reset_sleep_timer_state();
 	}
 
@@ -1202,9 +1325,13 @@ impl ActorContext {
 		self.0.sleep_requested.load(Ordering::SeqCst)
 	}
 
+	pub(crate) fn clear_sleep_requested(&self) {
+		self.0.sleep_requested.store(false, Ordering::SeqCst);
+	}
+
 	fn keep_awake_guard(&self) -> KeepAwakeGuard {
 		let region = self
-			.keep_awake_region()
+			.keep_awake_region_state()
 			.with_log_fields("keep_awake", Some(self.actor_id().to_owned()));
 		let guard = KeepAwakeGuard::new(self.clone(), region);
 		self.reset_sleep_timer();
@@ -1364,6 +1491,9 @@ impl ActorContext {
 	}
 
 	fn try_send_lifecycle_event(&self, event: LifecycleEvent, operation: &'static str) {
+		#[cfg(target_arch = "wasm32")]
+		let _ = operation;
+
 		let Some(sender) = self.0.lifecycle_events.read().clone() else {
 			return;
 		};
@@ -1372,6 +1502,9 @@ impl ActorContext {
 			Ok(permit) => {
 				permit.send(event);
 			}
+			#[cfg(target_arch = "wasm32")]
+			Err(_) => {}
+			#[cfg(not(target_arch = "wasm32"))]
 			Err(_) => {
 				let _ = actor_channel_overloaded_error(
 					LIFECYCLE_EVENT_INBOX_CHANNEL,
@@ -1510,6 +1643,10 @@ pub struct WebSocketCallbackRegion {
 	guard: Option<WebSocketCallbackGuard>,
 }
 
+pub struct KeepAwakeRegion {
+	guard: Option<KeepAwakeGuard>,
+}
+
 impl WebSocketCallbackGuard {
 	fn new(ctx: ActorContext, kind: UserTaskKind, region: RegionGuard) -> Self {
 		Self {
@@ -1532,6 +1669,13 @@ impl Drop for WebSocketCallbackGuard {
 
 impl Drop for WebSocketCallbackRegion {
 	fn drop(&mut self) {
+		self.guard.take();
+	}
+}
+
+impl Drop for KeepAwakeRegion {
+	fn drop(&mut self) {
+		// Take the guard explicitly to mirror WebSocketCallbackRegion.
 		self.guard.take();
 	}
 }

@@ -15,6 +15,7 @@ mod actor_event_demuxer;
 mod actor_lifecycle;
 mod conn;
 mod errors;
+mod hibernating_requests;
 mod metrics;
 mod ping_task;
 pub mod sqlite_runtime;
@@ -76,14 +77,9 @@ impl CustomServeTrait for PegboardEnvoyWs {
 		// Parse URL to extract parameters
 		let url = url::Url::parse(&format!("ws://placeholder/{}", req_ctx.path()))
 			.context("failed to parse WebSocket URL")?;
-		let url_data = utils::UrlData::parse_url(url)
-			.map_err(|err| errors::WsError::InvalidUrl(err.to_string()).build())?;
+		let url_data = utils::UrlData::parse_url(url)?;
 
 		tracing::debug!(path=%req_ctx.path(), "tunnel ws connection established");
-
-		let sqlite_engine = sqlite_runtime::shared_engine(&ctx)
-			.await
-			.context("failed to initialize sqlite dispatch runtime")?;
 
 		let namespace_name = url_data.namespace.clone();
 		let namespace = ctx
@@ -125,7 +121,7 @@ impl CustomServeTrait for PegboardEnvoyWs {
 		})?;
 
 		// Create the connection.
-		let conn = conn::init_conn(&ctx, ws_handle.clone(), sqlite_engine, url_data)
+		let conn = conn::init_conn(&ctx, ws_handle.clone(), url_data)
 			.await
 			.context("failed to initialize envoy connection")?;
 
@@ -182,7 +178,10 @@ impl CustomServeTrait for PegboardEnvoyWs {
 				res
 			},
 			async {
-				let res = ws_to_tunnel.await?;
+				let res = match ws_to_tunnel.await {
+					Err(err) if err.is_cancelled() => Ok(LifecycleResult::Aborted),
+					res => res?,
+				};
 
 				// Abort others if not aborted
 				if !matches!(res, Ok(LifecycleResult::Aborted)) {
@@ -211,7 +210,7 @@ impl CustomServeTrait for PegboardEnvoyWs {
 
 				// Any error of the ping task must result in a hard abort of ws_to_tunnel. This stops all in
 				// flight kv requests from being completed immediately. This guarantees the invariant that an
-				// actor's KV is only being from one place at a time.
+				// actor's KV is only being accessed from one place at a time.
 				if res.is_err() {
 					tracing::warn!(?res, "ping task failed, aborting ws_to_tunnel");
 					hard_abort_ws_to_tunnel.abort();

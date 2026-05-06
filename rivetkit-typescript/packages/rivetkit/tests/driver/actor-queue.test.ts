@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { describeDriverMatrix } from "./shared-matrix";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import type { ActorError } from "@/client/mod";
 import { MANY_QUEUE_NAMES } from "../../fixtures/driver-test-suite/queue";
 import { setupDriverTest, waitFor } from "./shared-utils";
@@ -307,14 +307,7 @@ describeDriverMatrix("Actor Queue", (driverTestConfig) => {
 					queued: true,
 				});
 
-				// Wait for the queued spawn to land in the parent's `spawned`
-				// list. The parent does not expose an event the test can
-				// subscribe to, so we poll the read-only `getSpawned` action
-				// rather than retry the original `queueSpawn` mutation.
-				await vi.waitFor(async () => {
-					const spawned = await parent.getSpawned();
-					expect(spawned).toContain("many-run-child");
-				});
+				expect(await parent.getSpawned()).toContain("many-run-child");
 
 				await expectManyQueueChildToDrain(
 					client.manyQueueChildActor,

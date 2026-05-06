@@ -9,20 +9,24 @@ use anyhow::{Context, Result};
 use futures::future::BoxFuture;
 use parking_lot::{RwLock, RwLockReadGuard};
 use rivet_error::RivetError;
-use serde::{Deserialize, Serialize};
-use tokio::time::timeout;
+use rivetkit_actor_persist::{generated::v4 as persist_v4, versioned as persist_versioned};
+use serde::Serialize;
 use uuid::Uuid;
 
 use tokio::sync::oneshot;
 
 use crate::actor::config::ActorConfig;
 use crate::actor::context::ActorContext;
+use crate::actor::keys::CONN_PREFIX;
 use crate::actor::lifecycle_hooks::Reply;
 use crate::actor::messages::{ActorEvent, Request};
-use crate::actor::persist::{decode_with_embedded_version, encode_with_embedded_version};
+use crate::actor::persist::{
+	decode_latest_with_embedded_version, encode_latest_with_embedded_version,
+};
 use crate::actor::preload::PreloadedKv;
 use crate::actor::state::RequestSaveOpts;
 use crate::error::ActorRuntime;
+use crate::time::timeout;
 use crate::types::ConnId;
 use crate::types::ListOpts;
 
@@ -30,10 +34,6 @@ pub(crate) type EventSendCallback = Arc<dyn Fn(OutgoingEvent) -> Result<()> + Se
 pub(crate) type DisconnectCallback =
 	Arc<dyn Fn(Option<String>) -> BoxFuture<'static, Result<()>> + Send + Sync>;
 type StateChangeCallback = Arc<dyn Fn(&ConnHandle) + Send + Sync>;
-
-const CONNECTION_KEY_PREFIX: &[u8] = &[2];
-const CONNECTION_PERSIST_VERSION: u16 = 4;
-const CONNECTION_PERSIST_COMPATIBLE_VERSIONS: &[u16] = &[3, 4];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OutgoingEvent {
@@ -51,24 +51,8 @@ pub(crate) struct HibernatableConnectionMetadata {
 	pub request_headers: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PersistedSubscription {
-	pub event_name: String,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PersistedConnection {
-	pub id: String,
-	pub parameters: Vec<u8>,
-	pub state: Vec<u8>,
-	pub subscriptions: Vec<PersistedSubscription>,
-	pub gateway_id: [u8; 4],
-	pub request_id: [u8; 4],
-	pub server_message_index: u16,
-	pub client_message_index: u16,
-	pub request_path: String,
-	pub request_headers: BTreeMap<String, String>,
-}
+pub(crate) type PersistedSubscription = persist_v4::Subscription;
+pub(crate) type PersistedConnection = persist_v4::Conn;
 
 #[derive(RivetError, Serialize)]
 #[error(
@@ -146,19 +130,19 @@ pub(crate) fn hibernatable_id_from_slice(field: &'static str, bytes: &[u8]) -> R
 }
 
 pub(crate) fn encode_persisted_connection(connection: &PersistedConnection) -> Result<Vec<u8>> {
-	encode_with_embedded_version(
-		connection,
-		CONNECTION_PERSIST_VERSION,
+	encode_latest_with_embedded_version::<persist_versioned::Conn>(
+		connection.clone(),
+		rivetkit_actor_persist::CURRENT_VERSION,
 		"persisted connection",
 	)
 }
 
 pub(crate) fn decode_persisted_connection(payload: &[u8]) -> Result<PersistedConnection> {
-	decode_with_embedded_version(
+	let connection = decode_latest_with_embedded_version::<persist_versioned::Conn>(
 		payload,
-		CONNECTION_PERSIST_COMPATIBLE_VERSIONS,
 		"persisted connection",
-	)
+	)?;
+	Ok(connection)
 }
 
 #[derive(Clone)]
@@ -348,7 +332,7 @@ impl ConnHandle {
 			server_message_index: hibernation.server_message_index,
 			client_message_index: hibernation.client_message_index,
 			request_path: hibernation.request_path,
-			request_headers: hibernation.request_headers,
+			request_headers: hibernation.request_headers.into_iter().collect(),
 		})
 	}
 
@@ -365,7 +349,7 @@ impl ConnHandle {
 			server_message_index: persisted.server_message_index,
 			client_message_index: persisted.client_message_index,
 			request_path: persisted.request_path,
-			request_headers: persisted.request_headers,
+			request_headers: persisted.request_headers.into_iter().collect(),
 		}));
 		for subscription in persisted.subscriptions {
 			conn.subscribe(subscription.event_name);
@@ -659,6 +643,30 @@ impl ActorContext {
 	where
 		F: std::future::Future<Output = Result<Vec<u8>>> + Send,
 	{
+		self.connect_with_state_and_prepare(
+			params,
+			is_hibernatable,
+			hibernation,
+			request,
+			create_state,
+			|_| Ok(()),
+		)
+		.await
+	}
+
+	pub(crate) async fn connect_with_state_and_prepare<F, P>(
+		&self,
+		params: Vec<u8>,
+		is_hibernatable: bool,
+		hibernation: Option<HibernatableConnectionMetadata>,
+		request: Option<Request>,
+		create_state: F,
+		prepare_connection: P,
+	) -> Result<ConnHandle>
+	where
+		F: std::future::Future<Output = Result<Vec<u8>>> + Send,
+		P: FnOnce(&ConnHandle) -> Result<()>,
+	{
 		let config = self.connection_config();
 
 		let state = timeout(config.create_conn_state_timeout, create_state)
@@ -675,9 +683,16 @@ impl ActorContext {
 		);
 		conn.configure_hibernation(hibernation);
 		self.prepare_managed_conn(&conn);
+
+		if let Err(error) = prepare_connection(&conn) {
+			return Err(error);
+		}
+
+		self.emit_connection_preflight(&conn, params.clone(), request.clone())
+			.await?;
 		self.insert_existing(conn.clone());
 
-		if let Err(error) = self.emit_connection_open(&conn, params, request).await {
+		if let Err(error) = self.emit_connection_open(&conn, request).await {
 			self.remove_existing(conn.id());
 			return Err(error);
 		}
@@ -712,22 +727,21 @@ impl ActorContext {
 		&self,
 		preloaded_kv: Option<&PreloadedKv>,
 	) -> Result<Vec<ConnHandle>> {
-		let entries = if let Some(entries) =
-			preloaded_kv.and_then(|kv| kv.prefix_entries(CONNECTION_KEY_PREFIX))
-		{
-			entries
-		} else {
-			self.0
-				.kv
-				.list_prefix(
-					CONNECTION_KEY_PREFIX,
-					ListOpts {
-						reverse: false,
-						limit: None,
-					},
-				)
-				.await?
-		};
+		let entries =
+			if let Some(entries) = preloaded_kv.and_then(|kv| kv.prefix_entries(&CONN_PREFIX)) {
+				entries
+			} else {
+				self.0
+					.kv
+					.list_prefix(
+						&CONN_PREFIX,
+						ListOpts {
+							reverse: false,
+							limit: None,
+						},
+					)
+					.await?
+			};
 		let mut restored = Vec::new();
 
 		for (_key, value) in entries {
@@ -856,7 +870,6 @@ impl ActorContext {
 	async fn emit_connection_open(
 		&self,
 		conn: &ConnHandle,
-		params: Vec<u8>,
 		request: Option<Request>,
 	) -> Result<()> {
 		let config = self.connection_config();
@@ -864,7 +877,6 @@ impl ActorContext {
 		self.try_send_actor_event(
 			ActorEvent::ConnectionOpen {
 				conn: conn.clone(),
-				params,
 				request,
 				reply: Reply::from(reply_tx),
 			},
@@ -874,6 +886,33 @@ impl ActorContext {
 			.await
 			.with_context(|| timeout_message("connection_open", config.on_connect_timeout))?
 			.context("receive connection_open reply")??;
+		Ok(())
+	}
+
+	async fn emit_connection_preflight(
+		&self,
+		conn: &ConnHandle,
+		params: Vec<u8>,
+		request: Option<Request>,
+	) -> Result<()> {
+		let config = self.connection_config();
+		let timeout_duration = config
+			.on_before_connect_timeout
+			.saturating_add(config.create_conn_state_timeout);
+		let (reply_tx, reply_rx) = oneshot::channel();
+		self.try_send_actor_event(
+			ActorEvent::ConnectionPreflight {
+				conn: conn.clone(),
+				params,
+				request,
+				reply: Reply::from(reply_tx),
+			},
+			"connection_preflight",
+		)?;
+		timeout(timeout_duration, reply_rx)
+			.await
+			.with_context(|| timeout_message("connection_preflight", timeout_duration))?
+			.context("receive connection_preflight reply")??;
 		Ok(())
 	}
 
@@ -973,13 +1012,6 @@ fn disconnect_message(conn_id: &str, reason: Option<&str>) -> String {
 		Some(reason) => format!("disconnect connection `{conn_id}` with reason `{reason}`"),
 		None => format!("disconnect connection `{conn_id}`"),
 	}
-}
-
-pub(crate) fn make_connection_key(conn_id: &str) -> Vec<u8> {
-	let mut key = Vec::with_capacity(CONNECTION_KEY_PREFIX.len() + conn_id.len());
-	key.extend_from_slice(CONNECTION_KEY_PREFIX);
-	key.extend_from_slice(conn_id.as_bytes());
-	key
 }
 
 // Test shim keeps moved tests in crate-root tests/ with private-module access.

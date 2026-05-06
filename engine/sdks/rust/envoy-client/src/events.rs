@@ -78,8 +78,8 @@ mod tests {
 	use std::collections::HashMap;
 	use std::sync::Arc;
 
+	use crate::async_counter::AsyncCounter;
 	use rivet_envoy_protocol as protocol;
-	use rivet_util::async_counter::AsyncCounter;
 	use tokio::sync::mpsc;
 
 	use super::handle_send_events;
@@ -102,7 +102,6 @@ mod tests {
 			_generation: u32,
 			_config: protocol::ActorConfig,
 			_preloaded_kv: Option<protocol::PreloadedKv>,
-			_sqlite_startup_data: Option<protocol::SqliteStartupData>,
 		) -> BoxFuture<anyhow::Result<()>> {
 			Box::pin(async { Ok(()) })
 		}
@@ -165,6 +164,7 @@ mod tests {
 			envoy_key: "test-envoy".to_string(),
 			envoy_tx,
 			actors: Arc::new(std::sync::Mutex::new(HashMap::new())),
+			actors_notify: Arc::new(tokio::sync::Notify::new()),
 			live_tunnel_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
 			pending_hibernation_restores: Arc::new(std::sync::Mutex::new(HashMap::new())),
 			ws_tx: Arc::new(tokio::sync::Mutex::new(
@@ -188,8 +188,11 @@ mod tests {
 				next_kv_request_id: 0,
 				sqlite_requests: HashMap::new(),
 				next_sqlite_request_id: 0,
+				remote_sqlite_requests: HashMap::new(),
+				next_remote_sqlite_request_id: 0,
 				request_to_actor: crate::utils::BufferMap::new(),
 				buffered_messages: Vec::new(),
+				processed_command_idx: HashMap::new(),
 			},
 			handle,
 		)

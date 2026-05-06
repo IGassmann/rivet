@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use rivet_api_builder::{ApiBadRequest, ApiCtx};
+use rivet_api_builder::ApiCtx;
 use rivet_api_types::{actors::list::*, pagination::Pagination};
 
 #[utoipa::path(
@@ -20,17 +20,9 @@ pub async fn list(ctx: ApiCtx, _path: (), query: ListQuery) -> Result<ListRespon
 			.actor_ids
 			.map(|x| {
 				x.split(',')
-					.map(|s| {
-						s.trim().parse::<rivet_util::Id>().map_err(|e| {
-							ApiBadRequest {
-								reason: format!("invalid id in `actor_ids` query: {e}"),
-							}
-							.build()
-						})
-					})
-					.collect::<Result<Vec<_>>>()
+					.filter_map(|s| s.trim().parse::<rivet_util::Id>().ok())
+					.collect::<Vec<_>>()
 			})
-			.transpose()?
 			.unwrap_or_default(),
 	]
 	.concat();
@@ -66,6 +58,13 @@ pub async fn list(ctx: ApiCtx, _path: (), query: ListQuery) -> Result<ListRespon
 
 		// Sort by create ts desc
 		actors.sort_by_cached_key(|x| std::cmp::Reverse(x.create_ts));
+
+		// Apply cursor (cursor is the create_ts of the last actor returned in the previous page;
+		// we want strictly older actors since results are sorted desc by create_ts)
+		if let Some(cursor) = query.cursor.as_deref() {
+			let cursor_ts: i64 = cursor.parse()?;
+			actors.retain(|actor| actor.create_ts < cursor_ts);
+		}
 
 		// Apply limit
 		actors.truncate(query.limit.unwrap_or(100));

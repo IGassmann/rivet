@@ -5,6 +5,7 @@ import { getHibernatableWebSocketAckState } from "@/common/websocket-test-hooks"
 import { setupDriverTest } from "./shared-utils";
 
 const HIBERNATABLE_ACK_SETTLE_TIMEOUT_MS = 12_000;
+const DRIVER_API_TOKEN = "dev";
 
 async function waitForJsonMessage(
 	ws: WebSocket,
@@ -426,6 +427,95 @@ describeDriverMatrix("Raw Websocket", (driverTestConfig) => {
 
 			// Check stats after close
 			expect(finalStats?.connectionCount).toBe(0);
+		});
+
+		test("should handle async onWebSocket open handler", async (c) => {
+			const { client, getRuntimeOutput } = await setupDriverTest(
+				c,
+				driverTestConfig,
+			);
+			const actor = client.rawWebSocketAsyncOpenActor.getOrCreate([
+				"async-open",
+			]);
+
+			const ws = await actor.webSocket();
+			const message = await waitForJsonMessage(ws, 5_000);
+
+			expect(message).toEqual({
+				type: "async-open",
+				openCount: 1,
+			});
+			expect(await actor.getOpenCount()).toBe(1);
+			expect(getRuntimeOutput()).not.toContain(
+				"undefined cannot be represented as a serde_json::Value",
+			);
+
+			ws.close();
+		});
+
+		test("should expose connection context in onWebSocket", async (c) => {
+			const { client } = await setupDriverTest(c, driverTestConfig);
+			const actor = client.rawWebSocketConnContextActor.getOrCreate([
+				"conn-context",
+			]);
+
+			const ws = await actor.webSocket();
+			const message = await waitForJsonMessage(ws, 5_000);
+
+			expect(message?.type).toBe("conn-context");
+			expect(typeof message?.connId).toBe("string");
+			expect(message?.state).toEqual({
+				opened: true,
+				connId: message?.connId,
+			});
+
+			ws.close();
+		});
+
+		test("force sleep disconnects non-hibernatable raw websocket", async (c) => {
+			const { client, endpoint, namespace } = await setupDriverTest(
+				c,
+				driverTestConfig,
+			);
+			const actor = client.rawWebSocketAsyncOpenActor.getOrCreate([
+				"force-sleep-disconnect",
+			]);
+			const ws = await actor.webSocket();
+			const ready = await waitForJsonMessage(ws, 5_000);
+			expect(ready?.type).toBe("async-open");
+			const actorId = await actor.resolve();
+
+			const closePromise = new Promise<CloseEvent>((resolve, reject) => {
+				const timeout = setTimeout(() => {
+					reject(new Error("timed out waiting for websocket close"));
+				}, 5_000);
+				ws.addEventListener("close", (event) => {
+					clearTimeout(timeout);
+					resolve(event);
+				}, {
+					once: true,
+				});
+			});
+			const response = await fetch(
+				`${endpoint}/actors/${encodeURIComponent(actorId)}/sleep?namespace=${encodeURIComponent(namespace)}`,
+				{
+					method: "POST",
+					headers: {
+						Authorization: `Bearer ${DRIVER_API_TOKEN}`,
+						"Content-Type": "application/json",
+					},
+					body: "{}",
+				},
+			);
+
+			if (!response.ok) {
+				throw new Error(
+					`failed to force actor sleep: ${response.status} ${await response.text()}`,
+				);
+			}
+			const closeEvent = await closePromise;
+			expect(closeEvent.code).not.toBe(1006);
+			expect(ws.readyState).toBe(WebSocket.CLOSED);
 		});
 
 		test("should properly handle onWebSocket open and close events", async (c) => {

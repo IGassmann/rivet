@@ -76,6 +76,21 @@ function classifyActorError(
 		);
 	}
 
+	if (
+		error.group === "guard" &&
+		isRetryableGuardGatewayHttpError(error.code)
+	) {
+		return buildLifecycleBoundaryInfo(
+			"request_retry",
+			"actor_error",
+			error.message,
+			{
+				group: error.group,
+				code: error.code,
+			},
+		);
+	}
+
 	// TODO(RVT-6193): Remove this legacy match after structured restart errors
 	// are authoritative everywhere.
 	if (
@@ -142,6 +157,17 @@ function classifyActorError(
 	}
 
 	return undefined;
+}
+
+function isRetryableGuardGatewayHttpError(code: string): boolean {
+	return (
+		code === "service_unavailable" ||
+		code === "actor_stopped_while_waiting" ||
+		code === "tunnel_request_aborted" ||
+		code === "tunnel_message_timeout" ||
+		code === "tunnel_response_closed" ||
+		code === "gateway_response_start_timeout"
+	);
 }
 
 function classifyTransportError(

@@ -103,6 +103,38 @@ pub struct ServiceUnavailable;
 #[derive(RivetError, Serialize, Deserialize)]
 #[error(
 	"guard",
+	"actor_stopped_while_waiting",
+	"Actor stopped while waiting for a response."
+)]
+pub struct ActorStoppedWhileWaiting;
+
+#[derive(RivetError, Serialize, Deserialize)]
+#[error("guard", "tunnel_request_aborted", "Actor tunnel aborted the request.")]
+pub struct TunnelRequestAborted;
+
+#[derive(RivetError, Serialize, Deserialize)]
+#[error("guard", "tunnel_message_timeout", "Actor tunnel message timed out.")]
+pub struct TunnelMessageTimeout;
+
+#[derive(RivetError, Serialize, Deserialize)]
+#[error(
+	"guard",
+	"tunnel_response_closed",
+	"Actor tunnel closed before sending a response."
+)]
+pub struct TunnelResponseClosed;
+
+#[derive(RivetError, Serialize, Deserialize)]
+#[error(
+	"guard",
+	"gateway_response_start_timeout",
+	"Timed out waiting for actor response start."
+)]
+pub struct GatewayResponseStartTimeout;
+
+#[derive(RivetError, Serialize, Deserialize)]
+#[error(
+	"guard",
 	"websocket_service_unavailable",
 	"WebSocket service unavailable."
 )]

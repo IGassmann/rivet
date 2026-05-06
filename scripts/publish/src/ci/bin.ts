@@ -65,10 +65,10 @@ program.name("ci").description("CI subcommands for the publish flow");
 program
 	.command("context-output")
 	.description("Resolve publish context and write to $GITHUB_OUTPUT")
-	.option("--trigger <trigger>", "Override trigger (pr|main|release)")
+	.option("--trigger <trigger>", "Override trigger (branch|release)")
 	.option("--version <version>", "Override version")
 	.option("--latest <bool>", "Override latest")
-	.option("--pr-number <number>", "Override PR number")
+	.option("--branch <name>", "Override branch name")
 	.action(async (opts) => {
 		const overrides: Parameters<typeof resolveContext>[0] = {};
 		if (opts.trigger) overrides.trigger = opts.trigger as Trigger;
@@ -76,10 +76,10 @@ program
 		if (opts.latest !== undefined) {
 			overrides.latest = opts.latest === "true";
 		}
-		if (opts.prNumber) overrides.prNumber = Number(opts.prNumber);
+		if (opts.branch) overrides.branch = opts.branch;
 		const ctx = await resolveContext(overrides);
 		log.info(
-			`resolved: trigger=${ctx.trigger} version=${ctx.version} npm_tag=${ctx.npmTag} sha=${ctx.sha} latest=${ctx.latest}${ctx.prNumber !== undefined ? ` pr=${ctx.prNumber}` : ""}`,
+			`resolved: trigger=${ctx.trigger} version=${ctx.version} npm_tag=${ctx.npmTag} sha=${ctx.sha} latest=${ctx.latest}${ctx.branch !== undefined ? ` branch=${ctx.branch}` : ""}`,
 		);
 		writeContextToGithubOutput(ctx);
 	});
@@ -296,16 +296,16 @@ program
 program
 	.command("comment-pr")
 	.description("Upsert the preview PR comment with install instructions")
-	.option("--pr-number <number>", "PR number (defaults to context)")
+	.requiredOption("--pr-number <number>", "PR number to comment on")
 	.option("--version <version>", "Version (defaults to context)")
 	.option("--tag <tag>", "npm dist-tag (defaults to context)")
 	.action(async (opts) => {
 		const ctx = await resolveContext();
-		const prNumber = opts.prNumber ? Number(opts.prNumber) : ctx.prNumber;
+		const prNumber = Number(opts.prNumber);
 		const version: string = opts.version ?? ctx.version;
 		const tag: string = opts.tag ?? ctx.npmTag;
-		if (typeof prNumber !== "number") {
-			throw new Error("comment-pr requires a PR number");
+		if (!Number.isFinite(prNumber)) {
+			throw new Error("comment-pr requires a numeric --pr-number");
 		}
 		const repo = process.env.GITHUB_REPOSITORY;
 		if (!repo) {

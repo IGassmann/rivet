@@ -3,9 +3,10 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 
+use crate::async_counter::AsyncCounter;
 use rivet_envoy_protocol as protocol;
-use rivet_util::async_counter::AsyncCounter;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
@@ -24,6 +25,7 @@ pub struct SharedContext {
 	pub envoy_key: String,
 	pub envoy_tx: mpsc::UnboundedSender<ToEnvoyMessage>,
 	pub actors: Arc<StdMutex<HashMap<String, HashMap<u32, SharedActorEntry>>>>,
+	pub actors_notify: Arc<Notify>,
 	pub live_tunnel_requests: Arc<StdMutex<HashMap<[u8; 8], String>>>,
 	pub pending_hibernation_restores:
 		Arc<StdMutex<HashMap<String, Vec<HibernatingWebSocketMetadata>>>>,

@@ -451,6 +451,31 @@ describeDriverMatrix("Actor Conn", (driverTestConfig) => {
 				await connection.dispose();
 			});
 
+			test("ready resolves when connection first opens", async (c) => {
+				const { client } = await setupDriverTest(c, driverTestConfig);
+
+				const handle = client.counter.getOrCreate(["test-ready"]);
+				const connection = handle.connect();
+				const ready = connection.ready;
+				let resolved = false;
+				ready.then(() => {
+					resolved = true;
+				});
+
+				expect(connection.ready).toBe(ready);
+				expect(connection.isConnected).toBe(false);
+				await Promise.resolve();
+				expect(resolved).toBe(false);
+
+				await ready;
+
+				expect(resolved).toBe(true);
+				expect(connection.isConnected).toBe(true);
+				expect(connection.ready).toBe(ready);
+
+				await connection.dispose();
+			});
+
 			test("onOpen should be called when connection opens", async (c) => {
 				const { client } = await setupDriverTest(c, driverTestConfig);
 

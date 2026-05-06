@@ -7,7 +7,7 @@
  *   2. Auto-detect or confirm `latest` flag
  *   3. Validate git working tree is clean
  *   4. Print release plan and confirm
- *   5. Update non-package.json source files (Cargo.toml, examples, sqlite-native)
+ *   5. Update non-package.json source files (Cargo.toml, examples)
  *   6. Rewrite every publishable package.json (via discovery)
  *   7. Run fern gen
  *   8. Run local type-check fail-fast
@@ -134,7 +134,7 @@ async function main() {
 	}
 
 	// 5. Update non-package.json source files.
-	log.info("updating source files (Cargo.toml, examples, sqlite-native)");
+	log.info("updating source files (Cargo.toml, examples)");
 	await updateSourceFiles(repoRoot, version);
 
 	// 6. Rewrite package.json version fields via discovery. Uses versionOnly
@@ -154,12 +154,11 @@ async function main() {
 		await $({
 			stdio: "inherit",
 			cwd: repoRoot,
-		})`pnpm build -F rivetkit -F @rivetkit/* -F !@rivetkit/shared-data -F !@rivetkit/engine-frontend -F !@rivetkit/mcp-hub -F !@rivetkit/sqlite-native -F !@rivetkit/sqlite-wasm -F !@rivetkit/rivetkit-napi`;
+		})`pnpm build -F rivetkit -F @rivetkit/* -F !@rivetkit/shared-data -F !@rivetkit/engine-frontend -F !@rivetkit/mcp-hub -F !@rivetkit/rivetkit-napi -F !@rivetkit/rivetkit-wasm`;
 		await $({
 			stdio: "inherit",
 			cwd: repoRoot,
-		})`npx turbo build:pack-inspector -F rivetkit`;
-		await $({ stdio: "inherit", cwd: repoRoot })`cargo check`;
+		})`cargo check --workspace --exclude rivetkit-wasm`;
 	}
 
 	if (opts.dryRun) {

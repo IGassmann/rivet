@@ -7,7 +7,7 @@ use parking_lot::RwLock;
 pub mod auth;
 pub(crate) mod protocol;
 
-pub use auth::{InspectorAuth, init_inspector_token};
+pub use auth::{InspectorAuth, init_inspector_token, set_test_inspector_token_override};
 
 type InspectorListener = Arc<dyn Fn(InspectorSignal) + Send + Sync>;
 

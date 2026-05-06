@@ -31,6 +31,33 @@ export type ActorActionFunction<
 	...args: Args extends [unknown, ...infer Rest] ? Rest : Args
 ) => Promise<Response>;
 
+export interface ActorGatewayOptions {
+	skipReadyWait?: boolean;
+}
+
+export type ResolvedActorGatewayOptions = Required<ActorGatewayOptions>;
+
+export function resolveActorGatewayOptions(
+	defaults: ActorGatewayOptions = {},
+	overrides?: ActorGatewayOptions,
+): ResolvedActorGatewayOptions {
+	const skipReadyWait = overrides?.skipReadyWait ?? defaults.skipReadyWait ?? false;
+
+	return {
+		skipReadyWait,
+	};
+}
+
+export interface ActorActionOptions extends ActorGatewayOptions {
+	signal?: AbortSignal;
+}
+
+export type ActorConnectOptions = ActorGatewayOptions;
+
+export type ActorFetchInit = RequestInit & ActorGatewayOptions;
+
+export type ActorWebSocketOptions = ActorGatewayOptions;
+
 /**
  * Maps action methods from actor definition to typed function signatures.
  */

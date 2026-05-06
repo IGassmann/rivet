@@ -16,7 +16,7 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub enum Operation {
-	Set {
+	SetValue {
 		key: Vec<u8>,
 		value: Vec<u8>,
 	},
@@ -68,7 +68,7 @@ impl TransactionOperations {
 	pub fn set(&self, key: &[u8], value: &[u8]) {
 		self.add_conflict_range(key, &end_of_key_range(key), ConflictRangeType::Write);
 
-		self.add_operation(Operation::Set {
+		self.add_operation(Operation::SetValue {
 			key: key.to_vec(),
 			value: value.to_vec(),
 		});
@@ -109,7 +109,7 @@ impl TransactionOperations {
 		// Iterate through operations in reverse order to find the most recent operation for this key
 		for op in self.operations().iter().rev() {
 			match op {
-				Operation::Set {
+				Operation::SetValue {
 					key: set_key,
 					value,
 				} if set_key.as_slice() == key => {
@@ -231,7 +231,7 @@ impl TransactionOperations {
 
 		for op in &*self.operations() {
 			match op {
-				Operation::Set { key, .. } => {
+				Operation::SetValue { key, .. } => {
 					local_keys.insert(key.clone(), ());
 				}
 				Operation::Clear { key } => {
@@ -356,7 +356,7 @@ impl TransactionOperations {
 		// Apply local operations
 		for op in &*self.operations() {
 			match op {
-				Operation::Set { key, value } => {
+				Operation::SetValue { key, value } => {
 					if key.as_slice() >= begin && key.as_slice() < end {
 						result_map.insert(key.clone(), value.clone());
 					}

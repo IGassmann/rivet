@@ -62,13 +62,14 @@ pub fn substitute_versionstamp(
 	versionstamp: Versionstamp,
 ) -> Result<(), String> {
 	const VERSIONSTAMP_MARKER: u8 = 0x33;
-	const VERSIONSTAMP_SIZE: usize = 12;
+	const VERSIONSTAMP_SIZE: usize = 10;
 
 	if packed_data.len() < 4 {
 		return Err("Packed data too short to contain versionstamp offset".to_string());
 	}
 
-	let offset_bytes = packed_data.split_off(packed_data.len() - 4);
+	let data_len = packed_data.len() - 4;
+	let offset_bytes = &packed_data[data_len..];
 	let offset = u32::from_le_bytes([
 		offset_bytes[0],
 		offset_bytes[1],
@@ -76,11 +77,10 @@ pub fn substitute_versionstamp(
 		offset_bytes[3],
 	]) as usize;
 
-	if offset >= packed_data.len() {
+	if offset >= data_len {
 		return Err(format!(
 			"Invalid versionstamp offset: {} exceeds data length {}",
-			offset,
-			packed_data.len()
+			offset, data_len
 		));
 	}
 
@@ -99,20 +99,55 @@ pub fn substitute_versionstamp(
 
 	let versionstamp_end = versionstamp_start + VERSIONSTAMP_SIZE;
 
-	if versionstamp_end > packed_data.len() {
+	if versionstamp_end > data_len {
 		return Err("Versionstamp extends beyond data bounds".to_string());
 	}
 
 	let existing_bytes = &packed_data[versionstamp_start..versionstamp_end];
 	if existing_bytes[0..10] != [0xff; 10] {
-		// Versionstamp is already complete, nothing to do
+		packed_data.truncate(data_len);
 		return Ok(());
 	}
 
 	let versionstamp_bytes = versionstamp.as_bytes();
-	packed_data[versionstamp_start..versionstamp_end].copy_from_slice(versionstamp_bytes);
+	packed_data[versionstamp_start..versionstamp_end].copy_from_slice(&versionstamp_bytes[..10]);
+	packed_data.truncate(data_len);
 
 	Ok(())
+}
+
+pub fn substitute_raw_versionstamp(
+	mut data: Vec<u8>,
+	versionstamp: &Versionstamp,
+) -> Result<Vec<u8>, String> {
+	if data.len() < 4 {
+		return Err("Packed data too short to contain versionstamp offset".to_string());
+	}
+
+	let data_len = data.len() - 4;
+	let offset_bytes = &data[data_len..];
+	let offset = u32::from_le_bytes([
+		offset_bytes[0],
+		offset_bytes[1],
+		offset_bytes[2],
+		offset_bytes[3],
+	]) as usize;
+	let versionstamp_len = 10;
+	let versionstamp_end = offset
+		.checked_add(versionstamp_len)
+		.ok_or_else(|| "Versionstamp offset overflowed".to_string())?;
+
+	if versionstamp_end > data_len {
+		return Err(format!(
+			"Invalid versionstamp offset: {} exceeds data length {}",
+			offset, data_len
+		));
+	}
+
+	data[offset..versionstamp_end].copy_from_slice(&versionstamp.as_bytes()[..versionstamp_len]);
+	data.truncate(data_len);
+
+	Ok(data)
 }
 
 pub fn pack_and_substitute_versionstamp<T: TuplePack>(
@@ -126,48 +161,4 @@ pub fn pack_and_substitute_versionstamp<T: TuplePack>(
 	substitute_versionstamp(&mut packed_data, versionstamp)?;
 
 	Ok(packed_data)
-}
-
-/// Checks if a value might contain an incomplete versionstamp and attempts to substitute it
-///
-/// This is a helper function for database drivers that want to support versionstamp substitution.
-/// It detects if a value contains an incomplete versionstamp by checking for the offset marker
-/// at the end, and substitutes it with a generated versionstamp.
-///
-/// Returns the potentially modified value. If the value doesn't contain a versionstamp marker
-/// or substitution fails, returns the original value.
-pub fn substitute_versionstamp_if_incomplete(mut value: Vec<u8>, user_version: u16) -> Vec<u8> {
-	// Check if the value contains an incomplete versionstamp
-	// An incomplete versionstamp has a 4-byte offset at the end
-	if value.len() >= 4 {
-		// Try to read the offset from the last 4 bytes
-		let offset_bytes = &value[value.len() - 4..];
-		let offset = u32::from_le_bytes([
-			offset_bytes[0],
-			offset_bytes[1],
-			offset_bytes[2],
-			offset_bytes[3],
-		]) as usize;
-
-		// Check if this could be a valid versionstamp offset
-		// The offset should point within the value (excluding the 4 offset bytes)
-		if offset < value.len() - 4 {
-			// Check for versionstamp marker at or near the offset
-			const VERSIONSTAMP_MARKER: u8 = 0x33;
-			let has_marker = value.get(offset) == Some(&VERSIONSTAMP_MARKER)
-				|| (offset > 0 && value.get(offset - 1) == Some(&VERSIONSTAMP_MARKER));
-
-			if has_marker {
-				// This looks like it contains an incomplete versionstamp
-				// Generate a versionstamp and substitute it
-				let versionstamp = generate_versionstamp(user_version);
-
-				// Substitute the versionstamp
-				// This will do nothing if the versionstamp is already complete
-				let _ = substitute_versionstamp(&mut value, versionstamp);
-			}
-		}
-	}
-
-	value
 }

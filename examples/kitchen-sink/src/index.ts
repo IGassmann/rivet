@@ -57,6 +57,7 @@ import {
 } from "./actors/http/raw-websocket.ts";
 import { rawFetchCounter } from "./actors/http/raw-fetch-counter.ts";
 import { rawWebSocketChatRoom } from "./actors/http/raw-websocket-chat-room.ts";
+import { rawWebSocketServerlessSmoke } from "./actors/http/raw-websocket-serverless-smoke.ts";
 // Lifecycle
 import {
 	runWithTicks,
@@ -116,11 +117,69 @@ import { testCounter } from "./actors/testing/test-counter.ts";
 import { testCounterSqlite } from "./actors/testing/test-counter-sqlite.ts";
 import { testSqliteLoad } from "./actors/testing/test-sqlite-load.ts";
 import { testSqliteBench } from "./actors/testing/test-sqlite-bench.ts";
+import { sqliteColdStartBench } from "./actors/testing/sqlite-cold-start-bench.ts";
+import { sqliteRealworldBench } from "./actors/testing/sqlite-realworld-bench.ts";
 import { rawSqliteFuzzer } from "./actors/testing/raw-sqlite-fuzzer.ts";
+import { sqliteMemoryPressure } from "./actors/testing/sqlite-memory-pressure.ts";
+import { mockAgenticLoop } from "./actors/testing/mock-agentic-loop.ts";
+import { sleepCloseFuzz } from "./actors/testing/sleep-close-fuzz.ts";
 // AI
 import { aiAgent } from "./actors/ai/ai-agent.ts";
 
+function numberFromEnv(name: string, fallback: number): number {
+	const value = process.env[name];
+	if (value === undefined || value === "") return fallback;
+
+	const parsed = Number(value);
+	if (!Number.isFinite(parsed)) {
+		throw new Error(`${name} must be a finite number`);
+	}
+
+	return parsed;
+}
+
+function serverlessPoolConfig() {
+	const url =
+		process.env.RIVET_SERVERLESS_URL ??
+		process.env.KITCHEN_SINK_SERVERLESS_URL ??
+		(process.env.RIVET_RUN_ENGINE === "1"
+			? "http://127.0.0.1:3000/api/rivet"
+			: undefined);
+
+	if (!url) return undefined;
+
+	return {
+		name: process.env.RIVET_POOL,
+		url,
+		requestLifespan: numberFromEnv(
+			"RIVET_SERVERLESS_REQUEST_LIFESPAN",
+			15 * 60,
+		),
+		drainGracePeriod: numberFromEnv(
+			"RIVET_SERVERLESS_DRAIN_GRACE_PERIOD",
+			15 * 60,
+		),
+		metadataPollInterval: numberFromEnv(
+			"RIVET_SERVERLESS_METADATA_POLL_INTERVAL_MS",
+			1000,
+		),
+		metadata: {
+			source: "kitchen-sink",
+			smoke: "raw-websocket-serverless",
+		},
+	};
+}
+
 export const registry = setup({
+	configurePool: serverlessPoolConfig(),
+	serverless: {
+		publicToken:
+			process.env.RIVET_PUBLIC_TOKEN ?? process.env.RIVET_TOKEN ?? "dev",
+		maxStartPayloadBytes: numberFromEnv(
+			"RIVET_SERVERLESS_MAX_START_PAYLOAD_BYTES",
+			16 * 1024 * 1024,
+		),
+	},
 	use: {
 		// Overview + state basics
 		counter,
@@ -166,6 +225,7 @@ export const registry = setup({
 		rawWebSocketBinaryActor,
 		rawFetchCounter,
 		rawWebSocketChatRoom,
+		rawWebSocketServerlessSmoke,
 		// Lifecycle and scheduling
 		runWithTicks,
 		runWithQueueConsumer,
@@ -213,7 +273,12 @@ export const registry = setup({
 		testCounterSqlite,
 		testSqliteLoad,
 		testSqliteBench,
+		sqliteColdStartBench,
+		sqliteRealworldBench,
 		rawSqliteFuzzer,
+		sqliteMemoryPressure,
+		mockAgenticLoop,
+		sleepCloseFuzz,
 		// AI
 		aiAgent,
 	},

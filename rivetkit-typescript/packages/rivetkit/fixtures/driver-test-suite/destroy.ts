@@ -87,3 +87,32 @@ export const destroyActor = actor({
 		},
 	},
 });
+
+export const destroyAbortSignalActor = actor({
+	state: {
+		abortEventCount: 0,
+	},
+	onDestroy: async (c) => {
+		const client = c.client<typeof registry>();
+		const observer = client.destroyObserver.getOrCreate(["observer"]);
+		await observer.notifyDestroyed(c.key.join("/"));
+	},
+	actions: {
+		requestDestroy: (c) => {
+			const beforeDestroyAborted = c.aborted;
+			const beforeDestroySignalAborted = c.abortSignal.aborted;
+			c.abortSignal.addEventListener("abort", () => {
+				c.state.abortEventCount += 1;
+			});
+			c.destroy();
+
+			return {
+				beforeDestroyAborted,
+				beforeDestroySignalAborted,
+				afterDestroyAborted: c.aborted,
+				afterDestroySignalAborted: c.abortSignal.aborted,
+				abortEventCountAfterDestroy: c.state.abortEventCount,
+			};
+		},
+	},
+});

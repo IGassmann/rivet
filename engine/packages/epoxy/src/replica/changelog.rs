@@ -14,7 +14,7 @@ use crate::keys::{
 };
 use crate::metrics;
 
-#[tracing::instrument(skip_all, fields(%replica_id, key = ?key))]
+#[tracing::instrument(skip_all, fields(%replica_id, key=hex::encode(&key)))]
 pub fn append(
 	replica_id: protocol::ReplicaId,
 	tx: &Transaction,
@@ -89,6 +89,9 @@ pub async fn apply_entry(
 	tx: &Transaction,
 	replica_id: protocol::ReplicaId,
 	entry: protocol::ChangelogEntry,
+	append_new_entry: bool,
+	ignore_version: bool,
+	ignore_immutable: bool,
 ) -> Result<()> {
 	let tx = tx.with_subspace(keys::subspace(replica_id));
 	let value_key = KvValueKey::new(entry.key.clone());
@@ -98,18 +101,20 @@ pub async fn apply_entry(
 	let cache_key = KvOptimisticCacheKey::new(entry.key.clone());
 
 	if let Some(existing_value) = tx.read_opt(&value_key, Serializable).await? {
-		if !existing_value.mutable && existing_value.value == entry.value {
+		if !ignore_immutable && !existing_value.mutable && existing_value.value == entry.value {
 			return Ok(());
 		}
 
 		if !existing_value.mutable && existing_value.value != entry.value {
 			tracing::warn!(
-				"changelog catch-up saw conflicting committed value for immutable key {:?}",
-				value_key.key()
+				key = hex::encode(value_key.key()),
+				existing_version = existing_value.version,
+				entry_version = entry.version,
+				"changelog catch-up saw conflicting committed value for immutable key",
 			);
 		}
 
-		if entry.version <= existing_value.version {
+		if !ignore_version && entry.version <= existing_value.version {
 			return Ok(());
 		}
 	}
@@ -128,14 +133,17 @@ pub async fn apply_entry(
 		tx.delete(&ballot_key);
 		tx.delete(&cache_key);
 	}
-	append(
-		replica_id,
-		&tx,
-		entry.key,
-		entry.value,
-		entry.version,
-		entry.mutable,
-	)?;
+
+	if append_new_entry {
+		append(
+			replica_id,
+			&tx,
+			entry.key,
+			entry.value,
+			entry.version,
+			entry.mutable,
+		)?;
+	}
 
 	Ok(())
 }

@@ -19,9 +19,10 @@ import {
 	promiseActor,
 	syncActionActor,
 } from "./action-types";
-import { dbActorRaw } from "./actor-db-raw";
+import { dbActorRaw, dbRemoteLifecycleProbe } from "./actor-db-raw";
 import { onStateChangeActor } from "./actor-onstatechange";
 import { connErrorSerializationActor } from "./conn-error-serialization";
+import { connPreflightVisibilityActor } from "./conn-preflight-visibility";
 import {
 	dbInitOrderCreateStateActor,
 	dbInitOrderCreateVarsActor,
@@ -42,7 +43,11 @@ import {
 	dbLifecycleFailing,
 	dbLifecycleObserver,
 } from "./db-lifecycle";
-import { destroyActor, destroyObserver } from "./destroy";
+import {
+	destroyAbortSignalActor,
+	destroyActor,
+	destroyObserver,
+} from "./destroy";
 import { customTimeoutActor, errorHandlingActor } from "./error-handling";
 import { fileSystemHibernationCleanupActor } from "./file-system-hibernation-cleanup";
 import { hibernationActor, hibernationSleepWindowActor } from "./hibernation";
@@ -71,7 +76,12 @@ import {
 	rawHttpVoidReturnActor,
 } from "./raw-http";
 import { rawHttpRequestPropertiesActor } from "./raw-http-request-properties";
-import { rawWebSocketActor, rawWebSocketBinaryActor } from "./raw-websocket";
+import {
+	rawWebSocketActor,
+	rawWebSocketAsyncOpenActor,
+	rawWebSocketBinaryActor,
+	rawWebSocketConnContextActor,
+} from "./raw-websocket";
 import { rejectConnectionActor } from "./reject-connection";
 import { requestAccessActor } from "./request-access";
 import {
@@ -96,11 +106,13 @@ import {
 	sleepWithRawHttp,
 	sleepWithRawWebSocket,
 	sleepWithWaitUntilMessage,
+	counterWaitUntilProbe,
 	sleepRawWsOnClose,
 	sleepRawWsOnMessage,
 	sleepRawWsSendOnSleep,
 	sleepRawWsDelayedSendOnSleep,
 	sleepWithWaitUntilInOnWake,
+	sleepAbortListenerVarsActor,
 } from "./sleep";
 import {
 	sleepWithDb,
@@ -120,6 +132,7 @@ import {
 	sleepWaitUntilState,
 	sleepWithRawWs,
 	sleepWsActiveDbExceedsGrace,
+	sleepKeepAwakeUntilIdle,
 } from "./sleep-db";
 import { saveStateActor, saveStateObserver } from "./save-state";
 import { lifecycleObserver, startStopRaceActor } from "./start-stop-race";
@@ -196,6 +209,8 @@ export const registry = setup({
 		sleepRawWsSendOnSleep,
 		sleepRawWsDelayedSendOnSleep,
 		sleepWithWaitUntilInOnWake,
+		sleepAbortListenerVarsActor,
+		counterWaitUntilProbe,
 		// From sleep-db.ts
 		sleepWithDb,
 		sleepWithSlowScheduledDb,
@@ -214,6 +229,7 @@ export const registry = setup({
 		sleepWsMessageExceedsGrace,
 		sleepWsConcurrentDbExceedsGrace,
 		sleepWsActiveDbExceedsGrace,
+		sleepKeepAwakeUntilIdle,
 		saveStateActor,
 		saveStateObserver,
 		// From error-handling.ts
@@ -243,6 +259,8 @@ export const registry = setup({
 		counterWithParams,
 		// From conn-state.ts
 		connStateActor,
+		// From conn-preflight-visibility.ts
+		connPreflightVisibilityActor,
 		// From metadata.ts
 		metadataActor,
 		// From vars.ts
@@ -260,7 +278,9 @@ export const registry = setup({
 		rawHttpRequestPropertiesActor,
 		// From raw-websocket.ts
 		rawWebSocketActor,
+		rawWebSocketAsyncOpenActor,
 		rawWebSocketBinaryActor,
+		rawWebSocketConnContextActor,
 		// From reject-connection.ts
 		rejectConnectionActor,
 		// From request-access.ts
@@ -270,6 +290,7 @@ export const registry = setup({
 		// From destroy.ts
 		destroyActor,
 		destroyObserver,
+		destroyAbortSignalActor,
 		// From hibernation.ts
 		hibernationActor,
 		hibernationSleepWindowActor,
@@ -310,6 +331,7 @@ export const registry = setup({
 		workflowSpawnParentActor,
 		// From actor-db-raw.ts
 		dbActorRaw,
+		dbRemoteLifecycleProbe,
 		// From db-lifecycle.ts
 		dbLifecycle,
 		dbLifecycleFailing,

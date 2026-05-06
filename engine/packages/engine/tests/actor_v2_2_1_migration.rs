@@ -1,12 +1,17 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
+use depot::{
+	conveyer::{Db, branch as depot_branch},
+	keys::{branch_meta_head_key, meta_head_key},
+	types::{BucketId, SQLITE_PAGE_SIZE, decode_db_head},
+};
 use gas::prelude::*;
 use pegboard::actor_kv::Recipient;
 use rivet_envoy_protocol as protocol;
+use rivet_pools::NodeId;
 use rusqlite::Connection;
 use serde::Deserialize;
-use sqlite_storage::{engine::SqliteEngine, open::OpenConfig, types::SqliteOrigin};
 use test_snapshot::SnapshotTestCtx;
 
 const SNAPSHOT_NAME: &str = "actor-v2-2-1-baseline";
@@ -43,8 +48,6 @@ async fn actor_v2_2_1_baseline_migrates_to_current_layout() -> Result<()> {
 
 	let db = (*ctx.udb()?).clone();
 	let standalone_ctx = ctx.standalone()?;
-	let (sqlite_engine, _compaction_rx) =
-		SqliteEngine::new(db.clone(), pegboard::actor_sqlite::sqlite_subspace());
 	let mut start = protocol::CommandStartActor {
 		config: protocol::ActorConfig {
 			name: actor.name.clone(),
@@ -54,7 +57,6 @@ async fn actor_v2_2_1_baseline_migrates_to_current_layout() -> Result<()> {
 		},
 		hibernating_requests: Vec::new(),
 		preloaded_kv: None,
-		sqlite_startup_data: None,
 	};
 
 	let migration = pegboard::actor_sqlite::migrate_v1_to_v2(
@@ -68,15 +70,6 @@ async fn actor_v2_2_1_baseline_migrates_to_current_layout() -> Result<()> {
 	.await?;
 	assert!(migration.migrated);
 
-	let sqlite_open = sqlite_engine
-		.open(
-			&actor.actor_id.to_string(),
-			OpenConfig::new(util::timestamp::now()),
-		)
-		.await?;
-	let sqlite_startup_data =
-		pegboard_envoy::sqlite_runtime::protocol_sqlite_startup_data(sqlite_open);
-	ensure!(start.sqlite_startup_data.is_none());
 	ensure!(start.preloaded_kv.is_none());
 	start.preloaded_kv = pegboard::actor_kv::preload::fetch_preloaded_kv(
 		&db,
@@ -86,18 +79,11 @@ async fn actor_v2_2_1_baseline_migrates_to_current_layout() -> Result<()> {
 		&start.config.name,
 	)
 	.await?;
-	start.sqlite_startup_data = Some(sqlite_startup_data);
 
-	assert!(start.sqlite_startup_data.is_some());
 	assert_eq!(
-		sqlite_engine
-			.load_head(&actor.actor_id.to_string())
-			.await?
-			.origin,
-		SqliteOrigin::MigratedFromV1
-	);
-	assert_eq!(
-		query_sqlite_notes(&load_v2_sqlite_bytes(&sqlite_engine, actor.actor_id).await?)?,
+		query_sqlite_notes(
+			&load_v2_sqlite_bytes(&db, namespace.namespace_id, actor.actor_id).await?
+		)?,
 		vec!["sqlite-from-v2.2.1"]
 	);
 
@@ -221,22 +207,57 @@ where
 	Ok(serde_bare::from_slice(&bytes[2..])?)
 }
 
-async fn load_v2_sqlite_bytes(engine: &SqliteEngine, actor_id: Id) -> Result<Vec<u8>> {
+fn actor_db(db: &universaldb::Database, namespace_id: Id, actor_id: &str) -> Db {
+	Db::new(
+		Arc::new(db.clone()),
+		namespace_id,
+		actor_id.to_string(),
+		NodeId::new(),
+	)
+}
+
+async fn load_v2_sqlite_bytes(
+	db: &universaldb::Database,
+	namespace_id: Id,
+	actor_id: Id,
+) -> Result<Vec<u8>> {
 	let actor_id = actor_id.to_string();
-	let meta = engine.load_meta(&actor_id).await?;
-	let pages = engine
-		.get_pages(
-			&actor_id,
-			meta.generation,
-			(1..=meta.db_size_pages).collect(),
-		)
+	let actor_id_for_tx = actor_id.clone();
+	let head = db
+		.run(move |tx| {
+			let actor_id = actor_id_for_tx.clone();
+			let bucket_id = BucketId::from_gas_id(namespace_id);
+			async move {
+				let key = if let Some(branch_id) = depot_branch::resolve_database_branch(
+					&tx,
+					bucket_id,
+					&actor_id,
+					universaldb::utils::IsolationLevel::Snapshot,
+				)
+				.await?
+				{
+					branch_meta_head_key(branch_id)
+				} else {
+					meta_head_key(&actor_id)
+				};
+				let bytes = tx
+					.informal()
+					.get(&key, universaldb::utils::IsolationLevel::Snapshot)
+					.await?
+					.context("sqlite v2 head should exist")?;
+				decode_db_head(bytes.as_ref())
+			}
+		})
 		.await?;
-	let mut bytes = Vec::with_capacity(meta.db_size_pages as usize * meta.page_size as usize);
+	let pages = actor_db(db, namespace_id, &actor_id)
+		.get_pages((1..=head.db_size_pages).collect())
+		.await?;
+	let mut bytes = Vec::with_capacity(head.db_size_pages as usize * SQLITE_PAGE_SIZE as usize);
 	for page in pages {
 		bytes.extend_from_slice(
 			&page
 				.bytes
-				.unwrap_or_else(|| vec![0; meta.page_size as usize]),
+				.unwrap_or_else(|| vec![0; SQLITE_PAGE_SIZE as usize]),
 		);
 	}
 	Ok(bytes)

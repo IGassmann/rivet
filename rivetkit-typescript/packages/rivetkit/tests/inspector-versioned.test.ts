@@ -1,17 +1,24 @@
-import { describe, expect, test } from "vitest";
-import { ActorContext } from "@rivetkit/rivetkit-napi";
-import type { WorkflowHistory } from "@/common/bare/transport/v1";
+import { beforeAll, describe, expect, test } from "vitest";
 import * as v1 from "@/common/bare/generated/inspector/v1";
 import * as v2 from "@/common/bare/generated/inspector/v2";
 import * as v3 from "@/common/bare/generated/inspector/v3";
 import * as v4 from "@/common/bare/generated/inspector/v4";
+import type { WorkflowHistory } from "@/common/bare/transport/v1";
 import {
 	decodeWorkflowHistoryTransport,
 	encodeWorkflowHistoryTransport,
 } from "@/common/inspector-transport";
+import { loadNapiRuntime, type NapiCoreRuntime } from "@/registry/napi-runtime";
+import type { ActorContextHandle } from "@/registry/runtime";
 
 const INSPECTOR_CURRENT_VERSION = 4;
-const ctx = new ActorContext("actor-1", "inspector", "local");
+let runtime: NapiCoreRuntime;
+let ctx: ActorContextHandle;
+
+beforeAll(async () => {
+	({ runtime } = await loadNapiRuntime());
+	ctx = runtime.createTestActorContext("actor-1", "inspector", "local");
+});
 
 function buffer(text: string): ArrayBuffer {
 	return new TextEncoder().encode(text).buffer;
@@ -26,7 +33,7 @@ function toBuffer(value: ArrayBuffer | Uint8Array): Buffer {
 function decodeRequest(bytes: Uint8Array, version: number): v4.ToServer {
 	return v4.decodeToServer(
 		new Uint8Array(
-			ctx.decodeInspectorRequest(toBuffer(bytes), version),
+			runtime.actorDecodeInspectorRequest(ctx, toBuffer(bytes), version),
 		),
 	);
 }
@@ -36,7 +43,8 @@ function encodeResponse(
 	version: 1 | 2 | 3 | 4,
 ): Uint8Array {
 	return new Uint8Array(
-		ctx.encodeInspectorResponse(
+		runtime.actorEncodeInspectorResponse(
+			ctx,
 			toBuffer(v4.encodeToClient(message)),
 			version,
 		),
@@ -67,7 +75,9 @@ describe("inspector versioned protocol", () => {
 					: version === 2
 						? v2.encodeToServer(request as unknown as v2.ToServer)
 						: version === 3
-							? v3.encodeToServer(request as unknown as v3.ToServer)
+							? v3.encodeToServer(
+									request as unknown as v3.ToServer,
+								)
 							: v4.encodeToServer(request);
 			const decoded = decodeRequest(bytes, version);
 

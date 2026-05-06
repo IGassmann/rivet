@@ -25,6 +25,10 @@ declare global {
 	const navigator: any;
 	const window: Window | undefined;
 
+	namespace WebAssembly {
+		class Module {}
+	}
+
 	const document: {
 		getElementById(id: string): HTMLElement | null;
 		createElement(tag: "script"): HTMLScriptElement;

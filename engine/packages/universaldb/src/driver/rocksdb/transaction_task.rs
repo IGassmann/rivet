@@ -11,10 +11,10 @@ use crate::{
 	atomic::apply_atomic_op,
 	error::DatabaseError,
 	key_selector::KeySelector,
-	options::ConflictRangeType,
+	options::{ConflictRangeType, MutationType},
 	tx_ops::Operation,
 	value::{KeyValue, Slice, Values},
-	versionstamp::substitute_versionstamp_if_incomplete,
+	versionstamp::{generate_versionstamp, substitute_raw_versionstamp},
 };
 
 pub enum TransactionCommand {
@@ -314,16 +314,12 @@ impl TransactionTask {
 	) -> Result<()> {
 		// Create a new transaction for this commit
 		let txn = self.create_transaction();
+		let transaction_versionstamp = generate_versionstamp(0);
 
 		// Apply all operations to the transaction
 		for op in operations {
 			match op {
-				Operation::Set { key, value } => {
-					// Substitute versionstamp if incomplete
-					// For now, just use the simple substitution - we can improve this later
-					// to ensure all versionstamps in a transaction have the same base timestamp
-					let value = substitute_versionstamp_if_incomplete(value.clone(), 0);
-
+				Operation::SetValue { key, value } => {
 					txn.put(key, &value)
 						.context("failed to set key in rocksdb")?;
 				}
@@ -353,6 +349,24 @@ impl TransactionTask {
 					param,
 					op_type,
 				} => {
+					if matches!(op_type, MutationType::SetVersionstampedKey) {
+						let key = substitute_raw_versionstamp(key, &transaction_versionstamp)
+							.map_err(anyhow::Error::msg)
+							.context("failed substituting versionstamped key")?;
+						txn.put(key, &param)
+							.context("failed to set versionstamped key in rocksdb")?;
+						continue;
+					}
+
+					if matches!(op_type, MutationType::SetVersionstampedValue) {
+						let value = substitute_raw_versionstamp(param, &transaction_versionstamp)
+							.map_err(anyhow::Error::msg)
+							.context("failed substituting versionstamped value")?;
+						txn.put(key, &value)
+							.context("failed to set versionstamped value in rocksdb")?;
+						continue;
+					}
+
 					// Get the current value from the database
 					let read_opts = ReadOptions::default();
 					let current_value = txn

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rivet_envoy_client::actor::ToActor;
+use rivet_envoy_client::async_counter::AsyncCounter;
 use rivet_envoy_client::commands::handle_commands;
 use rivet_envoy_client::config::{
 	BoxFuture, EnvoyCallbacks, EnvoyConfig, HttpRequest, HttpResponse, WebSocketHandler,
@@ -10,9 +11,12 @@ use rivet_envoy_client::config::{
 use rivet_envoy_client::context::{SharedContext, WsTxMessage};
 use rivet_envoy_client::envoy::EnvoyContext;
 use rivet_envoy_client::handle::EnvoyHandle;
-use rivet_envoy_client::utils::BufferMap;
+use rivet_envoy_client::sqlite::{
+	RemoteSqliteRequest, fail_sent_remote_sqlite_requests_with_indeterminate_result,
+	handle_remote_sqlite_request,
+};
+use rivet_envoy_client::utils::{BufferMap, RemoteSqliteIndeterminateResultError};
 use rivet_envoy_protocol as protocol;
-use rivet_util::async_counter::AsyncCounter;
 use tokio::sync::mpsc;
 
 struct IdleCallbacks;
@@ -25,7 +29,6 @@ impl EnvoyCallbacks for IdleCallbacks {
 		_generation: u32,
 		_config: protocol::ActorConfig,
 		_preloaded_kv: Option<protocol::PreloadedKv>,
-		_sqlite_startup_data: Option<protocol::SqliteStartupData>,
 	) -> BoxFuture<anyhow::Result<()>> {
 		Box::pin(async { Ok(()) })
 	}
@@ -88,6 +91,7 @@ fn new_envoy_context() -> EnvoyContext {
 		envoy_key: "test-envoy".to_string(),
 		envoy_tx,
 		actors: Arc::new(std::sync::Mutex::new(HashMap::new())),
+		actors_notify: Arc::new(tokio::sync::Notify::new()),
 		live_tunnel_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
 		pending_hibernation_restores: Arc::new(std::sync::Mutex::new(HashMap::new())),
 		ws_tx: Arc::new(tokio::sync::Mutex::new(
@@ -106,6 +110,8 @@ fn new_envoy_context() -> EnvoyContext {
 		next_kv_request_id: 0,
 		sqlite_requests: HashMap::new(),
 		next_sqlite_request_id: 0,
+		remote_sqlite_requests: HashMap::new(),
+		next_remote_sqlite_request_id: 0,
 		request_to_actor: BufferMap::new(),
 		buffered_messages: Vec::new(),
 		processed_command_idx: HashMap::new(),
@@ -122,6 +128,20 @@ fn stop_command(actor_id: &str, generation: u32, index: i64) -> protocol::Comman
 		inner: protocol::Command::CommandStopActor(protocol::CommandStopActor {
 			reason: protocol::StopActorReason::StopIntent,
 		}),
+	}
+}
+
+fn execute_request() -> protocol::SqliteExecuteRequest {
+	protocol::SqliteExecuteRequest {
+		namespace_id: "test".to_string(),
+		actor_id: "actor-replay".to_string(),
+		generation: 1,
+		sql: "insert into test values (?)".to_string(),
+		params: Some(vec![protocol::SqliteBindParam::SqliteValueText(
+			protocol::SqliteValueText {
+				value: "value".to_string(),
+			},
+		)]),
 	}
 }
 
@@ -201,4 +221,48 @@ async fn dedup_is_per_actor_and_generation() {
 	// Different actor_id, same index: not deduped.
 	handle_commands(&mut ctx, vec![stop_command("actor-b", 1, 5)]).await;
 	assert!(rx_b1.try_recv().is_ok());
+}
+
+#[tokio::test]
+async fn replayed_command_is_dropped_after_remote_sql_lost_response() {
+	let mut ctx = new_envoy_context();
+	let (actor_tx, mut actor_rx) = mpsc::unbounded_channel::<ToActor>();
+	ctx.insert_actor(
+		"actor-replay".to_string(),
+		1,
+		actor_tx,
+		Arc::new(AsyncCounter::new()),
+		"actor-replay".to_string(),
+		-1,
+	);
+
+	let (ws_tx, mut ws_rx) = mpsc::unbounded_channel();
+	*ctx.shared.ws_tx.lock().await = Some(ws_tx);
+	let (sql_tx, sql_rx) = tokio::sync::oneshot::channel();
+	handle_remote_sqlite_request(
+		&mut ctx,
+		RemoteSqliteRequest::Execute(execute_request()),
+		sql_tx,
+	)
+	.await;
+	assert!(matches!(ws_rx.recv().await, Some(WsTxMessage::Send(_))));
+
+	handle_commands(&mut ctx, vec![stop_command("actor-replay", 1, 5)]).await;
+	assert!(matches!(
+		actor_rx.try_recv(),
+		Ok(ToActor::Stop { command_idx: 5, .. })
+	));
+
+	fail_sent_remote_sqlite_requests_with_indeterminate_result(&mut ctx);
+	let err = sql_rx
+		.await
+		.expect("response sender should complete")
+		.expect_err("sent remote SQL should become indeterminate");
+	assert!(
+		err.downcast_ref::<RemoteSqliteIndeterminateResultError>()
+			.is_some()
+	);
+
+	handle_commands(&mut ctx, vec![stop_command("actor-replay", 1, 5)]).await;
+	assert!(actor_rx.try_recv().is_err());
 }

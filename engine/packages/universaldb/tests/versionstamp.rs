@@ -18,7 +18,7 @@ fn test_generate_versionstamp() {
 
 #[test]
 fn test_substitute_versionstamp_success() {
-	let incomplete = Versionstamp::from([0xff; 12]);
+	let incomplete = Versionstamp::incomplete(100);
 	let tuple = vec![
 		Element::String("mykey".into()),
 		Element::Versionstamp(incomplete),
@@ -100,8 +100,78 @@ fn test_substitute_versionstamp_already_complete() {
 }
 
 #[test]
+fn test_substitute_raw_versionstamp_trims_explicit_operand_offset() {
+	let versionstamp = generate_versionstamp(100);
+	let mut param = b"prefix".to_vec();
+	let offset = param.len() as u32;
+	param.extend_from_slice(&[0xff; 10]);
+	param.extend_from_slice(b"suffix");
+	param.extend_from_slice(&offset.to_le_bytes());
+
+	let substituted = substitute_raw_versionstamp(param.clone(), &versionstamp).unwrap();
+
+	assert_eq!(substituted.len(), param.len() - 4);
+	assert_eq!(&substituted[..offset as usize], b"prefix");
+	assert_eq!(
+		&substituted[offset as usize..offset as usize + 10],
+		&versionstamp.as_bytes()[..10]
+	);
+	assert_eq!(&substituted[offset as usize + 10..], b"suffix");
+}
+
+#[test]
+fn test_substitute_raw_versionstamp_matches_fdb_metadata_value_operand() {
+	let versionstamp = generate_versionstamp(100);
+	let mut param = vec![0; 14];
+	param[10..].copy_from_slice(&0u32.to_le_bytes());
+
+	let substituted = substitute_raw_versionstamp(param, &versionstamp).unwrap();
+
+	assert_eq!(substituted, versionstamp.as_bytes()[..10]);
+}
+
+#[test]
+fn test_substitute_raw_versionstamp_preserves_depot_suffix_bytes() {
+	let versionstamp = generate_versionstamp(100);
+	let mut param = vec![0xff; 10];
+	param.extend_from_slice(&[0; 6]);
+	param.extend_from_slice(&0u32.to_le_bytes());
+
+	let substituted = substitute_raw_versionstamp(param, &versionstamp).unwrap();
+
+	assert_eq!(substituted.len(), 16);
+	assert_eq!(&substituted[..10], &versionstamp.as_bytes()[..10]);
+	assert_eq!(&substituted[10..], &[0; 6]);
+}
+
+#[test]
+fn test_substitute_versionstamp_matches_official_tuple_operand_layout() {
+	let tuple = ("prefix", Versionstamp::incomplete(12345), "suffix");
+	let mut ours = pack_with_versionstamp(&tuple);
+	let official = ours.clone();
+	let versionstamp = generate_versionstamp(54321);
+
+	substitute_versionstamp(&mut ours, versionstamp.clone()).unwrap();
+
+	let offset_start = official.len() - 4;
+	let offset = u32::from_le_bytes(
+		official[offset_start..]
+			.try_into()
+			.expect("official tuple offset should be four bytes"),
+	) as usize;
+	let mut expected = official[..offset_start].to_vec();
+	expected[offset..offset + 10].copy_from_slice(&versionstamp.as_bytes()[..10]);
+
+	assert_eq!(ours, expected);
+
+	let unpacked: (String, Versionstamp, String) = unpack(&ours).unwrap();
+	assert!(unpacked.1.is_complete());
+	assert_eq!(unpacked.1.user_version(), 12345);
+}
+
+#[test]
 fn test_pack_and_substitute_versionstamp() {
-	let incomplete = Versionstamp::from([0xff; 12]);
+	let incomplete = Versionstamp::incomplete(100);
 	let tuple = vec![
 		Element::String("mykey".into()),
 		Element::Versionstamp(incomplete),
@@ -155,8 +225,6 @@ fn test_versionstamp_incomplete_preserves_user_version() {
 		"User version bytes should match"
 	);
 
-	// Test with substitute_versionstamp - the user version from the incomplete versionstamp
-	// should be ignored and replaced with the one from the generated versionstamp
 	let tuple = vec![
 		Element::String("test".into()),
 		Element::Versionstamp(incomplete),
@@ -172,11 +240,10 @@ fn test_versionstamp_incomplete_preserves_user_version() {
 	match &unpacked[1] {
 		Element::Versionstamp(v) => {
 			assert!(v.is_complete());
-			// The user version should be from the generated versionstamp, not the original incomplete one
 			assert_eq!(
 				v.user_version(),
-				new_user_version,
-				"Substituted versionstamp should have the new user version"
+				user_version,
+				"Substituted versionstamp should preserve the tuple user version"
 			);
 		}
 		_ => panic!("Expected versionstamp"),

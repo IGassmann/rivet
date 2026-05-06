@@ -82,4 +82,7 @@ export const lifecycleObserver = actor({
 			c.state.events = [];
 		},
 	},
+	options: {
+		noSleep: true,
+	},
 });

@@ -257,7 +257,7 @@ File tags: `0x00` main DB, `0x01` rollback journal, `0x02` WAL, `0x03` SHM. The 
 
 **v2 slow path.** Large commits that don't fit the one-shot path encode delta blocks as full LTX v3 frames and stuff them directly under the DELTA chunk keys. There is no `/STAGE` prefix, no fixed one-chunk-per-page mapping. A chunk key may contain a raw 4 KiB page *or* an LTX frame; the v3 decoder handles both.
 
-**The parity invariant.** The native Rust VFS and the WASM TypeScript VFS (`rivetkit-typescript/packages/sqlite-wasm/src/vfs.ts` + `kv.ts`) must be byte-for-byte identical: same chunk size, same key encoding, same PRAGMA settings, same delete-range strategy for truncate, same journal mode. When you change one, change the other in the same commit. A database written by the Rust VFS must be readable by the WASM VFS.
+**Native-only.** The VFS lives only in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`. There is no runtime WASM/TypeScript VFS — the `@rivetkit/sqlite-wasm` npm package is deprecated and the Rust crate is statically linked into `@rivetkit/rivetkit-napi` via `libsqlite3-sys`. Per-VFS rules (4 KiB chunks, `journal_mode=DELETE`, `locking_mode=EXCLUSIVE`, `auto_vacuum=NONE`) live in this one source.
 
 ---
 
@@ -393,7 +393,7 @@ Consolidated from the above:
 1. KV internal prefixes (`[1]`, `[2]*`, `[5]*`, `[0x08]*`) are reserved. No runtime enforcement. User writes into them corrupt the actor.
 2. `enqueue_and_wait` completion waits ignore the actor abort token. Breaking this breaks hibernation.
 3. Queue metadata rebuilds by full-scan on decode failure. Slow, safe, never lose messages.
-4. Native SQLite VFS and WASM SQLite VFS must match byte-for-byte. Chunk size, key layout, PRAGMAs, truncate strategy, journal mode.
+4. SQLite VFS is native-only (`rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`). Chunk size, key layout, PRAGMAs, truncate strategy, journal mode all live here.
 5. Raw `onRequest` HTTP bypasses message-size limits. Action and queue routes do not.
 6. Static native actor HTTP flows through `RegistryDispatcher::handle_fetch`, not `actor/event.rs`. Sleep-timer fixes need both entry points.
 7. WebSocket message/close callbacks run inline under the callback guard, not as dispatch events.

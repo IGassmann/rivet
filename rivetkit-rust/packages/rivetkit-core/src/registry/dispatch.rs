@@ -1,5 +1,6 @@
 use super::*;
 use crate::error::ActorLifecycle as ActorLifecycleError;
+use crate::time;
 
 pub(super) async fn dispatch_action_through_task(
 	dispatch: &mpsc::Sender<DispatchCommand>,
@@ -61,7 +62,7 @@ pub(super) async fn with_action_dispatch_timeout<T, F>(
 where
 	F: std::future::Future<Output = std::result::Result<T, ActionDispatchError>>,
 {
-	tokio::time::timeout(duration, future)
+	time::timeout(duration, future)
 		.await
 		.map_err(|_| ActionDispatchError::from_anyhow(ActionTimedOut.build()))?
 }
@@ -73,7 +74,7 @@ pub(super) async fn with_framework_action_timeout<T, F>(
 where
 	F: std::future::Future<Output = Result<T>>,
 {
-	tokio::time::timeout(duration, future)
+	time::timeout(duration, future)
 		.await
 		.map_err(|_| ActionTimedOut.build())?
 }
@@ -81,6 +82,7 @@ where
 pub(super) async fn dispatch_websocket_open_through_task(
 	dispatch: &mpsc::Sender<DispatchCommand>,
 	capacity: usize,
+	conn: ConnHandle,
 	ws: WebSocket,
 	request: Option<Request>,
 ) -> Result<()> {
@@ -90,6 +92,7 @@ pub(super) async fn dispatch_websocket_open_through_task(
 		capacity,
 		"dispatch_websocket_open",
 		DispatchCommand::OpenWebSocket {
+			conn,
 			ws,
 			request,
 			reply: reply_tx,

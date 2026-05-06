@@ -22,6 +22,8 @@ Design constraints, invariants, and reference commands for the Rivet monorepo. F
 
 **Always use versioned BARE (`vbare`) instead of raw `serde_bare` for any persisted or wire-format encoding unless explicitly told otherwise.** Raw `serde_bare::to_vec` / `from_slice` has no version header, so any future schema change forces hand-rolled `LegacyXxx` fallback structs. `vbare::OwnedVersionedData` plus a versioned `*.bare` schema is the standard pattern. Acceptable raw-bare exceptions: ephemeral in-memory encodings that never cross a process boundary or hit disk, and wire formats whose protocol version is coordinated out-of-band (e.g. an HTTP path like `/v{PROTOCOL_VERSION}/...` or another channel that pins both peers to one schema per call).
 
+- Avoid raw `f64` fields in vbare protocol schemas that use hashable maps; generated Rust derives `Eq`/`Hash`, so encode floats as fixed bytes or an ordered wrapper.
+
 When talking about "Rivet Actors" make sure to capitalize "Rivet Actor" as a proper noun and lowercase "actor" as a generic noun.
 
 ## Commands
@@ -90,6 +92,13 @@ docker-compose up -d
 ## Dependency Management
 
 - Prefer the Tokio-shaped APIs from `antiox` (`antiox/sync/mpsc`, `antiox/task`, etc.) over ad hoc Promise queues, custom channel wrappers, or event-emitter coordination.
+- `rivet-envoy-client` transport features are mutually exclusive; native builds use the default `native-transport`, while wasm builds must set `default-features = false` and enable `wasm-transport`.
+- `rivet-envoy-client` wasm WebSocket code lives behind `target_arch = "wasm32"` with a native-host `wasm-transport` stub so feature checks do not compile browser APIs on developer machines.
+- `rivetkit-core` wasm builds use `--no-default-features --features wasm-runtime,sqlite-remote`; keep native process and runner-config HTTP code behind `native-runtime`.
+- Core-owned lifecycle tasks in `rivetkit-core` should spawn through `RuntimeSpawner` so native builds use Send-capable tasks and wasm builds use local tasks.
+- `rivet-envoy-client::async_counter::AsyncCounter` is the shared HTTP request counter type consumed by core sleep logic; do not pull `rivet-util` into core for that counter.
+- For `wasm32-unknown-unknown` Rust checks, use target-specific minimal Tokio plus `getrandom/js` and `uuid/js`; scan production dependencies with `cargo tree -e normal` so dev-dependencies do not create false native-dependency hits.
+- Use `scripts/cargo/check-rivetkit-core-wasm.sh` as the canonical wasm gate for `rivetkit-core`; it checks the wasm build, scans native dependency leaks, and verifies native transport/runtime features fail on wasm.
 - The high-level `rivetkit` crate stays a thin typed wrapper over `rivetkit-core` and re-exports shared transport/config types instead of redefining them.
 - When `rivetkit` needs ergonomic helpers on a `rivetkit-core` type it re-exports, prefer an extension trait plus `prelude` re-export instead of wrapping and replacing the core type.
 - `engine/sdks/*/api-*` are auto-generated SDK outputs; update the source API schema and regenerate them instead of editing them by hand.
@@ -98,13 +107,27 @@ docker-compose up -d
 
 - Core tests that touch the `_RIVET_TEST_INSPECTOR_TOKEN` env override must share a process-wide lock with startup tests that assert inspector-token initialization side effects; otherwise parallel `cargo test` runs can flip `init_inspector_token(...)` between the env-override no-op path and the KV-backed path.
 - For the fast static/http/bare driver verifier, pass only the files listed under `## Fast Tests` in `.agent/notes/driver-test-progress.md`; `tests/driver/*.test.ts` also pulls in slow-suite files and gives bogus gate failures.
+- Wasm host smoke tests can drive `buildNativeFactory` through `WasmCoreRuntime` fake bindings to cover actor callbacks, KV, state serialization, remote SQLite routing, and NAPI import boundaries without checked-in wasm-pack output.
 - When moving Rust inline tests out of `src/`, keep a tiny source-owned `#[cfg(test)] #[path = "..."] mod tests;` shim so the moved file still has private module access without widening runtime visibility. Prefer a dedicated moved-test file per source module; reusing stale shared `tests/modules/*.rs` files can silently rot against private APIs and explode once you wire them back in.
 - Tracing assertions on spawned Rust futures should bind an explicit `tracing::Dispatch` with `.with_subscriber(...)` on the spawned future; thread-local `set_default(...)` can miss the real logs in full async suite runs.
 
 ### SQLite Package
 
-- RivetKit SQLite is native-only: VFS and query execution live in `rivetkit-rust/packages/rivetkit-sqlite/`, core owns lifecycle, and NAPI only marshals JS types.
+- Depot client owns native SQLite VFS and query execution in `engine/packages/depot-client/`; core owns lifecycle, and NAPI only marshals JS types.
+- SQLite VFS direct tests should record workflow compaction wakes through `CompactionSignaler`, not call legacy `compact_default_batch`.
+- SQLite VFS correctness tests should use `DirectStorage`; do not reintroduce mock or envoy transport variants for those tests.
+- SQLite VFS `xSync` durability depends on depot's `sqlite_commit` reply waiting for the FDB transaction commit.
+- SQLite VFS process-global registrations must be owned by a Drop guard so panics unwind through `sqlite3_vfs_unregister`.
+- `NativeDatabase::Drop` must bound dirty-page flushes with a short timeout and return after logging if the commit future never resolves.
 - Actor2 workflows and envoy actors always use the SQLite v2 storage format; only old actor v1 workflows and pegboard runners use the v1 storage format. ("v2" here refers to the on-disk storage format, not envoy-protocol v2.)
+- Native SQLite VFS recent-page preload hints are actor-side Rust state surfaced by `NativeDatabase::snapshot_preload_hints()`; persist and consume them through runtime/envoy wiring, not JS APIs.
+- SQLite VFS file handles must enforce their reader or writer role; reader-owned handles fail closed on mutating callbacks.
+- Native SQLite single-statement work should route through the native execute path; keep `exec` as the multi-statement compatibility path.
+- Native SQLite opens should use `depot_client::database::open_database_from_envoy` instead of direct `rusqlite` calls so native routing policy stays shared.
+- Pegboard-envoy remote SQL executor caches should use `Arc<OnceCell<NativeDatabaseHandle>>` values so first-use initialization stays lazy and single-flight per `(actor_id, sqlite_generation)`.
+- Sent remote SQL requests must fail with `sqlite.remote_indeterminate_result` on WebSocket disconnect; only unsent remote SQL may be sent after reconnect.
+- Native SQLite manual transactions keep an idle writer open until autocommit returns; route subsequent work through the writer instead of reader classification.
+- Native SQLite read mode may hold multiple read-only connections, while write mode must hold exactly one writable connection and no readers; TypeScript must not be the routing policy boundary.
 - For NAPI bridge wiring (TSF callback layout, cancellation tokens, `#[napi(object)]` rules), see `docs-internal/engine/napi-bridge.md`.
 
 ## Agent Working Directory
@@ -134,6 +157,7 @@ When the user asks to track something in a note, store it in `.agent/notes/` by 
 - rivetkit-napi must be pure bindings. If code would be duplicated by a future V8 runtime, it belongs in rivetkit-core instead.
 - rivetkit-napi serves through `CoreRegistry` + `NapiActorFactory`; do not reintroduce the deleted `BridgeCallbacks` JSON-envelope envoy path or `startEnvoy*Js` exports.
 - NAPI `ActorContext.sql()` returns `JsNativeDatabase` directly; do not reintroduce a standalone `SqliteDb` wrapper export.
+- TypeScript runtime adapters expose `CoreRuntime` from `rivetkit/src/registry/runtime.ts`; keep raw `@rivetkit/rivetkit-napi` and future `@rivetkit/rivetkit-wasm` imports inside `src/registry/*-runtime.ts`.
 - rivetkit (Rust) is a thin typed wrapper. If it does more than deserialize, delegate to core, and serialize, the logic should move to rivetkit-core.
 - rivetkit (TypeScript) owns only: workflow engine, agent-os, client library, Zod schema validation for user-defined types, and actor definition types.
 - Errors use universal `RivetError` (group/code/message/metadata) at all boundaries. No custom error classes in TS.
@@ -195,6 +219,13 @@ When the user asks to track something in a note, store it in `.agent/notes/` by 
 - Every shared counter with an awaiter must have a paired `Notify`, `watch`, or permit. Waiters must arm the notification before re-checking the counter so decrement-to-zero cannot race past them.
 - Reserve `tokio::time::sleep` for: per-call timeouts via `tokio::select!`, retry/reconnect backoff, deliberate debounce windows, or `sleep_until(deadline)` arms in an event-select loop. If it is inside a `loop { check; sleep }` body, it is polling and should be event-driven instead.
 - Never add unexplained wall-clock defers like `sleep(1ms)` to decouple a spawn from its caller. Use `tokio::task::yield_now().await` or rely on the spawn itself.
+
+## Memory Leaks
+
+- Never call `Box::leak` inside a per-request, per-error, or per-call code path. If the leak is for a `'static` reference required by an upstream API (e.g. `RivetErrorSchema`), intern the leaked value through a process-global `LazyLock<scc::HashMap<Key, &'static T>>` keyed on its identity so each unique value is leaked at most once. Examples: `BRIDGE_RIVET_ERROR_SCHEMAS` in `rivetkit-typescript/packages/rivetkit-napi/src/actor_factory.rs`.
+- If every field in a leaked struct is a compile-time constant, use a `static`/`const` instead of `Box::leak(Box::new(...))`.
+- `std::mem::forget` is only acceptable when an FFI handle cannot be dropped in the current context (e.g. napi `Ref::unref` requires an `Env`). Document the constraint inline and ensure the leak is bounded per actor/connection lifetime, not per call. Prefer routing the drop through an Env-bearing thread when possible.
+- Spawned futures that capture JS callbacks or other heavy resources must have a guaranteed completion path (e.g. a `CancellationToken` whose clones are guaranteed to drop). A `spawn_local(async move { token.cancelled().await; ... })` only drains if every clone of the token is dropped or cancelled.
 
 ## Async Rust Locks
 
@@ -272,6 +303,7 @@ When the user asks to track something in a note, store it in `.agent/notes/` by 
 - Only add design constraints, invariants, and non-obvious rules that shape how new code should be written. Do not add general trivia, current implementation wiring, KV-key layouts, module organization, API signatures, ephemeral migration state, or anything a reader can learn by reading the code. That content belongs in module doc-comments, `docs-internal/`, or `.claude/reference/`.
 - When the user asks to update any `CLAUDE.md`, add one-line bullet points only, or add a new section containing one-line bullet points.
 - Architectural internals and runtime wiring belong in `docs-internal/engine/`. Agent-procedural guides (test-harness gotchas, build troubleshooting, docs-sync tables) belong in `.claude/reference/`. Link them from the [Reference Docs](#reference-docs) index below instead of inlining.
+- Every directory that has a `CLAUDE.md` must also have an `AGENTS.md` symlink pointing to it (`ln -s CLAUDE.md AGENTS.md` from the same directory). When creating a new `CLAUDE.md`, create the symlink in the same change.
 
 ## Reference Docs
 
@@ -286,6 +318,7 @@ Load these only when the task touches the topic.
 - **[NAPI bridge](docs-internal/engine/napi-bridge.md)** — TSF callback slots, `ActorContextShared` cache reset, `#[napi(object)]` payload rules, cancellation token bridging, error prefix encoding. Read before touching `rivetkit-napi`.
 - **[BARE protocol crates](docs-internal/engine/bare-protocol-crates.md)** — vbare schema ordering, identity converters, `build.rs` TS codec generation pattern. Read before adding/changing protocol crates.
 - **[SQLite VFS parity](docs-internal/engine/sqlite-vfs.md)** — native Rust VFS ↔ WASM TypeScript VFS 1:1 parity rule, v2 storage keys, chunk layout, delete/truncate strategy. Read before touching either VFS.
+- **[SQLite optimizations](docs-internal/engine/SQLITE_OPTIMIZATIONS.md)** — brief tracker for SQLite cold-read, VFS, storage, preload, and benchmark optimization ideas.
 - **[TLS trust roots](docs-internal/engine/tls-trust-roots.md)** — rustls native+webpki union rationale, which clients use which backend.
 - **[Sleep sequence](docs-internal/engine/sleep-sequence.md)** — engine lifecycle authority, `keepAwake` vs `waitUntil` semantics, grace deadline shutdown-token abort, `can_arm_sleep_timer` vs `can_finalize_sleep` predicates. Read before touching sleep/destroy lifecycle.
 

@@ -275,22 +275,16 @@ pub fn stringify_to_rivet(message: &protocol::ToRivet) -> String {
 				val.request_id
 			)
 		}
-		protocol::ToRivet::ToRivetSqliteCommitStageBeginRequest(val) => {
+		protocol::ToRivet::ToRivetSqliteExecRequest(val) => {
 			format!(
-				"ToRivetSqliteCommitStageBeginRequest{{requestId: {}}}",
-				val.request_id
+				"ToRivetSqliteExecRequest{{requestId: {}, actorId: \"{}\", generation: {}}}",
+				val.request_id, val.data.actor_id, val.data.generation
 			)
 		}
-		protocol::ToRivet::ToRivetSqliteCommitStageRequest(val) => {
+		protocol::ToRivet::ToRivetSqliteExecuteRequest(val) => {
 			format!(
-				"ToRivetSqliteCommitStageRequest{{requestId: {}}}",
-				val.request_id
-			)
-		}
-		protocol::ToRivet::ToRivetSqliteCommitFinalizeRequest(val) => {
-			format!(
-				"ToRivetSqliteCommitFinalizeRequest{{requestId: {}}}",
-				val.request_id
+				"ToRivetSqliteExecuteRequest{{requestId: {}, actorId: \"{}\", generation: {}}}",
+				val.request_id, val.data.actor_id, val.data.generation
 			)
 		}
 		protocol::ToRivet::ToRivetTunnelMessage(val) => {
@@ -345,21 +339,12 @@ pub fn stringify_to_envoy(message: &protocol::ToEnvoy) -> String {
 				val.request_id
 			)
 		}
-		protocol::ToEnvoy::ToEnvoySqliteCommitStageBeginResponse(val) => {
-			format!(
-				"ToEnvoySqliteCommitStageBeginResponse{{requestId: {}}}",
-				val.request_id
-			)
+		protocol::ToEnvoy::ToEnvoySqliteExecResponse(val) => {
+			format!("ToEnvoySqliteExecResponse{{requestId: {}}}", val.request_id)
 		}
-		protocol::ToEnvoy::ToEnvoySqliteCommitStageResponse(val) => {
+		protocol::ToEnvoy::ToEnvoySqliteExecuteResponse(val) => {
 			format!(
-				"ToEnvoySqliteCommitStageResponse{{requestId: {}}}",
-				val.request_id
-			)
-		}
-		protocol::ToEnvoy::ToEnvoySqliteCommitFinalizeResponse(val) => {
-			format!(
-				"ToEnvoySqliteCommitFinalizeResponse{{requestId: {}}}",
+				"ToEnvoySqliteExecuteResponse{{requestId: {}}}",
 				val.request_id
 			)
 		}

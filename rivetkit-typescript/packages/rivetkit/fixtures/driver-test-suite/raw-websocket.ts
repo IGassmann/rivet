@@ -167,3 +167,44 @@ export const rawWebSocketBinaryActor = actor({
 	},
 	actions: {},
 });
+
+export const rawWebSocketAsyncOpenActor = actor({
+	options: {
+		canHibernateWebSocket: false,
+		sleepGracePeriod: 2_000,
+	},
+	state: {
+		openCount: 0,
+	},
+	async onWebSocket(ctx, websocket) {
+		ctx.state.openCount += 1;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		websocket.send(
+			JSON.stringify({
+				type: "async-open",
+				openCount: ctx.state.openCount,
+			}),
+		);
+	},
+	actions: {
+		getOpenCount: (ctx) => ctx.state.openCount,
+	},
+});
+
+export const rawWebSocketConnContextActor = actor({
+	onWebSocket(ctx: any, websocket: UniversalWebSocket) {
+		const connId = ctx.conn.id;
+		ctx.conn.state = {
+			opened: true,
+			connId,
+		};
+		websocket.send(
+			JSON.stringify({
+				type: "conn-context",
+				connId,
+				state: ctx.conn.state,
+			}),
+		);
+	},
+	actions: {},
+});

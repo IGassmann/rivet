@@ -5,34 +5,20 @@
 import * as serializers from "../index";
 import * as Rivet from "../../api/index";
 import * as core from "../../core";
-import { RunnerConfigsServerlessMetadataErrorInvalidRequest } from "./RunnerConfigsServerlessMetadataErrorInvalidRequest";
-import { RunnerConfigsServerlessMetadataErrorRequestFailed } from "./RunnerConfigsServerlessMetadataErrorRequestFailed";
-import { RunnerConfigsServerlessMetadataErrorRequestTimedOut } from "./RunnerConfigsServerlessMetadataErrorRequestTimedOut";
-import { RunnerConfigsServerlessMetadataErrorNonSuccessStatus } from "./RunnerConfigsServerlessMetadataErrorNonSuccessStatus";
-import { RunnerConfigsServerlessMetadataErrorInvalidResponseJson } from "./RunnerConfigsServerlessMetadataErrorInvalidResponseJson";
-import { RunnerConfigsServerlessMetadataErrorInvalidResponseSchema } from "./RunnerConfigsServerlessMetadataErrorInvalidResponseSchema";
-import { RunnerConfigsServerlessMetadataErrorInvalidEnvoyProtocolVersion } from "./RunnerConfigsServerlessMetadataErrorInvalidEnvoyProtocolVersion";
 
-export const RunnerConfigsServerlessMetadataError: core.serialization.Schema<
+export const RunnerConfigsServerlessMetadataError: core.serialization.ObjectSchema<
     serializers.RunnerConfigsServerlessMetadataError.Raw,
     Rivet.RunnerConfigsServerlessMetadataError
-> = core.serialization.undiscriminatedUnion([
-    RunnerConfigsServerlessMetadataErrorInvalidRequest,
-    RunnerConfigsServerlessMetadataErrorRequestFailed,
-    RunnerConfigsServerlessMetadataErrorRequestTimedOut,
-    RunnerConfigsServerlessMetadataErrorNonSuccessStatus,
-    RunnerConfigsServerlessMetadataErrorInvalidResponseJson,
-    RunnerConfigsServerlessMetadataErrorInvalidResponseSchema,
-    RunnerConfigsServerlessMetadataErrorInvalidEnvoyProtocolVersion,
-]);
+> = core.serialization.object({
+    details: core.serialization.string().optional(),
+    message: core.serialization.string(),
+    metadata: core.serialization.unknown().optional(),
+});
 
 export declare namespace RunnerConfigsServerlessMetadataError {
-    export type Raw =
-        | RunnerConfigsServerlessMetadataErrorInvalidRequest.Raw
-        | RunnerConfigsServerlessMetadataErrorRequestFailed.Raw
-        | RunnerConfigsServerlessMetadataErrorRequestTimedOut.Raw
-        | RunnerConfigsServerlessMetadataErrorNonSuccessStatus.Raw
-        | RunnerConfigsServerlessMetadataErrorInvalidResponseJson.Raw
-        | RunnerConfigsServerlessMetadataErrorInvalidResponseSchema.Raw
-        | RunnerConfigsServerlessMetadataErrorInvalidEnvoyProtocolVersion.Raw;
+    export interface Raw {
+        details?: string | null;
+        message: string;
+        metadata?: unknown | null;
+    }
 }

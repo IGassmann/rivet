@@ -199,7 +199,7 @@ mod moved_tests {
 	use std::collections::{BTreeSet, HashMap, HashSet};
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::sync::{Arc, Mutex};
-	use std::time::{Duration, SystemTime, UNIX_EPOCH};
+	use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 	use anyhow::anyhow;
 	use rivet_envoy_client::config::{
@@ -211,7 +211,7 @@ mod moved_tests {
 	use rivet_envoy_client::protocol;
 	use rivet_envoy_client::tunnel::HibernatingWebSocketMetadata;
 	use tokio::sync::mpsc;
-	use tokio::time::{Instant, sleep};
+	use tokio::time::sleep;
 
 	use super::ActorContext;
 	use crate::actor::connection::ConnHandle;
@@ -236,7 +236,6 @@ mod moved_tests {
 			_generation: u32,
 			_config: protocol::ActorConfig,
 			_preloaded_kv: Option<protocol::PreloadedKv>,
-			_sqlite_startup_data: Option<protocol::SqliteStartupData>,
 		) -> BoxFuture<anyhow::Result<()>> {
 			Box::pin(async { Ok(()) })
 		}
@@ -313,6 +312,7 @@ mod moved_tests {
 			envoy_key: "test-envoy".to_string(),
 			envoy_tx,
 			actors: Arc::new(std::sync::Mutex::new(HashMap::new())),
+			actors_notify: Arc::new(tokio::sync::Notify::new()),
 			live_tunnel_requests,
 			pending_hibernation_restores: Arc::new(std::sync::Mutex::new(HashMap::from([(
 				actor_id.to_owned(),
@@ -336,7 +336,7 @@ mod moved_tests {
 				SharedActorEntry {
 					handle: mpsc::unbounded_channel().0,
 					active_http_request_count: Arc::new(
-						rivet_util::async_counter::AsyncCounter::new(),
+						rivet_envoy_client::async_counter::AsyncCounter::new(),
 					),
 				},
 			);
@@ -361,6 +361,7 @@ mod moved_tests {
 			envoy_key: "test-envoy".to_string(),
 			envoy_tx,
 			actors: Arc::new(std::sync::Mutex::new(HashMap::new())),
+			actors_notify: Arc::new(tokio::sync::Notify::new()),
 			live_tunnel_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
 			pending_hibernation_restores: Arc::new(std::sync::Mutex::new(HashMap::new())),
 			ws_tx: Arc::new(tokio::sync::Mutex::new(
@@ -690,9 +691,9 @@ mod moved_tests {
 		ctx.load_persisted_actor(PersistedActor {
 			scheduled_events: vec![PersistedScheduleEvent {
 				event_id: "evt-future".to_owned(),
-				timestamp_ms: now_timestamp_ms() + 20,
+				timestamp: now_timestamp_ms() + 20,
 				action: "tick".to_owned(),
-				args: vec![1],
+				args: Some(vec![1]),
 			}],
 			..PersistedActor::default()
 		});
@@ -723,9 +724,9 @@ mod moved_tests {
 		ctx.load_persisted_actor(PersistedActor {
 			scheduled_events: vec![PersistedScheduleEvent {
 				event_id: "evt-overdue".to_owned(),
-				timestamp_ms: now_timestamp_ms() - 1_000,
+				timestamp: now_timestamp_ms() - 1_000,
 				action: "tick".to_owned(),
-				args: vec![1, 2, 3],
+				args: Some(vec![1, 2, 3]),
 			}],
 			..PersistedActor::default()
 		});

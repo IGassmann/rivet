@@ -1,7 +1,10 @@
 // @ts-nocheck
 
 import { describe, expect, test, vi } from "vitest";
-import { describeDriverMatrix } from "./shared-matrix";
+import {
+	describeDriverMatrix,
+	SQLITE_DRIVER_MATRIX_OPTIONS,
+} from "./shared-matrix";
 import { setupDriverTest, waitFor } from "./shared-utils";
 
 type DbVariant = "raw";
@@ -12,10 +15,7 @@ const HIGH_VOLUME_COUNT = 1000;
 const SLEEP_WAIT_MS = 150;
 const LIFECYCLE_POLL_INTERVAL_MS = 25;
 const LIFECYCLE_POLL_ATTEMPTS = 40;
-const REAL_TIMER_HARD_CRASH_POLL_INTERVAL_MS = 50;
-const REAL_TIMER_HARD_CRASH_POLL_ATTEMPTS = 600;
 const REAL_TIMER_DB_TIMEOUT_MS = 180_000;
-const RESET_READY_TIMEOUT_MS = 5_000;
 const CHUNK_BOUNDARY_SIZES = [
 	CHUNK_SIZE - 1,
 	CHUNK_SIZE,
@@ -35,6 +35,14 @@ const HOT_ROW_COUNT = 10;
 const HOT_ROW_UPDATES = 240;
 const INTEGRITY_SEED_COUNT = 64;
 const INTEGRITY_CHURN_COUNT = 120;
+const SLEEP_OBSERVER_TIMEOUT_MS =
+	SLEEP_WAIT_MS + 4 * LIFECYCLE_POLL_INTERVAL_MS;
+
+type LifecycleEvent = {
+	actorKey: string;
+	event: string;
+	timestamp: number;
+};
 
 function isActorStoppingDbError(error: unknown): boolean {
 	return (
@@ -63,9 +71,7 @@ async function runWithActorStoppingRetry(
 				}
 				throw new (class extends Error {
 					override name = "AbortRetry";
-				})(
-					error instanceof Error ? error.message : String(error),
-				);
+				})(error instanceof Error ? error.message : String(error));
 			}
 		},
 		{ timeout: SLEEP_WAIT_MS * 4, interval: 100 },
@@ -99,6 +105,33 @@ function getDbActor(
 	_variant: DbVariant,
 ) {
 	return client.dbActorRaw;
+}
+
+async function waitForDbLifecycleEvent(
+	driverTestConfig: DriverTestConfig,
+	observer: {
+		getEvents(): Promise<LifecycleEvent[]>;
+	},
+	actorKey: string,
+	event: string,
+	notBefore: number,
+): Promise<LifecycleEvent> {
+	for (let i = 0; i < LIFECYCLE_POLL_ATTEMPTS; i++) {
+		const events = await observer.getEvents();
+		const match = events.find(
+			(entry) =>
+				entry.actorKey === actorKey &&
+				entry.event === event &&
+				entry.timestamp >= notBefore,
+		);
+		if (match) {
+			return match;
+		}
+
+		await waitFor(driverTestConfig, LIFECYCLE_POLL_INTERVAL_MS);
+	}
+
+	throw new Error(`timed out waiting for ${event} event from ${actorKey}`);
 }
 
 describeDriverMatrix("Actor Db", (driverTestConfig) => {
@@ -140,16 +173,8 @@ describeDriverMatrix("Actor Db", (driverTestConfig) => {
 						`db-${variant}-crud-${crypto.randomUUID()}`,
 					]);
 
-					// Poll until the actor finishes startup and can serve reset without racing DB initialization.
-					await vi.waitFor(
-						async () => {
-							await actor.reset();
-						},
-						{
-							timeout: RESET_READY_TIMEOUT_MS,
-							interval: 100,
-						},
-					);
+					await actor.ready;
+					await actor.reset();
 
 					const first = await actor.insertValue("alpha");
 					const second = await actor.insertValue("beta");
@@ -221,51 +246,38 @@ describeDriverMatrix("Actor Db", (driverTestConfig) => {
 						c,
 						driverTestConfig,
 					);
+					const actorKey = `db-${variant}-sleep-${crypto.randomUUID()}`;
+					const observerKey = `${actorKey}-observer`;
+					const observer = client.lifecycleObserver.getOrCreate([
+						observerKey,
+					]);
+					await observer.clearEvents();
+
 					const actor = getDbActor(client, variant).getOrCreate([
-						`db-${variant}-sleep-${crypto.randomUUID()}`,
+						actorKey,
 					]);
 
 					await actor.reset();
+					await actor.configureLifecycleObserver(observerKey);
 					await actor.insertValue("sleepy");
 					const baselineCount = await actor.getCount();
 					expect(baselineCount).toBeGreaterThan(0);
 
 					for (let i = 0; i < 3; i++) {
+						const sleepRequestedAt = Date.now();
 						await actor.triggerSleep();
-						await waitFor(driverTestConfig, SLEEP_WAIT_MS);
+						const sleepEvent = await waitForDbLifecycleEvent(
+							driverTestConfig,
+							observer,
+							actorKey,
+							"sleep",
+							sleepRequestedAt,
+						);
+						expect(
+							sleepEvent.timestamp - sleepRequestedAt,
+						).toBeLessThanOrEqual(SLEEP_OBSERVER_TIMEOUT_MS);
 
-						let countAfterWake = -1;
-						let lastError: Error | undefined;
-						for (
-							let attempt = 0;
-							attempt < LIFECYCLE_POLL_ATTEMPTS;
-							attempt++
-						) {
-							try {
-								countAfterWake = await actor.getCount();
-								lastError = undefined;
-							} catch (error) {
-								if (!isActorStoppingDbError(error)) {
-									throw error;
-								}
-
-								lastError = error;
-							}
-
-							if (countAfterWake === baselineCount) {
-								break;
-							}
-
-							await waitFor(
-								driverTestConfig,
-								LIFECYCLE_POLL_INTERVAL_MS,
-							);
-						}
-
-						if (lastError && countAfterWake !== baselineCount) {
-							throw lastError;
-						}
-
+						const countAfterWake = await actor.getCount();
 						expect(countAfterWake).toBe(baselineCount);
 					}
 				},
@@ -291,36 +303,14 @@ describeDriverMatrix("Actor Db", (driverTestConfig) => {
 					]);
 
 					await actor.reset();
+					await actor.configureLifecycleObserver(null);
 					await actor.insertValue("before-crash");
 					expect(await actor.getCount()).toBe(1);
 
 					const actorId = await actor.resolve();
 					await hardCrashActor(actorId);
 
-					const hardCrashPollAttempts = driverTestConfig.useRealTimers
-						? REAL_TIMER_HARD_CRASH_POLL_ATTEMPTS
-						: LIFECYCLE_POLL_ATTEMPTS;
-					const hardCrashPollIntervalMs =
-						driverTestConfig.useRealTimers
-							? REAL_TIMER_HARD_CRASH_POLL_INTERVAL_MS
-							: LIFECYCLE_POLL_INTERVAL_MS;
-
-					let countAfterCrash = 0;
-					for (let i = 0; i < hardCrashPollAttempts; i++) {
-						try {
-							countAfterCrash = await actor.getCount();
-						} catch {
-							countAfterCrash = 0;
-						}
-						if (countAfterCrash === 1) {
-							break;
-						}
-						await waitFor(
-							driverTestConfig,
-							hardCrashPollIntervalMs,
-						);
-					}
-
+					const countAfterCrash = await actor.getCount();
 					expect(countAfterCrash).toBe(1);
 					const values = await actor.getValues();
 					expect(
@@ -600,4 +590,4 @@ describeDriverMatrix("Actor Db", (driverTestConfig) => {
 			lifecycleTestTimeout,
 		);
 	});
-});
+}, SQLITE_DRIVER_MATRIX_OPTIONS);

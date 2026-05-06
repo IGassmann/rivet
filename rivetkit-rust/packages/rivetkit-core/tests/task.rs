@@ -6,7 +6,7 @@ mod moved_tests {
 	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 	use std::sync::{Mutex, OnceLock};
 	use std::task::Poll;
-	use std::time::Duration;
+	use std::time::{Duration, Instant};
 
 	use futures::{FutureExt, poll};
 	use rivet_envoy_client::config::{
@@ -19,7 +19,7 @@ mod moved_tests {
 	use rivet_envoy_client::protocol;
 	use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 	use tokio::task::yield_now;
-	use tokio::time::{Instant, advance, sleep, timeout};
+	use tokio::time::{advance, sleep, timeout};
 	use tracing::field::{Field, Visit};
 	use tracing::instrument::WithSubscriber;
 	use tracing::{Event, Subscriber};
@@ -29,15 +29,18 @@ mod moved_tests {
 
 	use crate::actor::connection::{
 		ConnHandle, HibernatableConnectionMetadata, decode_persisted_connection,
-		make_connection_key,
 	};
 	use crate::actor::context::tests::new_with_kv;
+	use crate::actor::keys::{
+		CONN_PREFIX, INSPECTOR_TOKEN_KEY, LAST_PUSHED_ALARM_KEY, PERSIST_DATA_KEY,
+		QUEUE_MESSAGES_PREFIX, WORKFLOW_STORAGE_PREFIX, make_connection_key,
+	};
 	use crate::actor::messages::{ActorEvent, SerializeStateReason, StateDelta};
-	use crate::actor::preload::PreloadedPersistedActor;
+	use crate::actor::preload::{PreloadedKv, PreloadedPersistedActor};
+	use crate::actor::sleep::CanSleep;
 	use crate::actor::state::{
-		LAST_PUSHED_ALARM_KEY, PERSIST_DATA_KEY, PersistedActor, PersistedScheduleEvent,
-		RequestSaveOpts, decode_last_pushed_alarm, decode_persisted_actor,
-		encode_last_pushed_alarm, encode_persisted_actor,
+		PersistedActor, PersistedScheduleEvent, RequestSaveOpts, decode_last_pushed_alarm,
+		decode_persisted_actor, encode_last_pushed_alarm, encode_persisted_actor,
 	};
 	use crate::actor::task::{
 		ActorTask, DispatchCommand, LONG_SHUTDOWN_DRAIN_WARNING_THRESHOLD, LifecycleCommand,
@@ -47,6 +50,7 @@ mod moved_tests {
 	use crate::inspector::auth::test_inspector_env_lock;
 	use crate::kv::tests::new_in_memory;
 	use crate::{ActorConfig, ActorContext, ActorFactory};
+	use rivet_envoy_client::utils::EnvoyShutdownError;
 
 	fn test_hook_lock() -> &'static AsyncMutex<()> {
 		static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
@@ -180,7 +184,6 @@ mod moved_tests {
 			_generation: u32,
 			_config: protocol::ActorConfig,
 			_preloaded_kv: Option<protocol::PreloadedKv>,
-			_sqlite_startup_data: Option<protocol::SqliteStartupData>,
 		) -> EnvoyBoxFuture<anyhow::Result<()>> {
 			Box::pin(async { Ok(()) })
 		}
@@ -243,6 +246,7 @@ mod moved_tests {
 			envoy_key: "test-envoy".to_string(),
 			envoy_tx,
 			actors: Arc::new(Mutex::new(HashMap::new())),
+			actors_notify: Arc::new(tokio::sync::Notify::new()),
 			live_tunnel_requests: Arc::new(Mutex::new(HashMap::new())),
 			pending_hibernation_restores: Arc::new(Mutex::new(HashMap::new())),
 			ws_tx: Arc::new(tokio::sync::Mutex::new(
@@ -763,7 +767,7 @@ mod moved_tests {
 		let debounce_deadline = task
 			.state_save_deadline
 			.expect("debounced save deadline should exist");
-		assert!(debounce_deadline > tokio::time::Instant::now());
+		assert!(debounce_deadline > Instant::now());
 		sleep(Duration::from_millis(20)).await;
 		assert_eq!(save_ticks.load(Ordering::SeqCst), 0);
 
@@ -781,7 +785,7 @@ mod moved_tests {
 		let immediate_deadline = task
 			.state_save_deadline
 			.expect("immediate save deadline should exist");
-		assert!(immediate_deadline <= tokio::time::Instant::now() + Duration::from_millis(5));
+		assert!(immediate_deadline <= Instant::now() + Duration::from_millis(5));
 		task.on_state_save_tick().await;
 		wait_for_count(&save_ticks, 2).await;
 		wait_for_state(&ctx, &[2]).await;
@@ -943,7 +947,7 @@ mod moved_tests {
 	}
 
 	#[tokio::test]
-	async fn save_tick_cancels_pending_inspector_deadline_and_broadcasts_overlay() {
+	async fn save_tick_cancels_pending_inspector_deadline_and_persists_state() {
 		let ctx = new_with_kv(
 			"actor-save-overlay",
 			"task-save-overlay",
@@ -991,14 +995,11 @@ mod moved_tests {
 		task.on_state_save_tick().await;
 
 		assert!(task.inspector_serialize_state_deadline.is_none());
-		let overlay = inspector_rx
-			.recv()
-			.await
-			.expect("save tick should broadcast inspector overlay");
-		let deltas: Vec<StateDelta> =
-			ciborium::from_reader(overlay.as_slice()).expect("overlay payload should decode");
-		assert_eq!(deltas, vec![StateDelta::ActorState(vec![1])]);
 		wait_for_state(&ctx, &[1]).await;
+		assert!(matches!(
+			inspector_rx.try_recv(),
+			Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+		));
 
 		task.handle_stop(ShutdownKind::Destroy)
 			.await
@@ -1210,6 +1211,76 @@ mod moved_tests {
 		let remaining_conns: Vec<_> = ctx.conns().collect();
 		assert_eq!(remaining_conns.len(), 1);
 		assert_eq!(remaining_conns[0].id(), hibernating_conn.id());
+	}
+
+	#[tokio::test]
+	async fn wake_start_clears_previous_sleep_request() {
+		let kv = new_in_memory();
+		let ctx = new_with_kv("actor-wake", "task-wake", Vec::new(), "local", kv.clone());
+		let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(4);
+		let (_dispatch_tx, dispatch_rx) = mpsc::channel(4);
+		let (events_tx, events_rx) = mpsc::channel(4);
+		ctx.configure_lifecycle_events(Some(events_tx));
+
+		let factory = Arc::new(ActorFactory::new(
+			ActorConfig {
+				sleep_grace_period: Duration::from_millis(200),
+				sleep_grace_period_overridden: true,
+				..ActorConfig::default()
+			},
+			|start| {
+				Box::pin(async move {
+					let mut events = start.events;
+					while let Some(event) = events.recv().await {
+						match event {
+							ActorEvent::SerializeState { reply, .. } => {
+								reply.send(Ok(Vec::new()));
+							}
+							ActorEvent::RunGracefulCleanup { reply, .. } => {
+								reply.send(Ok(()));
+							}
+							_ => {}
+						}
+					}
+					Ok(())
+				})
+			},
+		));
+
+		let mut task = ActorTask::new(
+			"actor-wake".into(),
+			0,
+			lifecycle_rx,
+			dispatch_rx,
+			events_rx,
+			factory,
+			ctx.clone(),
+			None,
+			None,
+		);
+		let (start_tx, start_rx) = oneshot::channel();
+		task.handle_lifecycle(LifecycleCommand::Start { reply: start_tx })
+			.await;
+		start_rx
+			.await
+			.expect("start reply should send")
+			.expect("start should succeed");
+
+		ctx.sleep().expect("sleep request should succeed");
+		assert!(ctx.sleep_requested());
+
+		task.handle_stop(ShutdownKind::Sleep)
+			.await
+			.expect("sleep stop should succeed");
+		let (wake_tx, wake_rx) = oneshot::channel();
+		task.handle_lifecycle(LifecycleCommand::Start { reply: wake_tx })
+			.await;
+		wake_rx
+			.await
+			.expect("wake reply should send")
+			.expect("wake should succeed");
+
+		assert!(!ctx.sleep_requested());
 	}
 
 	#[tokio::test]
@@ -1492,9 +1563,9 @@ mod moved_tests {
 		let mut persisted = task.ctx.persisted_actor();
 		persisted.scheduled_events.push(PersistedScheduleEvent {
 			event_id: "event-1".to_owned(),
-			timestamp_ms: 0,
+			timestamp: 0,
 			action: "alarm-action".to_owned(),
-			args: Vec::new(),
+			args: None,
 		});
 		task.ctx.load_persisted_actor(PersistedActor {
 			scheduled_events: persisted.scheduled_events,
@@ -1515,6 +1586,107 @@ mod moved_tests {
 			seen_conns.lock().expect("action log lock poisoned").clone(),
 			vec![Some("conn-client".to_owned()), None],
 		);
+
+		task.handle_stop(ShutdownKind::Destroy)
+			.await
+			.expect("destroy stop should succeed");
+	}
+
+	#[tokio::test]
+	async fn action_dispatch_blocks_idle_sleep_until_reply() {
+		let ctx = new_with_kv(
+			"actor-action-keep-awake",
+			"task-action-keep-awake",
+			Vec::new(),
+			"local",
+			new_in_memory(),
+		);
+		let (action_started_tx, action_started_rx) = oneshot::channel();
+		let action_started_tx = Arc::new(Mutex::new(Some(action_started_tx)));
+		let (release_action_tx, release_action_rx) = oneshot::channel();
+		let release_action_rx = Arc::new(Mutex::new(Some(release_action_rx)));
+		let factory = Arc::new(ActorFactory::new(Default::default(), {
+			let action_started_tx = action_started_tx.clone();
+			let release_action_rx = release_action_rx.clone();
+			move |start| {
+				let action_started_tx = action_started_tx.clone();
+				let release_action_rx = release_action_rx.clone();
+				Box::pin(async move {
+					let mut events = start.events;
+					while let Some(event) = events.recv().await {
+						match event {
+							ActorEvent::Action { reply, .. } => {
+								if let Some(tx) = action_started_tx
+									.lock()
+									.expect("action started sender lock poisoned")
+									.take()
+								{
+									let _ = tx.send(());
+								}
+								let release_rx = release_action_rx
+									.lock()
+									.expect("release action receiver lock poisoned")
+									.take()
+									.expect("release action receiver should exist");
+								let _ = release_rx.await;
+								reply.send(Ok(vec![9]));
+							}
+							ActorEvent::BeginSleep => {}
+							ActorEvent::FinalizeSleep { reply } | ActorEvent::Destroy { reply } => {
+								reply.send(Ok(()));
+								break;
+							}
+							_ => {}
+						}
+					}
+					Ok(())
+				})
+			}
+		}));
+
+		let mut task = new_task_with_factory(ctx.clone(), factory);
+		let (start_tx, start_rx) = oneshot::channel();
+		task.handle_lifecycle(LifecycleCommand::Start { reply: start_tx })
+			.await;
+		start_rx
+			.await
+			.expect("start reply should send")
+			.expect("start should succeed");
+
+		let client_conn = ConnHandle::new("conn-keep-awake", Vec::new(), Vec::new(), false);
+		let (reply_tx, reply_rx) = oneshot::channel();
+		task.handle_dispatch(DispatchCommand::Action {
+			name: "slow-action".to_owned(),
+			args: Vec::new(),
+			conn: client_conn,
+			reply: reply_tx,
+		})
+		.await;
+		action_started_rx
+			.await
+			.expect("action should start before sleep assertion");
+
+		assert_eq!(ctx.internal_keep_awake_count(), 1);
+		assert_eq!(ctx.can_sleep().await, CanSleep::ActiveInternalKeepAwake);
+		release_action_tx
+			.send(())
+			.expect("action should still be waiting");
+
+		assert_eq!(
+			reply_rx
+				.await
+				.expect("action reply should send")
+				.expect("action should succeed"),
+			vec![9]
+		);
+		for _ in 0..10 {
+			if ctx.internal_keep_awake_count() == 0 {
+				break;
+			}
+			yield_now().await;
+		}
+		assert_eq!(ctx.internal_keep_awake_count(), 0);
+		assert_eq!(ctx.can_sleep().await, CanSleep::Yes);
 
 		task.handle_stop(ShutdownKind::Destroy)
 			.await
@@ -1573,7 +1745,8 @@ mod moved_tests {
 							reply.send(Ok(()));
 							break;
 						}
-						ActorEvent::ConnectionOpen { .. } => {
+						ActorEvent::ConnectionPreflight { .. }
+						| ActorEvent::ConnectionOpen { .. } => {
 							panic!("hibernated connection should not refire ConnectionOpen");
 						}
 						_ => {}
@@ -1905,7 +2078,7 @@ mod moved_tests {
 			decode_persisted_actor(&actor_bytes).expect("persisted actor should decode");
 		assert_eq!(persisted.scheduled_events.len(), 1);
 		assert_eq!(persisted.scheduled_events[0].action, "after-destroy");
-		assert_eq!(persisted.scheduled_events[0].args, vec![1, 2, 3]);
+		assert_eq!(persisted.scheduled_events[0].args, Some(vec![1, 2, 3]));
 	}
 
 	#[tokio::test]
@@ -1933,11 +2106,331 @@ mod moved_tests {
 			.expect("start reply should send")
 			.expect("start should succeed");
 
-		// Startup still probes the inspector token key at [3], but it should not
+		// Startup still probes the inspector token key, but it should not
 		// batch-get the persisted actor/alarm startup bundle when the registry
 		// already told us the persisted bundle exists and is empty.
 		assert_eq!(kv.test_batch_get_call_count(), 1);
 		assert!(ctx.persisted_actor().has_initialized);
+	}
+
+	#[tokio::test]
+	async fn manual_startup_does_not_mark_initialized_before_runtime_preamble() {
+		let kv = new_in_memory();
+		let ctx = new_with_kv(
+			"actor-manual-startup-init",
+			"task-manual-startup-init",
+			Vec::new(),
+			"local",
+			kv,
+		);
+		let (observed_tx, observed_rx) = oneshot::channel();
+		let observed_tx = Arc::new(Mutex::new(Some(observed_tx)));
+		let factory = Arc::new(ActorFactory::new_with_manual_startup_ready(
+			Default::default(),
+			move |mut start| {
+				let observed_tx = observed_tx.clone();
+				Box::pin(async move {
+					observed_tx
+						.lock()
+						.expect("observed lock poisoned")
+						.take()
+						.expect("observed sender should exist")
+						.send(start.ctx.persisted_actor().has_initialized)
+						.expect("observed sender should send");
+					start.ctx.set_state_initial(vec![4, 5, 6]);
+					start.ctx.set_has_initialized(true);
+					start
+						.startup_ready
+						.take()
+						.expect("manual runtime should receive startup ready sender")
+						.send(Ok(()))
+						.expect("startup ready receiver should exist");
+
+					while let Some(event) = start.events.recv().await {
+						match event {
+							ActorEvent::SerializeState { reply, .. } => {
+								reply.send(Ok(vec![StateDelta::ActorState(start.ctx.state())]));
+							}
+							ActorEvent::RunGracefulCleanup { reply, .. } => {
+								reply.send(Ok(()));
+							}
+							_ => {}
+						}
+					}
+					Ok(())
+				})
+			},
+		));
+		let mut task = new_task_with_factory(ctx.clone(), factory);
+		let (start_tx, start_rx) = oneshot::channel();
+
+		task.handle_lifecycle(LifecycleCommand::Start { reply: start_tx })
+			.await;
+		start_rx
+			.await
+			.expect("start reply should send")
+			.expect("start should succeed");
+
+		assert!(!observed_rx.await.expect("runtime should observe startup"));
+		assert!(ctx.persisted_actor().has_initialized);
+		assert_eq!(ctx.state(), vec![4, 5, 6]);
+
+		let run_handle = task.run_handle.take().expect("run handle should exist");
+		run_handle.abort();
+		let _ = run_handle.await;
+	}
+
+	#[tokio::test]
+	async fn startup_uses_preloaded_last_pushed_alarm_without_live_kv() {
+		let _env_guard = test_inspector_env_lock().lock().expect("env lock poisoned");
+		unsafe {
+			std::env::remove_var("_RIVET_TEST_INSPECTOR_TOKEN");
+		}
+
+		let future_ts = 4_102_445_000_000;
+		let persisted = PersistedActor {
+			has_initialized: true,
+			scheduled_events: vec![PersistedScheduleEvent {
+				event_id: "evt-preloaded-alarm".to_owned(),
+				timestamp: future_ts,
+				action: "tick".to_owned(),
+				args: None,
+			}],
+			..PersistedActor::default()
+		};
+		let encoded_alarm =
+			encode_last_pushed_alarm(Some(future_ts)).expect("last pushed alarm should encode");
+		let preloaded_kv = PreloadedKv::new_with_requested_get_keys(
+			vec![
+				(LAST_PUSHED_ALARM_KEY.to_vec(), encoded_alarm),
+				(
+					INSPECTOR_TOKEN_KEY.to_vec(),
+					b"startup-preload-token".to_vec(),
+				),
+			],
+			vec![
+				PERSIST_DATA_KEY.to_vec(),
+				LAST_PUSHED_ALARM_KEY.to_vec(),
+				INSPECTOR_TOKEN_KEY.to_vec(),
+				vec![5, 1, 1],
+			],
+			vec![
+				WORKFLOW_STORAGE_PREFIX.to_vec(),
+				CONN_PREFIX.to_vec(),
+				QUEUE_MESSAGES_PREFIX.to_vec(),
+			],
+		);
+
+		let (handle, mut rx) = test_envoy_handle();
+		tokio::spawn(async move {
+			while let Some(message) = rx.recv().await {
+				if let ToEnvoyMessage::KvRequest { response_tx, .. } = message {
+					let _ = response_tx.send(Err(anyhow::anyhow!(EnvoyShutdownError)));
+				}
+			}
+		});
+
+		let ctx = new_with_kv(
+			"actor-preloaded-alarm",
+			"task-preloaded-alarm",
+			Vec::new(),
+			"local",
+			crate::kv::Kv::new(handle.clone(), "actor-preloaded-alarm"),
+		);
+		ctx.configure_envoy(handle, Some(31));
+		let mut task = new_task(ctx.clone())
+			.with_preloaded_persisted_actor(PreloadedPersistedActor::Some(persisted))
+			.with_preloaded_kv(Some(preloaded_kv));
+		let (start_tx, start_rx) = oneshot::channel();
+
+		task.handle_lifecycle(LifecycleCommand::Start { reply: start_tx })
+			.await;
+		start_rx
+			.await
+			.expect("start reply should send")
+			.expect("start should use preloaded alarm without live kv");
+
+		assert_eq!(ctx.last_pushed_alarm(), Some(future_ts));
+	}
+
+	#[tokio::test]
+	async fn startup_decodes_persisted_actor_from_preloaded_kv_without_live_kv() {
+		let _env_guard = test_inspector_env_lock().lock().expect("env lock poisoned");
+		unsafe {
+			std::env::remove_var("_RIVET_TEST_INSPECTOR_TOKEN");
+		}
+
+		let future_ts = 4_102_445_061_000;
+		let persisted = PersistedActor {
+			has_initialized: true,
+			state: b"preloaded-state".to_vec(),
+			scheduled_events: vec![PersistedScheduleEvent {
+				event_id: "evt-preloaded-persisted".to_owned(),
+				timestamp: future_ts,
+				action: "tick".to_owned(),
+				args: None,
+			}],
+			..PersistedActor::default()
+		};
+		let encoded_persisted =
+			encode_persisted_actor(&persisted).expect("persisted actor should encode");
+		let encoded_alarm =
+			encode_last_pushed_alarm(Some(future_ts)).expect("last pushed alarm should encode");
+		let preloaded_kv = PreloadedKv::new_with_requested_get_keys(
+			vec![
+				(PERSIST_DATA_KEY.to_vec(), encoded_persisted),
+				(LAST_PUSHED_ALARM_KEY.to_vec(), encoded_alarm),
+				(
+					INSPECTOR_TOKEN_KEY.to_vec(),
+					b"startup-persisted-preload-token".to_vec(),
+				),
+			],
+			vec![
+				PERSIST_DATA_KEY.to_vec(),
+				LAST_PUSHED_ALARM_KEY.to_vec(),
+				INSPECTOR_TOKEN_KEY.to_vec(),
+				vec![5, 1, 1],
+			],
+			vec![
+				WORKFLOW_STORAGE_PREFIX.to_vec(),
+				CONN_PREFIX.to_vec(),
+				QUEUE_MESSAGES_PREFIX.to_vec(),
+			],
+		);
+
+		let (handle, mut rx) = test_envoy_handle();
+		tokio::spawn(async move {
+			while let Some(message) = rx.recv().await {
+				if let ToEnvoyMessage::KvRequest { response_tx, .. } = message {
+					let _ = response_tx.send(Err(anyhow::anyhow!(EnvoyShutdownError)));
+				}
+			}
+		});
+
+		let ctx = new_with_kv(
+			"actor-preloaded-persisted",
+			"task-preloaded-persisted",
+			Vec::new(),
+			"local",
+			crate::kv::Kv::new(handle.clone(), "actor-preloaded-persisted"),
+		);
+		ctx.configure_envoy(handle, Some(33));
+		let mut task = new_task(ctx.clone()).with_preloaded_kv(Some(preloaded_kv));
+		let (start_tx, start_rx) = oneshot::channel();
+
+		task.handle_lifecycle(LifecycleCommand::Start { reply: start_tx })
+			.await;
+		start_rx
+			.await
+			.expect("start reply should send")
+			.expect("start should decode persisted actor from preloaded kv");
+
+		assert_eq!(ctx.persisted_actor().state, b"preloaded-state");
+		assert_eq!(ctx.last_pushed_alarm(), Some(future_ts));
+	}
+
+	#[tokio::test]
+	async fn startup_uses_preloaded_alarm_with_partial_startup_preload() {
+		let _env_guard = test_inspector_env_lock().lock().expect("env lock poisoned");
+		unsafe {
+			std::env::remove_var("_RIVET_TEST_INSPECTOR_TOKEN");
+		}
+
+		let future_ts = 4_102_445_123_000;
+		let persisted = PersistedActor {
+			has_initialized: true,
+			scheduled_events: vec![PersistedScheduleEvent {
+				event_id: "evt-partial-preload-alarm".to_owned(),
+				timestamp: future_ts,
+				action: "tick".to_owned(),
+				args: None,
+			}],
+			..PersistedActor::default()
+		};
+		let encoded_persisted =
+			encode_persisted_actor(&persisted).expect("persisted actor should encode");
+		let encoded_alarm =
+			encode_last_pushed_alarm(Some(future_ts)).expect("last pushed alarm should encode");
+		let preloaded_kv = PreloadedKv::new_with_requested_get_keys(
+			vec![
+				(LAST_PUSHED_ALARM_KEY.to_vec(), encoded_alarm),
+				(
+					INSPECTOR_TOKEN_KEY.to_vec(),
+					b"startup-partial-preload-token".to_vec(),
+				),
+			],
+			vec![
+				LAST_PUSHED_ALARM_KEY.to_vec(),
+				INSPECTOR_TOKEN_KEY.to_vec(),
+				vec![5, 1, 1],
+			],
+			vec![
+				WORKFLOW_STORAGE_PREFIX.to_vec(),
+				CONN_PREFIX.to_vec(),
+				QUEUE_MESSAGES_PREFIX.to_vec(),
+			],
+		);
+
+		let saw_persist_live_get = Arc::new(AtomicBool::new(false));
+		let saw_persist_live_get_for_task = Arc::clone(&saw_persist_live_get);
+		let (handle, mut rx) = test_envoy_handle();
+		tokio::spawn(async move {
+			while let Some(message) = rx.recv().await {
+				if let ToEnvoyMessage::KvRequest {
+					data, response_tx, ..
+				} = message
+				{
+					match data {
+						protocol::KvRequestData::KvGetRequest(request) => {
+							assert_eq!(
+								request.keys,
+								vec![PERSIST_DATA_KEY.to_vec()],
+								"partial preload should only live-fetch missing persisted actor data"
+							);
+							saw_persist_live_get_for_task.store(true, Ordering::SeqCst);
+							let _ = response_tx.send(Ok(protocol::KvResponseData::KvGetResponse(
+								protocol::KvGetResponse {
+									keys: vec![PERSIST_DATA_KEY.to_vec()],
+									values: vec![encoded_persisted.clone()],
+									metadata: vec![protocol::KvMetadata {
+										version: Vec::new(),
+										update_ts: 0,
+									}],
+								},
+							)));
+						}
+						protocol::KvRequestData::KvPutRequest(_) => {
+							let _ = response_tx.send(Ok(protocol::KvResponseData::KvPutResponse));
+						}
+						other => {
+							let _ = response_tx
+								.send(Err(anyhow::anyhow!("unexpected KV request: {other:?}")));
+						}
+					}
+				}
+			}
+		});
+
+		let ctx = new_with_kv(
+			"actor-partial-preload-alarm",
+			"task-partial-preload-alarm",
+			Vec::new(),
+			"local",
+			crate::kv::Kv::new(handle.clone(), "actor-partial-preload-alarm"),
+		);
+		ctx.configure_envoy(handle, Some(32));
+		let mut task = new_task(ctx.clone()).with_preloaded_kv(Some(preloaded_kv));
+		let (start_tx, start_rx) = oneshot::channel();
+
+		task.handle_lifecycle(LifecycleCommand::Start { reply: start_tx })
+			.await;
+		start_rx
+			.await
+			.expect("start reply should send")
+			.expect("start should use preloaded alarm in partial preload bundle");
+
+		assert!(saw_persist_live_get.load(Ordering::SeqCst));
+		assert_eq!(ctx.last_pushed_alarm(), Some(future_ts));
 	}
 
 	#[tokio::test]
@@ -1948,9 +2441,9 @@ mod moved_tests {
 			has_initialized: true,
 			scheduled_events: vec![PersistedScheduleEvent {
 				event_id: "evt-future".to_owned(),
-				timestamp_ms: future_ts,
+				timestamp: future_ts,
 				action: "tick".to_owned(),
-				args: Vec::new(),
+				args: None,
 			}],
 			..PersistedActor::default()
 		};
@@ -1997,9 +2490,9 @@ mod moved_tests {
 			has_initialized: true,
 			scheduled_events: vec![PersistedScheduleEvent {
 				event_id: "evt-future".to_owned(),
-				timestamp_ms: future_ts,
+				timestamp: future_ts,
 				action: "tick".to_owned(),
-				args: Vec::new(),
+				args: None,
 			}],
 			..PersistedActor::default()
 		};
@@ -2066,9 +2559,9 @@ mod moved_tests {
 		ctx.load_persisted_actor(PersistedActor {
 			scheduled_events: vec![PersistedScheduleEvent {
 				event_id: "evt-overdue".to_owned(),
-				timestamp_ms: 0,
+				timestamp: 0,
 				action: "tick".to_owned(),
-				args: vec![1, 2, 3],
+				args: Some(vec![1, 2, 3]),
 			}],
 			..PersistedActor::default()
 		});
@@ -2645,11 +3138,14 @@ mod moved_tests {
 			})
 			.await
 			.expect("action should send during sleep grace");
-		let _error = action_rx
-			.await
-			.expect("action reply should send")
-			.expect_err("sleep grace should reject new dispatch");
-		assert_eq!(action_count.load(Ordering::SeqCst), 0);
+		assert_eq!(
+			action_rx
+				.await
+				.expect("action reply should send")
+				.expect("sleep grace should accept new dispatch"),
+			vec![7, 7, 7]
+		);
+		assert_eq!(action_count.load(Ordering::SeqCst), 1);
 		assert_eq!(destroy_count.load(Ordering::SeqCst), 0);
 
 		release_tx.send(()).expect("keep-awake release should send");
@@ -2664,6 +3160,37 @@ mod moved_tests {
 		run.await
 			.expect("task run should finish")
 			.expect("task run should succeed");
+	}
+
+	#[tokio::test]
+	async fn sleep_finalize_rejects_new_dispatch() {
+		let ctx = new_with_kv(
+			"actor-sleep-finalize-dispatch",
+			"task-sleep-finalize-dispatch",
+			Vec::new(),
+			"local",
+			new_in_memory(),
+		);
+		let mut task = new_task(ctx);
+		task.lifecycle = LifecycleState::SleepFinalize;
+
+		let (reply_tx, reply_rx) = oneshot::channel();
+		task.handle_dispatch(DispatchCommand::Action {
+			name: "ping".to_owned(),
+			args: Vec::new(),
+			conn: ConnHandle::new("conn-finalize", Vec::new(), Vec::new(), false),
+			reply: reply_tx,
+		})
+		.await;
+
+		let error = reply_rx
+			.await
+			.expect("action reply should send")
+			.expect_err("sleep finalize should reject new dispatch");
+		assert!(
+			error.to_string().contains("Actor is stopping"),
+			"expected actor stopping error, got {error:#}"
+		);
 	}
 
 	#[cfg(not(debug_assertions))]
@@ -3523,7 +4050,8 @@ mod moved_tests {
 							reply.send(Ok(()));
 							break;
 						}
-						ActorEvent::ConnectionOpen { .. } => {
+						ActorEvent::ConnectionPreflight { .. }
+						| ActorEvent::ConnectionOpen { .. } => {
 							panic!("hibernated connection should not refire ConnectionOpen");
 						}
 						_ => {}
@@ -3648,7 +4176,8 @@ mod moved_tests {
 							reply.send(Ok(()));
 							break;
 						}
-						ActorEvent::ConnectionOpen { .. } => {
+						ActorEvent::ConnectionPreflight { .. }
+						| ActorEvent::ConnectionOpen { .. } => {
 							panic!("dead hibernated connection should not refire ConnectionOpen");
 						}
 						_ => {}

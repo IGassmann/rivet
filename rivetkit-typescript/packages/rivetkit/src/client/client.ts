@@ -1,9 +1,9 @@
 import type { AnyActorDefinition } from "@/actor/definition";
+import type { ActorQuery } from "@/client/query";
 import type { Encoding } from "@/common/encoding";
 import type { EngineControlClient } from "@/engine-client/driver";
-import type { ActorQuery } from "@/client/query";
 import type { Registry } from "@/registry";
-import type { ActorActionFunction } from "./actor-common";
+import type { ActorActionFunction, ActorGatewayOptions } from "./actor-common";
 import {
 	type ActorConn,
 	type ActorConnRaw,
@@ -178,6 +178,7 @@ export class ClientRaw {
 
 	#driver: EngineControlClient;
 	#encodingKind: Encoding;
+	#gatewayOptions: ActorGatewayOptions;
 
 	/**
 	 * Creates an instance of Client.
@@ -185,10 +186,12 @@ export class ClientRaw {
 	public constructor(
 		driver: EngineControlClient,
 		encoding: Encoding | undefined,
+		gatewayOptions: ActorGatewayOptions = {},
 	) {
 		this.#driver = driver;
 
 		this.#encodingKind = encoding ?? "bare";
+		this.#gatewayOptions = gatewayOptions;
 	}
 
 	/**
@@ -382,6 +385,7 @@ export class ClientRaw {
 			getParams,
 			this.#encodingKind,
 			actorQuery,
+			this.#gatewayOptions,
 		);
 	}
 
@@ -438,9 +442,9 @@ export type AnyClient = Client<Registry<any>>;
 
 export function createClientWithDriver<A extends Registry<any>>(
 	driver: EngineControlClient,
-	config: { encoding?: Encoding } = {},
+	config: { encoding?: Encoding; gateway?: ActorGatewayOptions } = {},
 ): Client<A> {
-	const client = new ClientRaw(driver, config.encoding);
+	const client = new ClientRaw(driver, config.encoding, config.gateway);
 
 	// Create proxy for accessing actors by name
 	return new Proxy(client, {

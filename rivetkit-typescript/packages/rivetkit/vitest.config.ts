@@ -1,12 +1,18 @@
 import { resolve } from "node:path";
 import tsconfigPaths from "vite-tsconfig-paths";
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 import defaultConfig from "../../../vitest.base.ts";
 
 export default defineConfig({
 	...defaultConfig,
 	test: {
 		...defaultConfig.test,
+		exclude: [
+			...configDefaults.exclude,
+			...(process.env.RIVETKIT_INCLUDE_PLATFORM_TESTS === "1"
+				? []
+				: ["tests/platforms/**/*.test.ts"]),
+		],
 		fileParallelism: false,
 		testTimeout: 30_000,
 		hookTimeout: 30_000,

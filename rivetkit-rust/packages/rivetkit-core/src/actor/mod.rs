@@ -4,6 +4,7 @@ pub mod connection;
 pub mod context;
 pub(crate) mod diagnostics;
 pub mod factory;
+pub(crate) mod keys;
 pub mod kv;
 pub mod lifecycle_hooks;
 pub mod messages;
@@ -22,7 +23,7 @@ pub(crate) mod work_registry;
 pub use action::ActionDispatchError;
 pub use config::{ActionDefinition, ActorConfig, ActorConfigOverrides, CanHibernateWebSocket};
 pub use connection::ConnHandle;
-pub use context::{ActorContext, WebSocketCallbackRegion};
+pub use context::{ActorContext, KeepAwakeRegion, WebSocketCallbackRegion};
 pub use factory::{ActorEntryFn, ActorFactory};
 pub use kv::Kv;
 pub use lifecycle_hooks::{ActorEvents, ActorStart, Reply};
@@ -31,7 +32,9 @@ pub use queue::{
 	CompletableQueueMessage, EnqueueAndWaitOpts, QueueMessage, QueueNextBatchOpts, QueueNextOpts,
 	QueueTryNextBatchOpts, QueueTryNextOpts, QueueWaitOpts,
 };
-pub use sqlite::{BindParam, ColumnValue, ExecResult, QueryResult, SqliteDb};
+pub use sqlite::{
+	BindParam, ColumnValue, ExecResult, ExecuteResult, QueryResult, SqliteBackend, SqliteDb,
+};
 pub use state::RequestSaveOpts;
 pub use task::{
 	ActionDispatchResult, ActorTask, DispatchCommand, HttpDispatchResult, LifecycleCommand,

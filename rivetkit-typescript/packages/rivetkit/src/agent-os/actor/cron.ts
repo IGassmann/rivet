@@ -2,9 +2,44 @@ import type { CronAction, CronJobInfo } from "@rivet-dev/agent-os-core";
 import type { AgentOsActorConfig } from "../config";
 import type {
 	AgentOsActionContext,
+	SerializableCronAction,
+	SerializableCronJobInfo,
 	SerializableCronJobOptions,
 } from "../types";
 import { ensureVm } from "./index";
+
+function serializeCronAction(action: CronAction): SerializableCronAction {
+	switch (action.type) {
+		case "session":
+			return {
+				type: "session",
+				agentType: action.agentType,
+				prompt: action.prompt,
+				cwd: action.options?.cwd,
+			};
+		case "exec":
+			return {
+				type: "exec",
+				command: action.command,
+				args: action.args,
+			};
+		case "callback":
+			throw new TypeError("callback cron actions are not serializable");
+	}
+}
+
+function serializeCronJob(job: CronJobInfo): SerializableCronJobInfo {
+	return {
+		id: job.id,
+		schedule: job.schedule,
+		action: serializeCronAction(job.action),
+		overlap: job.overlap,
+		lastRun: job.lastRun?.toISOString(),
+		nextRun: job.nextRun?.toISOString(),
+		runCount: job.runCount,
+		running: job.running,
+	};
+}
 
 // Build cron scheduling actions for the actor factory.
 export function buildCronActions<TConnParams>(
@@ -32,9 +67,9 @@ export function buildCronActions<TConnParams>(
 
 		listCronJobs: async (
 			c: AgentOsActionContext<TConnParams>,
-		): Promise<CronJobInfo[]> => {
+		): Promise<SerializableCronJobInfo[]> => {
 			const agentOs = await ensureVm(c, config);
-			return agentOs.listCronJobs();
+			return agentOs.listCronJobs().map(serializeCronJob);
 		},
 
 		cancelCronJob: async (

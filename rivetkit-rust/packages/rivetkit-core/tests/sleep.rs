@@ -4,10 +4,12 @@ mod moved_tests {
 
 	use crate::actor::context::ActorContext;
 	use parking_lot::Mutex as DropMutex;
-	use rivet_util::async_counter::AsyncCounter;
+	use rivet_envoy_client::async_counter::AsyncCounter;
+	use std::time::{Duration, Instant};
 	use tokio::sync::oneshot;
 	use tokio::task::yield_now;
-	use tokio::time::{Duration, Instant, advance};
+
+	use tokio::time::advance;
 	use tracing::field::{Field, Visit};
 	use tracing::{Event, Subscriber};
 	use tracing_subscriber::layer::{Context as LayerContext, Layer};
@@ -17,24 +19,38 @@ mod moved_tests {
 	#[derive(Default)]
 	struct MessageVisitor {
 		message: Option<String>,
+		actor_id: Option<String>,
+		reason: Option<String>,
 	}
 
 	impl Visit for MessageVisitor {
 		fn record_str(&mut self, field: &Field, value: &str) {
-			if field.name() == "message" {
-				self.message = Some(value.to_owned());
+			match field.name() {
+				"message" => self.message = Some(value.to_owned()),
+				"actor_id" => self.actor_id = Some(value.to_owned()),
+				"reason" => self.reason = Some(value.to_owned()),
+				_ => {}
 			}
 		}
 
 		fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-			if field.name() == "message" {
-				self.message = Some(format!("{value:?}").trim_matches('"').to_owned());
+			let value = format!("{value:?}").trim_matches('"').to_owned();
+			match field.name() {
+				"message" => self.message = Some(value),
+				"actor_id" => self.actor_id = Some(value),
+				"reason" => self.reason = Some(value),
+				_ => {}
 			}
 		}
 	}
 
 	#[derive(Clone)]
 	struct ShutdownTaskRefusedLayer {
+		count: Arc<AtomicUsize>,
+	}
+
+	#[derive(Clone)]
+	struct RegisteredTaskDeadlineLayer {
 		count: Arc<AtomicUsize>,
 	}
 
@@ -51,6 +67,26 @@ mod moved_tests {
 			event.record(&mut visitor);
 			if visitor.message.as_deref()
 				== Some("shutdown task spawned after teardown; aborting immediately")
+			{
+				self.count.fetch_add(1, Ordering::SeqCst);
+			}
+		}
+	}
+
+	impl<S> Layer<S> for RegisteredTaskDeadlineLayer
+	where
+		S: Subscriber,
+	{
+		fn on_event(&self, event: &Event<'_>, _ctx: LayerContext<'_, S>) {
+			if *event.metadata().level() != tracing::Level::WARN {
+				return;
+			}
+
+			let mut visitor = MessageVisitor::default();
+			event.record(&mut visitor);
+			if visitor.message.as_deref() == Some("registered task cancelled by shutdown deadline")
+				&& visitor.actor_id.as_deref() == Some("actor-register-task-deadline")
+				&& visitor.reason.as_deref() == Some("shutdown_deadline_elapsed")
 			{
 				self.count.fetch_add(1, Ordering::SeqCst);
 			}
@@ -161,11 +197,39 @@ mod moved_tests {
 	}
 
 	#[tokio::test(start_paused = true)]
+	async fn register_task_exits_when_shutdown_deadline_cancels() {
+		let ctx = ActorContext::new_for_sleep_tests("actor-register-task-deadline");
+		let warning_count = Arc::new(AtomicUsize::new(0));
+		let subscriber = Registry::default().with(RegisteredTaskDeadlineLayer {
+			count: warning_count.clone(),
+		});
+		let _guard = tracing::subscriber::set_default(subscriber);
+
+		ctx.register_task(futures::future::pending::<()>());
+		assert_eq!(ctx.shutdown_task_count(), 1);
+
+		ctx.cancel_shutdown_deadline();
+
+		assert!(
+			ctx.0
+				.sleep
+				.work
+				.shutdown_counter
+				.wait_zero(Instant::now() + Duration::from_millis(1))
+				.await,
+			"registered task should stop waiting after the shutdown deadline"
+		);
+		assert_eq!(ctx.shutdown_task_count(), 0);
+		assert_eq!(warning_count.load(Ordering::SeqCst), 1);
+	}
+
+	#[tokio::test(start_paused = true)]
 	async fn sleep_then_destroy_signal_tasks_do_not_leak_after_teardown() {
 		let ctx = ActorContext::new_for_sleep_tests("actor-sleep-destroy");
 		ctx.set_started(true);
 
-		ctx.sleep().expect("sleep should succeed after started is set");
+		ctx.sleep()
+			.expect("sleep should succeed after started is set");
 		ctx.destroy()
 			.expect("destroy should succeed after started is set");
 

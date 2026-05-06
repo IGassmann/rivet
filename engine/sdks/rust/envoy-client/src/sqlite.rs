@@ -4,29 +4,52 @@ use tokio::sync::oneshot;
 use crate::connection::ws_send;
 use crate::envoy::EnvoyContext;
 use crate::kv::KV_EXPIRE_MS;
+use crate::utils::{EnvoyShutdownError, RemoteSqliteIndeterminateResultError};
 
 #[derive(Clone)]
 pub enum SqliteRequest {
 	GetPages(protocol::SqliteGetPagesRequest),
 	Commit(protocol::SqliteCommitRequest),
-	CommitStageBegin(protocol::SqliteCommitStageBeginRequest),
-	CommitStage(protocol::SqliteCommitStageRequest),
-	CommitFinalize(protocol::SqliteCommitFinalizeRequest),
 }
 
 pub enum SqliteResponse {
 	GetPages(protocol::SqliteGetPagesResponse),
 	Commit(protocol::SqliteCommitResponse),
-	CommitStageBegin(protocol::SqliteCommitStageBeginResponse),
-	CommitStage(protocol::SqliteCommitStageResponse),
-	CommitFinalize(protocol::SqliteCommitFinalizeResponse),
+}
+
+#[derive(Clone, Debug)]
+pub enum RemoteSqliteRequest {
+	Exec(protocol::SqliteExecRequest),
+	Execute(protocol::SqliteExecuteRequest),
+}
+
+#[derive(Debug)]
+pub enum RemoteSqliteResponse {
+	Exec(protocol::SqliteExecResponse),
+	Execute(protocol::SqliteExecuteResponse),
+}
+
+impl RemoteSqliteRequest {
+	fn operation(&self) -> &'static str {
+		match self {
+			RemoteSqliteRequest::Exec(_) => "exec",
+			RemoteSqliteRequest::Execute(_) => "execute",
+		}
+	}
 }
 
 pub struct SqliteRequestEntry {
 	pub request: SqliteRequest,
 	pub response_tx: oneshot::Sender<anyhow::Result<SqliteResponse>>,
 	pub sent: bool,
-	pub timestamp: std::time::Instant,
+	pub timestamp: crate::time::Instant,
+}
+
+pub struct RemoteSqliteRequestEntry {
+	pub request: RemoteSqliteRequest,
+	pub response_tx: oneshot::Sender<anyhow::Result<RemoteSqliteResponse>>,
+	pub sent: bool,
+	pub timestamp: crate::time::Instant,
 }
 
 pub async fn handle_sqlite_request(
@@ -41,7 +64,7 @@ pub async fn handle_sqlite_request(
 		request,
 		response_tx,
 		sent: false,
-		timestamp: std::time::Instant::now(),
+		timestamp: crate::time::Instant::now(),
 	};
 
 	ctx.sqlite_requests.insert(request_id, entry);
@@ -53,6 +76,33 @@ pub async fn handle_sqlite_request(
 
 	if ws_available {
 		send_single_sqlite_request(ctx, request_id).await;
+	}
+}
+
+pub async fn handle_remote_sqlite_request(
+	ctx: &mut EnvoyContext,
+	request: RemoteSqliteRequest,
+	response_tx: oneshot::Sender<anyhow::Result<RemoteSqliteResponse>>,
+) {
+	let request_id = ctx.next_remote_sqlite_request_id;
+	ctx.next_remote_sqlite_request_id += 1;
+
+	let entry = RemoteSqliteRequestEntry {
+		request,
+		response_tx,
+		sent: false,
+		timestamp: crate::time::Instant::now(),
+	};
+
+	ctx.remote_sqlite_requests.insert(request_id, entry);
+
+	let ws_available = {
+		let guard = ctx.shared.ws_tx.lock().await;
+		guard.is_some()
+	};
+
+	if ws_available {
+		send_single_remote_sqlite_request(ctx, request_id).await;
 	}
 }
 
@@ -80,39 +130,27 @@ pub async fn handle_sqlite_commit_response(
 	);
 }
 
-pub async fn handle_sqlite_commit_stage_begin_response(
+pub async fn handle_remote_sqlite_exec_response(
 	ctx: &mut EnvoyContext,
-	response: protocol::ToEnvoySqliteCommitStageBeginResponse,
+	response: protocol::ToEnvoySqliteExecResponse,
 ) {
-	handle_sqlite_response(
+	handle_remote_sqlite_response(
 		ctx,
 		response.request_id,
-		SqliteResponse::CommitStageBegin(response.data),
-		"sqlite_commit_stage_begin",
+		RemoteSqliteResponse::Exec(response.data),
+		"remote_sqlite_exec",
 	);
 }
 
-pub async fn handle_sqlite_commit_stage_response(
+pub async fn handle_remote_sqlite_execute_response(
 	ctx: &mut EnvoyContext,
-	response: protocol::ToEnvoySqliteCommitStageResponse,
+	response: protocol::ToEnvoySqliteExecuteResponse,
 ) {
-	handle_sqlite_response(
+	handle_remote_sqlite_response(
 		ctx,
 		response.request_id,
-		SqliteResponse::CommitStage(response.data),
-		"sqlite_commit_stage",
-	);
-}
-
-pub async fn handle_sqlite_commit_finalize_response(
-	ctx: &mut EnvoyContext,
-	response: protocol::ToEnvoySqliteCommitFinalizeResponse,
-) {
-	handle_sqlite_response(
-		ctx,
-		response.request_id,
-		SqliteResponse::CommitFinalize(response.data),
-		"sqlite_commit_finalize",
+		RemoteSqliteResponse::Execute(response.data),
+		"remote_sqlite_execute",
 	);
 }
 
@@ -135,6 +173,25 @@ fn handle_sqlite_response(
 	}
 }
 
+fn handle_remote_sqlite_response(
+	ctx: &mut EnvoyContext,
+	request_id: u32,
+	response: RemoteSqliteResponse,
+	op: &str,
+) {
+	let request = ctx.remote_sqlite_requests.remove(&request_id);
+
+	if let Some(request) = request {
+		let _ = request.response_tx.send(Ok(response));
+	} else {
+		tracing::error!(
+			request_id,
+			op,
+			"received remote sqlite response for unknown request id"
+		);
+	}
+}
+
 pub async fn send_single_sqlite_request(ctx: &mut EnvoyContext, request_id: u32) {
 	let request = ctx.sqlite_requests.get_mut(&request_id);
 	let Some(request) = request else { return };
@@ -150,26 +207,50 @@ pub async fn send_single_sqlite_request(ctx: &mut EnvoyContext, request_id: u32)
 			SqliteRequest::Commit(data) => protocol::ToRivet::ToRivetSqliteCommitRequest(
 				protocol::ToRivetSqliteCommitRequest { request_id, data },
 			),
-			SqliteRequest::CommitStageBegin(data) => {
-				protocol::ToRivet::ToRivetSqliteCommitStageBeginRequest(
-					protocol::ToRivetSqliteCommitStageBeginRequest { request_id, data },
-				)
-			}
-			SqliteRequest::CommitStage(data) => protocol::ToRivet::ToRivetSqliteCommitStageRequest(
-				protocol::ToRivetSqliteCommitStageRequest { request_id, data },
-			),
-			SqliteRequest::CommitFinalize(data) => {
-				protocol::ToRivet::ToRivetSqliteCommitFinalizeRequest(
-					protocol::ToRivetSqliteCommitFinalizeRequest { request_id, data },
-				)
-			}
 		};
 
 	ws_send(&ctx.shared, message).await;
 
 	if let Some(request) = ctx.sqlite_requests.get_mut(&request_id) {
 		request.sent = true;
-		request.timestamp = std::time::Instant::now();
+		request.timestamp = crate::time::Instant::now();
+	}
+}
+
+pub async fn send_single_remote_sqlite_request(ctx: &mut EnvoyContext, request_id: u32) {
+	let request = ctx.remote_sqlite_requests.get_mut(&request_id);
+	let Some(request) = request else { return };
+	if request.sent {
+		return;
+	}
+
+	let message = remote_sqlite_request_to_message(request_id, request.request.clone());
+
+	ws_send(&ctx.shared, message).await;
+
+	if let Some(request) = ctx.remote_sqlite_requests.get_mut(&request_id) {
+		request.sent = true;
+		request.timestamp = crate::time::Instant::now();
+	}
+}
+
+pub fn remote_sqlite_request_to_message(
+	request_id: u32,
+	request: RemoteSqliteRequest,
+) -> protocol::ToRivet {
+	match request {
+		RemoteSqliteRequest::Exec(data) => {
+			protocol::ToRivet::ToRivetSqliteExecRequest(protocol::ToRivetSqliteExecRequest {
+				request_id,
+				data,
+			})
+		}
+		RemoteSqliteRequest::Execute(data) => {
+			protocol::ToRivet::ToRivetSqliteExecuteRequest(protocol::ToRivetSqliteExecuteRequest {
+				request_id,
+				data,
+			})
+		}
 	}
 }
 
@@ -195,8 +276,30 @@ pub async fn process_unsent_sqlite_requests(ctx: &mut EnvoyContext) {
 	}
 }
 
+pub async fn process_unsent_remote_sqlite_requests(ctx: &mut EnvoyContext) {
+	let ws_available = {
+		let guard = ctx.shared.ws_tx.lock().await;
+		guard.is_some()
+	};
+
+	if !ws_available {
+		return;
+	}
+
+	let unsent: Vec<u32> = ctx
+		.remote_sqlite_requests
+		.iter()
+		.filter(|(_, req)| !req.sent)
+		.map(|(id, _)| *id)
+		.collect();
+
+	for request_id in unsent {
+		send_single_remote_sqlite_request(ctx, request_id).await;
+	}
+}
+
 pub fn cleanup_old_sqlite_requests(ctx: &mut EnvoyContext) {
-	let now = std::time::Instant::now();
+	let now = crate::time::Instant::now();
 	let mut to_delete = Vec::new();
 
 	for (request_id, request) in &ctx.sqlite_requests {
@@ -211,5 +314,356 @@ pub fn cleanup_old_sqlite_requests(ctx: &mut EnvoyContext) {
 				.response_tx
 				.send(Err(anyhow::anyhow!("sqlite request timed out")));
 		}
+	}
+}
+
+pub fn cleanup_old_remote_sqlite_requests(ctx: &mut EnvoyContext) {
+	let now = crate::time::Instant::now();
+	let mut to_delete = Vec::new();
+
+	for (request_id, request) in &ctx.remote_sqlite_requests {
+		if now.duration_since(request.timestamp).as_millis() > KV_EXPIRE_MS as u128 {
+			to_delete.push(*request_id);
+		}
+	}
+
+	for request_id in to_delete {
+		if let Some(request) = ctx.remote_sqlite_requests.remove(&request_id) {
+			let _ = request
+				.response_tx
+				.send(Err(anyhow::anyhow!("remote sqlite request timed out")));
+		}
+	}
+}
+
+pub fn fail_sqlite_requests_with_shutdown(ctx: &mut EnvoyContext) {
+	for (_id, request) in ctx.sqlite_requests.drain() {
+		let _ = request
+			.response_tx
+			.send(Err(anyhow::anyhow!(EnvoyShutdownError)));
+	}
+}
+
+pub fn fail_remote_sqlite_requests_with_shutdown(ctx: &mut EnvoyContext) {
+	for (_id, request) in ctx.remote_sqlite_requests.drain() {
+		let _ = request
+			.response_tx
+			.send(Err(anyhow::anyhow!(EnvoyShutdownError)));
+	}
+}
+
+pub fn fail_sent_remote_sqlite_requests_with_indeterminate_result(ctx: &mut EnvoyContext) {
+	let request_ids: Vec<u32> = ctx
+		.remote_sqlite_requests
+		.iter()
+		.filter(|(_, request)| request.sent)
+		.map(|(request_id, _)| *request_id)
+		.collect();
+
+	for request_id in request_ids {
+		if let Some(request) = ctx.remote_sqlite_requests.remove(&request_id) {
+			let operation = request.request.operation();
+			tracing::warn!(
+				request_id,
+				operation,
+				"remote sqlite response lost after websocket disconnect"
+			);
+			let _ = request.response_tx.send(Err(anyhow::anyhow!(
+				RemoteSqliteIndeterminateResultError { operation }
+			)));
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::HashMap;
+	use std::sync::Arc;
+
+	use vbare::OwnedVersionedData;
+
+	use super::*;
+	use crate::config::{
+		BoxFuture, EnvoyCallbacks, EnvoyConfig, HttpRequest, HttpResponse, WebSocketHandler,
+		WebSocketSender,
+	};
+	use crate::context::{SharedContext, WsTxMessage};
+	use crate::handle::EnvoyHandle;
+	use crate::utils::{BufferMap, RemoteSqliteIndeterminateResultError};
+
+	struct IdleCallbacks;
+
+	impl EnvoyCallbacks for IdleCallbacks {
+		fn on_actor_start(
+			&self,
+			_handle: EnvoyHandle,
+			_actor_id: String,
+			_generation: u32,
+			_config: protocol::ActorConfig,
+			_preloaded_kv: Option<protocol::PreloadedKv>,
+		) -> BoxFuture<anyhow::Result<()>> {
+			Box::pin(async { Ok(()) })
+		}
+
+		fn on_shutdown(&self) {}
+
+		fn fetch(
+			&self,
+			_handle: EnvoyHandle,
+			_actor_id: String,
+			_gateway_id: protocol::GatewayId,
+			_request_id: protocol::RequestId,
+			_request: HttpRequest,
+		) -> BoxFuture<anyhow::Result<HttpResponse>> {
+			Box::pin(async { anyhow::bail!("fetch should not be called in sqlite tests") })
+		}
+
+		fn websocket(
+			&self,
+			_handle: EnvoyHandle,
+			_actor_id: String,
+			_gateway_id: protocol::GatewayId,
+			_request_id: protocol::RequestId,
+			_request: HttpRequest,
+			_path: String,
+			_headers: HashMap<String, String>,
+			_is_hibernatable: bool,
+			_is_restoring_hibernatable: bool,
+			_sender: WebSocketSender,
+		) -> BoxFuture<anyhow::Result<WebSocketHandler>> {
+			Box::pin(async { anyhow::bail!("websocket should not be called in sqlite tests") })
+		}
+
+		fn can_hibernate(
+			&self,
+			_actor_id: &str,
+			_gateway_id: &protocol::GatewayId,
+			_request_id: &protocol::RequestId,
+			_request: &HttpRequest,
+		) -> BoxFuture<anyhow::Result<bool>> {
+			Box::pin(async { Ok(false) })
+		}
+	}
+
+	fn new_envoy_context() -> EnvoyContext {
+		let (envoy_tx, _envoy_rx) = tokio::sync::mpsc::unbounded_channel();
+		let shared = Arc::new(SharedContext {
+			config: EnvoyConfig {
+				version: 1,
+				endpoint: "http://127.0.0.1:1".to_string(),
+				token: None,
+				namespace: "test".to_string(),
+				pool_name: "test".to_string(),
+				prepopulate_actor_names: HashMap::new(),
+				metadata: None,
+				not_global: true,
+				debug_latency_ms: None,
+				callbacks: Arc::new(IdleCallbacks),
+			},
+			envoy_key: "test-envoy".to_string(),
+			envoy_tx,
+			actors: Arc::new(std::sync::Mutex::new(HashMap::new())),
+			actors_notify: Arc::new(tokio::sync::Notify::new()),
+			live_tunnel_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
+			pending_hibernation_restores: Arc::new(std::sync::Mutex::new(HashMap::new())),
+			ws_tx: Arc::new(tokio::sync::Mutex::new(
+				None::<tokio::sync::mpsc::UnboundedSender<WsTxMessage>>,
+			)),
+			protocol_metadata: Arc::new(tokio::sync::Mutex::new(None)),
+			shutting_down: std::sync::atomic::AtomicBool::new(false),
+			stopped_tx: tokio::sync::watch::channel(true).0,
+		});
+
+		EnvoyContext {
+			shared,
+			shutting_down: false,
+			actors: HashMap::new(),
+			buffered_actor_messages: HashMap::new(),
+			kv_requests: HashMap::new(),
+			next_kv_request_id: 0,
+			sqlite_requests: HashMap::new(),
+			next_sqlite_request_id: 0,
+			remote_sqlite_requests: HashMap::new(),
+			next_remote_sqlite_request_id: 0,
+			request_to_actor: BufferMap::new(),
+			buffered_messages: Vec::new(),
+			processed_command_idx: HashMap::new(),
+		}
+	}
+
+	fn exec_request() -> protocol::SqliteExecRequest {
+		protocol::SqliteExecRequest {
+			namespace_id: "ns".to_string(),
+			actor_id: "actor".to_string(),
+			generation: 1,
+			sql: "select 1".to_string(),
+		}
+	}
+
+	fn execute_request() -> protocol::SqliteExecuteRequest {
+		protocol::SqliteExecuteRequest {
+			namespace_id: "ns".to_string(),
+			actor_id: "actor".to_string(),
+			generation: 1,
+			sql: "select ?".to_string(),
+			params: Some(vec![protocol::SqliteBindParam::SqliteValueInteger(
+				protocol::SqliteValueInteger { value: 1 },
+			)]),
+		}
+	}
+
+	#[tokio::test]
+	async fn remote_sqlite_exec_response_matches_pending_request() {
+		let mut ctx = new_envoy_context();
+		let (tx, rx) = oneshot::channel();
+
+		handle_remote_sqlite_request(&mut ctx, RemoteSqliteRequest::Exec(exec_request()), tx).await;
+		assert!(ctx.remote_sqlite_requests.contains_key(&0));
+
+		handle_remote_sqlite_exec_response(
+			&mut ctx,
+			protocol::ToEnvoySqliteExecResponse {
+				request_id: 0,
+				data: protocol::SqliteExecResponse::SqliteExecOk(protocol::SqliteExecOk {
+					result: protocol::SqliteQueryResult {
+						columns: vec!["one".to_string()],
+						rows: vec![vec![protocol::SqliteColumnValue::SqliteValueInteger(
+							protocol::SqliteValueInteger { value: 1 },
+						)]],
+					},
+				}),
+			},
+		)
+		.await;
+
+		let response = rx
+			.await
+			.expect("response sender should complete")
+			.expect("response should succeed");
+		match response {
+			RemoteSqliteResponse::Exec(protocol::SqliteExecResponse::SqliteExecOk(ok)) => {
+				assert_eq!(ok.result.columns, vec!["one"]);
+				assert_eq!(ok.result.rows.len(), 1);
+			}
+			_ => panic!("unexpected response"),
+		}
+		assert!(ctx.remote_sqlite_requests.is_empty());
+	}
+
+	#[test]
+	fn remote_sqlite_requests_reject_protocol_v3_serialization() {
+		let requests = vec![
+			RemoteSqliteRequest::Exec(exec_request()),
+			RemoteSqliteRequest::Execute(execute_request()),
+		];
+
+		for request in requests {
+			let message = remote_sqlite_request_to_message(7, request);
+			let err = protocol::versioned::ToRivet::wrap_latest(message)
+				.serialize(3)
+				.expect_err("remote sqlite requests should require protocol v4");
+			let compatibility = err
+				.downcast_ref::<protocol::versioned::ProtocolCompatibilityError>()
+				.expect("error should be a protocol compatibility error");
+			assert_eq!(
+				compatibility.feature,
+				protocol::versioned::ProtocolCompatibilityFeature::RemoteSqliteExecution
+			);
+			assert_eq!(compatibility.required_version, 4);
+			assert_eq!(compatibility.target_version, 3);
+		}
+	}
+
+	#[tokio::test]
+	async fn remote_sqlite_shutdown_cleanup_fails_pending_requests() {
+		let mut ctx = new_envoy_context();
+		let (tx, rx) = oneshot::channel();
+
+		handle_remote_sqlite_request(
+			&mut ctx,
+			RemoteSqliteRequest::Execute(execute_request()),
+			tx,
+		)
+		.await;
+		fail_remote_sqlite_requests_with_shutdown(&mut ctx);
+
+		let err = rx
+			.await
+			.expect("response sender should complete")
+			.expect_err("pending request should fail during shutdown");
+		assert!(err.downcast_ref::<EnvoyShutdownError>().is_some());
+		assert!(ctx.remote_sqlite_requests.is_empty());
+	}
+
+	#[tokio::test]
+	async fn sent_remote_sqlite_request_fails_indeterminate_on_disconnect() {
+		let mut ctx = new_envoy_context();
+		let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel();
+		*ctx.shared.ws_tx.lock().await = Some(ws_tx);
+		let (tx, rx) = oneshot::channel();
+
+		handle_remote_sqlite_request(
+			&mut ctx,
+			RemoteSqliteRequest::Execute(execute_request()),
+			tx,
+		)
+		.await;
+		assert!(matches!(ws_rx.recv().await, Some(WsTxMessage::Send(_))));
+		assert!(
+			ctx.remote_sqlite_requests
+				.get(&0)
+				.expect("request should be pending")
+				.sent
+		);
+
+		fail_sent_remote_sqlite_requests_with_indeterminate_result(&mut ctx);
+
+		let err = rx
+			.await
+			.expect("response sender should complete")
+			.expect_err("sent write should fail indeterminate on disconnect");
+		let indeterminate = err
+			.downcast_ref::<RemoteSqliteIndeterminateResultError>()
+			.expect("error should describe indeterminate remote sqlite result");
+		assert_eq!(indeterminate.operation, "execute");
+		assert!(ctx.remote_sqlite_requests.is_empty());
+	}
+
+	#[tokio::test]
+	async fn unsent_remote_sqlite_request_survives_disconnect_and_sends_on_reconnect() {
+		let mut ctx = new_envoy_context();
+		let (tx, mut rx) = oneshot::channel();
+
+		handle_remote_sqlite_request(
+			&mut ctx,
+			RemoteSqliteRequest::Execute(execute_request()),
+			tx,
+		)
+		.await;
+		assert!(
+			!ctx.remote_sqlite_requests
+				.get(&0)
+				.expect("request should be pending")
+				.sent
+		);
+
+		fail_sent_remote_sqlite_requests_with_indeterminate_result(&mut ctx);
+		assert!(matches!(
+			rx.try_recv(),
+			Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+		));
+		assert!(ctx.remote_sqlite_requests.contains_key(&0));
+
+		let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel();
+		*ctx.shared.ws_tx.lock().await = Some(ws_tx);
+		process_unsent_remote_sqlite_requests(&mut ctx).await;
+
+		assert!(matches!(ws_rx.recv().await, Some(WsTxMessage::Send(_))));
+		assert!(
+			ctx.remote_sqlite_requests
+				.get(&0)
+				.expect("request should still be pending")
+				.sent
+		);
 	}
 }

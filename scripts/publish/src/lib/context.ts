@@ -8,7 +8,7 @@ import { $ } from "execa";
  * subcommand and passed through every subsequent step via GitHub Actions job
  * outputs + per-step flags.
  */
-export type Trigger = "pr" | "main" | "release";
+export type Trigger = "branch" | "release";
 
 export interface PublishContext {
 	trigger: Trigger;
@@ -20,7 +20,8 @@ export interface PublishContext {
 	sha: string;
 	/** Only meaningful when trigger === "release". */
 	latest: boolean;
-	prNumber?: number;
+	/** Branch name. Only set when trigger === "branch". */
+	branch?: string;
 	repoRoot: string;
 }
 
@@ -29,7 +30,7 @@ export interface ResolveOverrides {
 	trigger?: Trigger;
 	version?: string;
 	latest?: boolean;
-	prNumber?: number;
+	branch?: string;
 	sha?: string;
 }
 
@@ -47,10 +48,11 @@ function findRepoRoot(): string {
 
 /**
  * Base for all preview pre-release strings. Hardcoded to `0.0.0` so preview
- * versions like `0.0.0-pr.4600.abc1234` never look like real releases and
+ * versions like `0.0.0-my-branch.abc1234` never look like real releases and
  * always sort below any published `X.Y.Z`. Using a committed `package.json`
  * version as the base would just embed whatever stale number happened to be
- * committed there — it has no semantic relationship to the PR being previewed.
+ * committed there. It has no semantic relationship to the branch being
+ * previewed.
  */
 const PREVIEW_BASE_VERSION = "0.0.0";
 
@@ -61,22 +63,31 @@ async function readShortSha(repoRoot: string): Promise<string> {
 	return stdout.trim().slice(0, 7);
 }
 
-function readPrNumberFromEvent(): number | undefined {
-	const path = process.env.GITHUB_EVENT_PATH;
-	if (!path || !existsSync(path)) return undefined;
-	try {
-		const event = JSON.parse(readFileSync(path, "utf-8")) as {
-			pull_request?: { number?: number };
-			number?: number;
-		};
-		if (typeof event.pull_request?.number === "number") {
-			return event.pull_request.number;
-		}
-		if (typeof event.number === "number") return event.number;
-	} catch {
-		// fall through
+async function readBranchName(repoRoot: string): Promise<string> {
+	const envRef = process.env.GITHUB_REF_NAME;
+	if (envRef) return envRef;
+	const { stdout } = await $({
+		cwd: repoRoot,
+	})`git rev-parse --abbrev-ref HEAD`;
+	return stdout.trim();
+}
+
+/**
+ * Sanitize a branch name into something safe to use as both an npm dist-tag
+ * and a semver prerelease identifier. Lowercases, replaces any
+ * non-alphanumeric character (other than hyphens) with a hyphen, collapses
+ * runs of hyphens, and trims leading/trailing hyphens.
+ */
+function sanitizeBranch(branch: string): string {
+	const cleaned = branch
+		.toLowerCase()
+		.replace(/[^a-z0-9-]+/g, "-")
+		.replace(/-+/g, "-")
+		.replace(/^-+|-+$/g, "");
+	if (cleaned.length === 0) {
+		throw new Error(`branch name "${branch}" sanitized to empty string`);
 	}
-	return undefined;
+	return cleaned;
 }
 
 function readInputFromEvent<T = unknown>(name: string): T | undefined {
@@ -105,10 +116,11 @@ function parseBoolInput(v: unknown, fallback: boolean): boolean {
 function deriveTrigger(overrides: ResolveOverrides | undefined): Trigger {
 	if (overrides?.trigger) return overrides.trigger;
 	const eventName = process.env.GITHUB_EVENT_NAME;
-	if (eventName === "pull_request" || eventName === "pull_request_target")
-		return "pr";
-	if (eventName === "workflow_dispatch") return "release";
-	if (eventName === "push") return "main";
+	if (eventName === "workflow_dispatch") {
+		const version = readInputFromEvent<string>("version");
+		if (typeof version === "string" && version.length > 0) return "release";
+		return "branch";
+	}
 	// Default for local invocation without overrides (unusual): assume release
 	// so missing fields are caught loudly.
 	return "release";
@@ -118,15 +130,14 @@ function computeNpmTag(
 	trigger: Trigger,
 	version: string,
 	latest: boolean,
-	prNumber?: number,
+	branch?: string,
 ): string {
-	if (trigger === "pr") {
-		if (typeof prNumber !== "number") {
-			throw new Error("PR trigger requires prNumber to compute npm tag");
+	if (trigger === "branch") {
+		if (!branch) {
+			throw new Error("branch trigger requires branch to compute npm tag");
 		}
-		return `pr-${prNumber}`;
+		return sanitizeBranch(branch);
 	}
-	if (trigger === "main") return "main";
 	// release
 	if (version.includes("-rc.")) return "rc";
 	return latest ? "latest" : "next";
@@ -136,17 +147,16 @@ function computeVersion(
 	trigger: Trigger,
 	base: string,
 	sha: string,
-	prNumber: number | undefined,
+	branch: string | undefined,
 	overrideVersion: string | undefined,
 ): string {
 	if (overrideVersion) return overrideVersion;
-	if (trigger === "pr") {
-		if (typeof prNumber !== "number") {
-			throw new Error("PR trigger requires prNumber to compute version");
+	if (trigger === "branch") {
+		if (!branch) {
+			throw new Error("branch trigger requires branch to compute version");
 		}
-		return `${base}-pr.${prNumber}.${sha}`;
+		return `${base}-${sanitizeBranch(branch)}.${sha}`;
 	}
-	if (trigger === "main") return `${base}-main.${sha}`;
 	throw new Error("release trigger requires an explicit version override");
 }
 
@@ -164,9 +174,9 @@ export async function resolveContext(
 
 	const sha = overrides.sha ?? (await readShortSha(repoRoot));
 
-	let prNumber = overrides.prNumber;
-	if (trigger === "pr" && prNumber === undefined) {
-		prNumber = readPrNumberFromEvent();
+	let branch = overrides.branch;
+	if (trigger === "branch" && !branch) {
+		branch = await readBranchName(repoRoot);
 	}
 
 	// Release version: override > workflow_dispatch input > error.
@@ -181,7 +191,7 @@ export async function resolveContext(
 			trigger,
 			PREVIEW_BASE_VERSION,
 			sha,
-			prNumber,
+			branch,
 			version,
 		);
 	} else if (!version) {
@@ -198,7 +208,7 @@ export async function resolveContext(
 	}
 	if (trigger !== "release") latest = false;
 
-	const npmTag = computeNpmTag(trigger, version, latest, prNumber);
+	const npmTag = computeNpmTag(trigger, version, latest, branch);
 
 	return {
 		trigger,
@@ -206,7 +216,7 @@ export async function resolveContext(
 		npmTag,
 		sha,
 		latest,
-		prNumber,
+		branch,
 		repoRoot,
 	};
 }
@@ -221,7 +231,7 @@ export function writeContextToGithubOutput(ctx: PublishContext): void {
 		console.log(`npm_tag=${ctx.npmTag}`);
 		console.log(`sha=${ctx.sha}`);
 		console.log(`latest=${ctx.latest}`);
-		if (ctx.prNumber !== undefined) console.log(`pr_number=${ctx.prNumber}`);
+		if (ctx.branch !== undefined) console.log(`branch=${ctx.branch}`);
 		return;
 	}
 	const lines = [
@@ -231,7 +241,7 @@ export function writeContextToGithubOutput(ctx: PublishContext): void {
 		`sha=${ctx.sha}`,
 		`latest=${ctx.latest}`,
 	];
-	if (ctx.prNumber !== undefined) lines.push(`pr_number=${ctx.prNumber}`);
+	if (ctx.branch !== undefined) lines.push(`branch=${ctx.branch}`);
 	// Append (do not overwrite) in case other steps also wrote to GITHUB_OUTPUT.
 	appendFileSync(path, `${lines.join("\n")}\n`);
 }
