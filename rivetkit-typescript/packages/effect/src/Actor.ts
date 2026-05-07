@@ -329,11 +329,7 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 					);
 				}
 
-				const built = entry.buildHandlers as Effect.Effect<
-					unknown,
-					never,
-					Scope.Scope | CurrentAddress | Sleep
-				>;
+				const built = entry.buildHandlers;
 				let provided = built.pipe(
 					Effect.provideService(CurrentAddress, address),
 					Effect.provideService(Scope.Scope, scope),
@@ -357,7 +353,7 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 			const { handlers, scope } =
 				await Effect.runPromiseWith(services)(acquire);
 			instances.set(c.actorId, {
-				handlers: handlers as ActorInstance["handlers"],
+				handlers,
 				scope,
 			});
 		},
@@ -524,12 +520,6 @@ export type ActionRequest<A extends Action.Any> =
 			}
 		: never;
 
-export type ActionHandlers<Actions extends Action.AnyWithProps> = {
-	readonly [A in Actions as Action.Tag<A>]: (
-		request: ActionRequest<A>,
-	) => Effect.Effect<Action.Success<A>, Action.Error<A>, unknown>;
-};
-
 type HandlerServices<Handlers> = {
 	readonly [Name in keyof Handlers]: Handlers[Name] extends (
 		...args: ReadonlyArray<any>
@@ -573,7 +563,6 @@ export interface Actor<
 > {
 	readonly [TypeId]: typeof TypeId;
 	readonly name: Name;
-	readonly key: string;
 	readonly actions: ReadonlyArray<Actions>;
 
 	of<Handlers extends HandlersFrom<Actions>>(handlers: Handlers): Handlers;
@@ -610,37 +599,7 @@ export interface Actor<
 	>;
 }
 
-/**
- * Type-erased view of any actor contract.
- */
-export interface Any {
-	readonly [TypeId]: typeof TypeId;
-	readonly _tag: string;
-	readonly key: string;
-}
-
-/**
- * Type-erased actor with all runtime properties available.
- */
-export interface AnyWithProps extends Actor<string, Action.AnyWithProps> {}
-
-export type Name<A> = A extends Actor<infer _Name, any> ? _Name : never;
-
-export type Actions<A> =
-	A extends Actor<any, infer _Actions> ? _Actions : never;
-
-export type Services<A> =
-	A extends Actor<any, infer _Actions> ? Action.Services<_Actions> : never;
-
-export type ClientServices<A> =
-	A extends Actor<any, infer _Actions>
-		? Action.ServicesClient<_Actions>
-		: never;
-
-export type ServerServices<A> =
-	A extends Actor<any, infer _Actions>
-		? Action.ServicesServer<_Actions>
-		: never;
+export type Any = Actor<string, Action.AnyWithProps>;
 
 export type HandlersFrom<Action extends Action.Any> = {
 	readonly [Current in Action as Current["_tag"]]: (
@@ -675,7 +634,7 @@ const Proto = {
 		);
 	},
 	get client() {
-		const self = this as unknown as AnyWithProps;
+		const self = this as Any;
 		return Effect.gen(function* () {
 			const client = yield* Client;
 			const actions = self.actions;
