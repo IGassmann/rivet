@@ -38,7 +38,7 @@ export interface Any {
  * `SubscriptionRef` under the state's tag.
  */
 export interface AnyWithProps
-	extends Context.Service<any, SubscriptionRef.SubscriptionRef<unknown>> {
+	extends Context.Service<any, SubscriptionRef.SubscriptionRef<any>> {
 	readonly [TypeId]: typeof TypeId;
 	readonly _tag: string;
 	readonly schema: Schema.Top;

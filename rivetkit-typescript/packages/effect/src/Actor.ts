@@ -167,7 +167,7 @@ export class Registry extends Context.Service<
 	 * the collected entries, materializes the underlying rivetkit
 	 * registry, and starts it.
 	 */
-	static start = Layer.effectDiscard(
+	static start: Layer.Layer<never, never, Registry> = Layer.effectDiscard(
 		Effect.gen(function* () {
 			const registry = yield* Registry;
 			const rivetkitRegistry = yield* toRivetkitRegistry(registry);
