@@ -1,7 +1,7 @@
 import { assert, layer } from "@effect/vitest";
 import { Effect, Layer, Schedule } from "effect";
 import { TestClock } from "effect/testing";
-import { Registry, RivetError, Runner } from "@rivetkit/effect";
+import { Registry, RivetError } from "@rivetkit/effect";
 import {
 	Counter,
 	CounterLive,
@@ -32,7 +32,7 @@ const GreeterLive = Layer.succeed(
 // itself sees it too.
 const MultiplierLive = Layer.succeed(Multiplier, Multiplier.of({ factor: 2 }));
 
-const TestLayer = Runner.test.pipe(
+const TestLayer = Registry.test.pipe(
 	Layer.provideMerge(
 		Layer.mergeAll(CounterLive, PingerLive, FailingActorLive),
 	),

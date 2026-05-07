@@ -123,9 +123,9 @@ export type RegistryOptions = Pick<
  * Service collecting actor defs/builders together with the engine
  * connection config. Provided once via `Registry.layer({ ... })` and
  * consumed by both `Actor.toLayer` (which registers itself into the
- * collector on acquire) and the `Runner.*` mode layers (which
- * materialize the underlying rivetkit registry from the collected
- * entries).
+ * collector on acquire) and by `Registry.start` / `Registry.test`
+ * (which materialize the underlying rivetkit registry from the
+ * collected entries).
  */
 export class Registry extends Context.Service<
 	Registry,
@@ -161,6 +161,107 @@ export class Registry extends Context.Service<
 			}),
 		);
 	}
+
+	/**
+	 * Run the registered actors against the configured engine. Reads
+	 * the collected entries, materializes the underlying rivetkit
+	 * registry, and starts it.
+	 */
+	static start = Layer.effectDiscard(
+		Effect.gen(function* () {
+			const registry = yield* Registry;
+			const rivetkitRegistry = yield* toRivetkitRegistry(registry);
+			yield* Effect.sync(() => rivetkitRegistry.start());
+		}),
+	);
+
+	/**
+	 * In-process test runtime. Boots the rivetkit registry against the
+	 * configured engine, waits for `/health` to answer, and provides
+	 * `Client` from the same Layer so consumers don't need to wire
+	 * `Client.layer` separately. Mirrors `Registry.start` plus test-mode
+	 * flags and a scoped client dispose. The registry itself is leaked
+	 * to process exit because the public rivetkit `Registry` doesn't
+	 * expose a public `shutdown()` today; only the SIGINT handler can
+	 * drive `#runShutdown`. This matches `setupTest`'s existing behavior.
+	 */
+	static test: Layer.Layer<Client, never, Registry> = Layer.effect(
+		Client,
+		Effect.gen(function* () {
+			const registry = yield* Registry;
+			const rivetkitRegistry = yield* toRivetkitRegistry(registry);
+			rivetkitRegistry.config.test = {
+				...rivetkitRegistry.config.test,
+				enabled: true,
+			};
+			rivetkitRegistry.config.noWelcome = true;
+			// Auto-spawn the engine when no endpoint was provided, so
+			// `Registry.test` works out of the box without requiring the
+			// caller to start an engine externally. If the user wired an
+			// explicit endpoint via `Registry.layer({ endpoint: ... })`,
+			// honor it and skip the local spawn.
+			if (registry.options.endpoint === undefined) {
+				rivetkitRegistry.config.startEngine = true;
+			}
+			yield* Effect.sync(() => rivetkitRegistry.start());
+
+			// The rivetkitRegistry itself is leaked until process exit (matches
+			// setupTest's behavior). The public Rivetkit.Registry doesn't
+			// expose a shutdown method; only the SIGINT handler can drive the
+			// inner .shutdown(). Disposing the client is the only cleanup we
+			// can do cleanly today.
+			//
+			// When the engine was auto-spawned, propagate its resolved
+			// endpoint to the client so `createClient` doesn't fall back
+			// to its (warning-emitting) default.
+			const resolvedEndpoint = rivetkitRegistry.parseConfig().endpoint;
+			const rivetkitClient = yield* Effect.acquireRelease(
+				Effect.sync(() =>
+					RivetkitClient.createClient({
+						...registry.options,
+						endpoint:
+							registry.options.endpoint ?? resolvedEndpoint,
+					}),
+				),
+				(c) => Effect.promise(() => c.dispose()),
+			);
+
+			const callAction: ClientService["callAction"] = ({
+				actorName,
+				key,
+				actionName,
+				encodedPayload,
+				meta,
+			}) =>
+				Effect.tryPromise({
+					try: () =>
+						rivetkitClient[actorName].getOrCreate(key).action({
+							name: actionName,
+							args: meta
+								? [encodedPayload, meta]
+								: [encodedPayload],
+						}),
+					catch: (cause) =>
+						cause instanceof Rivetkit.RivetError
+							? cause
+							: new Rivetkit.RivetError(
+									"client",
+									"unknown",
+									cause instanceof Error
+										? cause.message
+										: String(cause),
+									{
+										cause:
+											cause instanceof Error
+												? cause
+												: undefined,
+									},
+								),
+				});
+
+			return Client.of({ callAction });
+		}),
+	);
 }
 
 type ActorInstance = {
@@ -181,8 +282,8 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 ) {
 	// Snapshot the current Effect context so action callbacks
 	// (which run in rivetkit's plain Promise world) can run
-	// handler effects against the same services the Runner layer
-	// was provided with.
+	// handler effects against the same services the Registry.start /
+	// Registry.test layer was provided with.
 	const services = yield* Effect.context<any>();
 	const actor = entry.actor;
 
@@ -391,120 +492,6 @@ const toRivetkitRegistry = Effect.fnUntraced(function* (
 		...registry.options,
 	});
 });
-
-/**
- * Service that selects how the registered actors are served. Each
- * static field is a `Layer` for a specific mode mirroring the
- * non-Effect TS SDK: `start`. Each requires `Registry`.
- */
-export class Runner extends Context.Service<
-	Runner,
-	{
-		readonly mode: "start" | "test";
-	}
->()("@rivetkit/effect/Actor/Runner") {
-	static start = Layer.effect(
-		Runner,
-		Effect.gen(function* () {
-			const registry = yield* Registry;
-			const rivetkitRegistry = yield* toRivetkitRegistry(registry);
-			yield* Effect.sync(() => rivetkitRegistry.start());
-			return Runner.of({ mode: "start" });
-		}),
-	);
-
-	/**
-	 * In-process test runtime. Boots the rivetkit registry against the
-	 * configured engine, waits for `/health` to answer, and provides
-	 * both `Runner` and `Client` from one Layer so consumers don't need
-	 * to wire `Client.layer` separately. Mirrors `Runner.start` plus
-	 * test-mode flags and a scoped client dispose. The registry itself
-	 * is leaked to process exit because the public rivetkit `Registry`
-	 * doesn't expose a public `shutdown()` today; only the SIGINT
-	 * handler can drive `#runShutdown`. This matches `setupTest`'s
-	 * existing behavior.
-	 */
-	static test: Layer.Layer<Runner | Client, never, Registry> =
-		Layer.effectContext(
-			Effect.gen(function* () {
-				const registry = yield* Registry;
-				const rivetkitRegistry = yield* toRivetkitRegistry(registry);
-				rivetkitRegistry.config.test = {
-					...rivetkitRegistry.config.test,
-					enabled: true,
-				};
-				rivetkitRegistry.config.noWelcome = true;
-				// Auto-spawn the engine when no endpoint was provided, so
-				// `Runner.test` works out of the box without requiring the
-				// caller to start an engine externally. If the user wired an
-				// explicit endpoint via `Registry.layer({ endpoint: ... })`,
-				// honor it and skip the local spawn.
-				if (registry.options.endpoint === undefined) {
-					rivetkitRegistry.config.startEngine = true;
-				}
-				yield* Effect.sync(() => rivetkitRegistry.start());
-
-				// The rivetkitRegistry itself is leaked until process exit (matches
-				// setupTest's behavior). The public Rivetkit.Registry doesn't
-				// expose a shutdown method; only the SIGINT handler can drive the
-				// inner .shutdown(). Disposing the client is the only cleanup we
-				// can do cleanly today.
-				//
-				// When the engine was auto-spawned, propagate its resolved
-				// endpoint to the client so `createClient` doesn't fall back
-				// to its (warning-emitting) default.
-				const resolvedEndpoint =
-					rivetkitRegistry.parseConfig().endpoint;
-				const rivetkitClient = yield* Effect.acquireRelease(
-					Effect.sync(() =>
-						RivetkitClient.createClient({
-							...registry.options,
-							endpoint:
-								registry.options.endpoint ?? resolvedEndpoint,
-						}),
-					),
-					(c) => Effect.promise(() => c.dispose()),
-				);
-
-				const callAction: ClientService["callAction"] = ({
-					actorName,
-					key,
-					actionName,
-					encodedPayload,
-					meta,
-				}) =>
-					Effect.tryPromise({
-						try: () =>
-							rivetkitClient[actorName].getOrCreate(key).action({
-								name: actionName,
-								args: meta
-									? [encodedPayload, meta]
-									: [encodedPayload],
-							}),
-						catch: (cause) =>
-							cause instanceof Rivetkit.RivetError
-								? cause
-								: new Rivetkit.RivetError(
-										"client",
-										"unknown",
-										cause instanceof Error
-											? cause.message
-											: String(cause),
-										{
-											cause:
-												cause instanceof Error
-													? cause
-													: undefined,
-										},
-									),
-					});
-
-				return Context.make(Runner, Runner.of({ mode: "test" })).pipe(
-					Context.add(Client, Client.of({ callAction })),
-				);
-			}),
-		);
-}
 
 export type ActionRequest<A extends Action.Any> =
 	A extends Action.Action<
