@@ -28,7 +28,7 @@ export const isActor = (u: unknown): u is Actor<any, any> =>
 	Predicate.hasProperty(u, TypeId);
 
 export type RivetkitActorOptions = Pick<
-	NonNullable<Rivetkit.GlobalActorOptionsInput>,
+	NonNullable<Rivetkit.ActorOptionsInput>,
 	"name" | "icon"
 >;
 
