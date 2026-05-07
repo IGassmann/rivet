@@ -603,7 +603,6 @@ export type ServerServices<A> =
 
 const Proto = {
 	[TypeId]: TypeId,
-	of: identity,
 	toLayer(
 		this: AnyWithProps,
 		build: unknown,
@@ -720,6 +719,7 @@ const Proto = {
 			};
 		});
 	},
+	of: identity,
 };
 
 const makeProto = <
