@@ -3,6 +3,7 @@ mod moved_tests {
 	use std::sync::atomic::{AtomicUsize, Ordering};
 
 	use crate::actor::context::ActorContext;
+	use crate::actor::work_registry::ActorWorkKind;
 	use parking_lot::Mutex as DropMutex;
 	use rivet_envoy_client::async_counter::AsyncCounter;
 	use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ mod moved_tests {
 	struct MessageVisitor {
 		message: Option<String>,
 		actor_id: Option<String>,
+		kind: Option<String>,
 		reason: Option<String>,
 	}
 
@@ -28,6 +30,7 @@ mod moved_tests {
 			match field.name() {
 				"message" => self.message = Some(value.to_owned()),
 				"actor_id" => self.actor_id = Some(value.to_owned()),
+				"kind" => self.kind = Some(value.to_owned()),
 				"reason" => self.reason = Some(value.to_owned()),
 				_ => {}
 			}
@@ -38,6 +41,7 @@ mod moved_tests {
 			match field.name() {
 				"message" => self.message = Some(value),
 				"actor_id" => self.actor_id = Some(value),
+				"kind" => self.kind = Some(value),
 				"reason" => self.reason = Some(value),
 				_ => {}
 			}
@@ -84,8 +88,9 @@ mod moved_tests {
 
 			let mut visitor = MessageVisitor::default();
 			event.record(&mut visitor);
-			if visitor.message.as_deref() == Some("registered task cancelled by shutdown deadline")
+			if visitor.message.as_deref() == Some("actor work cancelled by shutdown deadline")
 				&& visitor.actor_id.as_deref() == Some("actor-register-task-deadline")
+				&& visitor.kind.as_deref() == Some("registered_task")
 				&& visitor.reason.as_deref() == Some("shutdown_deadline_elapsed")
 			{
 				self.count.fetch_add(1, Ordering::SeqCst);
@@ -221,6 +226,88 @@ mod moved_tests {
 		);
 		assert_eq!(ctx.shutdown_task_count(), 0);
 		assert_eq!(warning_count.load(Ordering::SeqCst), 1);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn tracked_shutdown_work_drain_wakes_on_shutdown_counter_zero() {
+		let ctx = ActorContext::new_for_sleep_tests("actor-shutdown-drain-counter");
+		ctx.notify_activity_dirty();
+		let (release_tx, release_rx) = oneshot::channel();
+
+		ctx.track_shutdown_task(async move {
+			let _ = release_rx.await;
+		});
+		let waiter = tokio::spawn({
+			let ctx = ctx.clone();
+			async move { ctx.wait_for_tracked_shutdown_work().await }
+		});
+
+		yield_now().await;
+		assert!(
+			!waiter.is_finished(),
+			"shutdown drain should wait while the counter is non-zero"
+		);
+
+		release_tx
+			.send(())
+			.expect("release signal should send to tracked shutdown task");
+		yield_now().await;
+		yield_now().await;
+
+		assert!(
+			waiter.is_finished(),
+			"shutdown drain should wake from the counter zero notification"
+		);
+		assert!(waiter.await.expect("shutdown drain waiter should join"));
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn tracked_shutdown_work_drain_wakes_on_websocket_callback_zero() {
+		let ctx = ActorContext::new_for_sleep_tests("actor-shutdown-drain-websocket");
+		ctx.notify_activity_dirty();
+		let guard = ctx.websocket_callback_region();
+		let waiter = tokio::spawn({
+			let ctx = ctx.clone();
+			async move { ctx.wait_for_tracked_shutdown_work().await }
+		});
+
+		yield_now().await;
+		assert!(
+			!waiter.is_finished(),
+			"shutdown drain should wait while the websocket callback is active"
+		);
+
+		drop(guard);
+		yield_now().await;
+
+		assert!(
+			waiter.is_finished(),
+			"shutdown drain should wake from the websocket zero notification"
+		);
+		assert!(waiter.await.expect("shutdown drain waiter should join"));
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn keep_awake_spawned_work_exits_when_shutdown_deadline_cancels() {
+		let ctx = ActorContext::new_for_sleep_tests("actor-keep-awake-deadline");
+
+		ctx.spawn_work(ActorWorkKind::KeepAwake, futures::future::pending::<()>());
+		assert_eq!(ctx.shutdown_task_count(), 1);
+		assert_eq!(ctx.sleep_keep_awake_count(), 1);
+
+		ctx.cancel_shutdown_deadline();
+
+		assert!(
+			ctx.0
+				.sleep
+				.work
+				.shutdown_counter
+				.wait_zero(Instant::now() + Duration::from_millis(1))
+				.await,
+			"keepAwake work should stop waiting after the shutdown deadline"
+		);
+		assert_eq!(ctx.shutdown_task_count(), 0);
+		assert_eq!(ctx.sleep_keep_awake_count(), 0);
 	}
 
 	#[tokio::test(start_paused = true)]

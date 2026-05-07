@@ -102,6 +102,20 @@ impl AsyncCounter {
 			}
 		}
 	}
+
+	pub async fn wait_zero_unbounded(&self) {
+		loop {
+			let notified = self.zero_notify.notified();
+			tokio::pin!(notified);
+			notified.as_mut().enable();
+
+			if self.value.load(Ordering::Acquire) == 0 {
+				return;
+			}
+
+			notified.await;
+		}
+	}
 }
 
 impl Default for AsyncCounter {
