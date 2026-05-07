@@ -3,6 +3,7 @@ import {
 	Context,
 	Effect,
 	Exit,
+	identity,
 	Layer,
 	Predicate,
 	Ref,
@@ -599,8 +600,6 @@ export type ServerServices<A> =
 	A extends Actor<any, infer _Actions>
 		? Action.ServicesServer<_Actions>
 		: never;
-
-const identity = <A>(value: A): A => value;
 
 const Proto = {
 	[TypeId]: TypeId,
