@@ -619,19 +619,18 @@ const Proto = {
 		build: Handlers | Effect.Effect<Handlers, never, RX>,
 		options?: ActorOptions<State>,
 	) {
-		const self = this;
-		return Layer.effectDiscard(
-			Effect.gen(function* () {
-				const registry = yield* Registry;
-				yield* registry.register({
-					actor: self,
+		return Registry.asEffect().pipe(
+			Effect.flatMap((registry) =>
+				registry.register({
+					actor: this,
 					buildHandlers: Effect.isEffect(build)
 						? build
 						: Effect.succeed(build),
 					options,
-				});
-			}),
-		);
+				})
+			),
+			Layer.effectDiscard
+		)
 	},
 	get client() {
 		const self = this as Any;
