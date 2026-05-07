@@ -15,6 +15,7 @@ import {
 } from "effect";
 import * as Rivetkit from "rivetkit";
 import * as RivetkitClient from "rivetkit/client";
+import type { ActorName } from "./ActorName";
 import type * as Action from "./Action";
 import type * as ActorState from "./ActorState";
 import { Client, type ActionMeta, type ClientService } from "./Client";
@@ -161,13 +162,13 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 			const inst = instances.get(c.actorId);
 			if (!inst) {
 				throw new Error(
-					`actor ${actor._tag}/${c.actorId} has no handlers (onWake didn't run?)`,
+					`actor ${actor.name}/${c.actorId} has no handlers (onWake didn't run?)`,
 				);
 			}
 			const handler = inst.handlers[action._tag];
 			if (!handler) {
 				throw new Error(
-					`actor ${actor._tag} has no handler for action ${action._tag}`,
+					`actor ${actor.name} has no handler for action ${action._tag}`,
 				);
 			}
 
@@ -213,7 +214,7 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 			// context (e.g. a non-Effect-SDK client). When trace context
 			// is present, reattach it as the parent so the server span
 			// joins the caller's trace.
-			const rpcMethod = `${actor._tag}/${action._tag}`;
+			const rpcMethod = `${actor.name}/${action._tag}`;
 			const traceMeta = readTraceMeta(meta);
 			pipeline = pipeline.pipe(
 				Effect.withSpan(rpcMethod, {
@@ -345,7 +346,7 @@ const toRivetkitRegistry = Effect.fnUntraced(function* (
 	const instances = new Map<string, ActorInstance>();
 	const use: Record<string, Rivetkit.AnyActorDefinition> = {};
 	for (const entry of entries) {
-		use[entry.actor._tag] = yield* toRivetkitActor(entry, instances);
+		use[entry.actor.name] = yield* toRivetkitActor(entry, instances);
 	}
 
 	return Rivetkit.setup({
@@ -526,11 +527,11 @@ export interface TypedAccessor<Actions extends Action.AnyWithProps> {
  * display options, but no server implementation.
  */
 export interface Actor<
-	Name extends string,
-	Actions extends Action.AnyWithProps = never,
+	in out Name extends ActorName,
+	in out Actions extends Action.AnyWithProps = never,
 > {
 	readonly [TypeId]: typeof TypeId;
-	readonly _tag: Name;
+	readonly name: Name;
 	readonly key: string;
 	readonly actions: ReadonlyArray<Actions>;
 	readonly options: GlobalActorOptionsInput;
@@ -581,7 +582,7 @@ export interface Any {
 /**
  * Type-erased actor with all runtime properties available.
  */
-export interface AnyWithProps extends Actor<string, Action.AnyWithProps> {}
+export interface AnyWithProps extends Actor<ActorName, Action.AnyWithProps> {}
 
 export type Name<A> = A extends Actor<infer _Name, any> ? _Name : never;
 
@@ -637,7 +638,7 @@ const Proto = {
 					> = {};
 					for (const action of actions) {
 						const tag = action._tag;
-						const rpcMethod = `${self._tag}/${tag}`;
+						const rpcMethod = `${self.name}/${tag}`;
 						// `Effect.fn` wraps the generator in a span named
 						// `rpcMethod` (kind=client + OTel `rpc.*` attrs)
 						// without an extra `pipe(Effect.withSpan(...))`.
@@ -667,7 +668,7 @@ const Proto = {
 							};
 							const raw = yield* client
 								.callAction({
-									actorName: self._tag,
+									actorName: self.name,
 									key,
 									actionName: tag,
 									encodedPayload: encoded,
@@ -723,7 +724,7 @@ const Proto = {
 };
 
 const makeProto = <
-	const Name extends string,
+	const Name extends ActorName,
 	Actions extends Action.AnyWithProps,
 >(options: {
 	readonly _tag: Name;
@@ -745,7 +746,7 @@ const makeProto = <
  * `toLayer({ state })`; the client never sees the persisted shape.
  */
 export const make = <
-	const Name extends string,
+	const Name extends ActorName,
 	const Actions extends ReadonlyArray<Action.AnyWithProps> = readonly [],
 >(
 	name: Name,
