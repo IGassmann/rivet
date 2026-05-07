@@ -1,4 +1,4 @@
-import { Predicate, Schema } from "effect";
+import { Deferred, Effect, Predicate, Schema } from "effect";
 import { RivetErrorFromWire } from "./RivetError";
 
 const TypeId = "~@rivetkit/effect/Action";
@@ -132,6 +132,20 @@ export type ExtractTag<R extends Any, Tag extends string> = R extends {
 	readonly _tag: Tag;
 }
 	? R
+	: never;
+
+export type ResultFrom<R extends Any, Services> = R extends Action<
+	infer _Tag,
+	infer _Payload,
+	infer _Success,
+	infer _Error
+>
+	? Effect.Effect<
+			| _Success["Type"]
+			| Deferred.Deferred<_Success["Type"], _Error["Type"]>,
+			_Error["Type"],
+			Services
+		>
 	: never;
 
 // --- Implementation -------------------------------------------------

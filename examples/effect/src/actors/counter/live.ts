@@ -118,5 +118,9 @@ export const CounterLive = Counter.toLayer(
 				SubscriptionRef.get(state).pipe(Effect.map((s) => s.count)),
 		});
 	}),
-	{ state: CounterState },
+	{
+		state: CounterState,
+		name: "Counter", // Human-friendly display name
+		icon: "comments", // FontAwesome icon name
+	},
 );

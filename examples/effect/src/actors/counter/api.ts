@@ -1,5 +1,5 @@
-import { Schema } from "effect"
-import { Actor, Action } from "@rivetkit/effect"
+import { Schema } from "effect";
+import { Actor, Action } from "@rivetkit/effect";
 
 // --- Errors ---
 
@@ -35,11 +35,11 @@ export const Increment = Action.make("Increment", {
 	payload: { amount: Schema.Number },
 	success: Schema.Number,
 	error: CounterOverflowError,
-})
+});
 
 export const GetCount = Action.make("GetCount", {
 	success: Schema.Number,
-})
+});
 
 // --- Messages (not yet implemented) ---
 //
@@ -65,8 +65,4 @@ export const Counter = Actor.make("Counter", {
 	actions: [Increment, GetCount],
 	// messages: [Reset, IncrementBy],	// durable, queued, background
 	// events: { countChanged: Schema.Number },
-	options: {
-		name: "Counter",	// Human-friendly display name
-		icon: "comments",	// FontAwesome icon name
-	},
-})
+});
