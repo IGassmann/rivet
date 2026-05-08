@@ -8,7 +8,7 @@ import {
 	Scope,
 } from "effect";
 import * as Rivetkit from "rivetkit";
-import * as Registry from './Registry';
+import * as Registry from "./Registry";
 import type * as Action from "./Action";
 import type * as ActorState from "./ActorState";
 import * as Client from "./Client";
@@ -39,10 +39,7 @@ export const splitOptions = <State extends ActorState.AnyWithProps>(
 	options: Options<State>,
 ): {
 	readonly rivetkitOptions: RivetkitActorOptions;
-	readonly effectOptions: Omit<
-		Options<State>,
-		keyof RivetkitActorOptions
-	>;
+	readonly effectOptions: Omit<Options<State>, keyof RivetkitActorOptions>;
 } => {
 	const { state, ...rivetkitOptions } = options;
 	return { rivetkitOptions, effectOptions: { state } };
@@ -198,10 +195,10 @@ const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 						? build
 						: Effect.succeed(build),
 					options,
-				})
+				}),
 			),
-			Layer.effectDiscard
-		)
+			Layer.effectDiscard,
+		);
 	},
 	get client() {
 		const self = this as Any;
