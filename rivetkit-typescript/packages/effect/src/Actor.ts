@@ -178,7 +178,7 @@ export type HandlersFrom<Action extends Action.Any> = {
 	) => Action.ResultFrom<Current, any>;
 };
 
-const Proto = {
+const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 	[TypeId]: TypeId,
 	toLayer<
 		Actions extends Action.Any,
