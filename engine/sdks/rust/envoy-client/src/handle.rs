@@ -541,12 +541,18 @@ impl EnvoyHandle {
 	/// Inject a serverless start payload into the envoy.
 	/// The payload is a u16 LE protocol version followed by a serialized ToEnvoy message.
 	pub async fn start_serverless_actor(&self, payload: &[u8]) -> anyhow::Result<()> {
+		tracing::debug!(
+			envoy_key = %self.shared.envoy_key,
+			payload_len = payload.len(),
+			"received serverless start request"
+		);
 		let (message, _) = decode_serverless_actor_start_payload(payload)?;
 
 		// Wait for envoy to be started before injecting
 		self.started().await?;
 
 		tracing::debug!(
+			envoy_key = %self.shared.envoy_key,
 			data = crate::stringify::stringify_to_envoy(&message),
 			"received serverless start"
 		);
