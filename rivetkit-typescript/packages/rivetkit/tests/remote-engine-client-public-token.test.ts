@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ClientConfigSchema } from "@/client/config";
+import { createClient } from "@/client/mod";
 import {
 	HEADER_RIVET_ACTOR,
 	HEADER_RIVET_SKIP_READY_WAIT,
@@ -10,7 +11,6 @@ import {
 	WS_PROTOCOL_TARGET,
 	WS_PROTOCOL_TOKEN,
 } from "@/common/actor-router-consts";
-import { createClient } from "@/client/mod";
 import { RemoteEngineControlClient } from "@/engine-client/mod";
 
 describe.sequential("RemoteEngineControlClient public token usage", () => {
@@ -162,6 +162,48 @@ describe.sequential("RemoteEngineControlClient public token usage", () => {
 		);
 	});
 
+	test("query handle fetch keeps skip ready wait on gateway URL", async () => {
+		const fetchCalls: Request[] = [];
+		const fetchMock = vi.fn(async (input: Request | URL | string) => {
+			const request = normalizeRequest(input);
+			fetchCalls.push(request);
+			return new Response("ok");
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const client = createClient({
+			endpoint: "https://api.rivet.dev",
+			disableMetadataLookup: true,
+			gateway: { skipReadyWait: true },
+		});
+		const handle = client.getOrCreate("mockAgenticLoop", [
+			"query-http-skip-ready-wait",
+		]);
+
+		const response = await handle.fetch("/skip-ready-wait");
+
+		expect(response.status).toBe(200);
+		expect(fetchCalls).toHaveLength(1);
+
+		const actorRequest = fetchCalls[0];
+		expect(actorRequest).toBeDefined();
+		if (!actorRequest) throw new Error("missing actor request");
+		const url = new URL(actorRequest.url);
+		expect(url.pathname).toBe(
+			"/gateway/mockAgenticLoop/request/skip-ready-wait",
+		);
+		expect(url.searchParams.get("rvt-method")).toBe("getOrCreate");
+		expect(url.searchParams.get("rvt-key")).toBe(
+			"query-http-skip-ready-wait",
+		);
+		expect(url.searchParams.get("rvt-skip-ready-wait")).toBe("true");
+		expect(actorRequest?.headers.get(HEADER_RIVET_TARGET)).toBeNull();
+		expect(actorRequest?.headers.get(HEADER_RIVET_ACTOR)).toBeNull();
+		expect(actorRequest?.headers.get(HEADER_RIVET_SKIP_READY_WAIT)).toBe(
+			"1",
+		);
+	});
+
 	test("uses metadata clientToken for actor websocket gateway requests", async () => {
 		const fetchMock = vi.fn(async (input: Request | URL | string) => {
 			const request = normalizeRequest(input);
@@ -257,6 +299,36 @@ describe.sequential("RemoteEngineControlClient public token usage", () => {
 				`${WS_PROTOCOL_TOKEN}public-ws-token`,
 				WS_PROTOCOL_SKIP_READY_WAIT,
 			]),
+		);
+
+		const client = createClient({
+			endpoint: "https://api.rivet.dev",
+			disableMetadataLookup: true,
+			gateway: { skipReadyWait: true },
+		});
+		const handle = client.getOrCreate("mockAgenticLoop", [
+			"query-ws-skip-ready-wait",
+		]);
+
+		await handle.webSocket("/skip-ready-wait");
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(sockets).toHaveLength(4);
+		const querySocket = sockets[3];
+		expect(querySocket).toBeDefined();
+		if (!querySocket) throw new Error("missing query websocket");
+		const url = new URL(querySocket.url);
+		expect(url.pathname).toBe(
+			"/gateway/mockAgenticLoop/websocket/skip-ready-wait",
+		);
+		expect(url.searchParams.get("rvt-method")).toBe("getOrCreate");
+		expect(url.searchParams.get("rvt-key")).toBe(
+			"query-ws-skip-ready-wait",
+		);
+		expect(url.searchParams.get("rvt-skip-ready-wait")).toBe("true");
+		expect(querySocket.protocols).toContain(WS_PROTOCOL_SKIP_READY_WAIT);
+		expect(querySocket.protocols).not.toContain(
+			`${WS_PROTOCOL_TARGET}actor`,
 		);
 	});
 });

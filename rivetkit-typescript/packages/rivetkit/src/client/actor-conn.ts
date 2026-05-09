@@ -56,7 +56,6 @@ import {
 	type QueueSendResult,
 	type QueueSendWaitOptions,
 } from "./queue";
-import { resolveGatewayTarget } from "./resolve-gateway-target";
 import {
 	type WebSocketMessage as ConnMessage,
 	messageLength,
@@ -578,9 +577,7 @@ export class ActorConnRaw {
 
 	async #connectWebSocket() {
 		const params = await this.#resolveConnectionParams();
-		const target = this.#gatewayOptions.skipReadyWait
-			? await this.#resolveGatewayTargetForSkipReadyWait()
-			: getGatewayTarget(this.#actorResolutionState);
+		const target = getGatewayTarget(this.#actorResolutionState);
 		const ws = await this.#driver.openWebSocket(
 			PATH_CONNECT,
 			target,
@@ -632,25 +629,6 @@ export class ActorConnRaw {
 				});
 			}
 		});
-	}
-
-	async #resolveGatewayTargetForSkipReadyWait() {
-		if ("getForId" in this.#actorResolutionState) {
-			return {
-				directId: this.#actorResolutionState.getForId.actorId,
-			} as const;
-		}
-
-		if (this.#actorId) {
-			return { directId: this.#actorId } as const;
-		}
-
-		return {
-			directId: await resolveGatewayTarget(
-				this.#driver,
-				this.#actorResolutionState,
-			),
-		} as const;
 	}
 
 	/** Called by the onopen event from drivers. */

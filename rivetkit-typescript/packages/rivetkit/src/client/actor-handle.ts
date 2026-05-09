@@ -140,7 +140,13 @@ export class ActorHandleRaw {
 			for (let attempt = 0; attempt < maxAttempts; attempt++) {
 				let actorId: string | undefined;
 				try {
-					const target = await this.#resolveActionTarget(useQueryTarget);
+					const gatewayOptions = resolveActorGatewayOptions(
+						this.#gatewayOptions,
+					);
+					const target = await this.#resolveGatewayRequestTarget(
+						useQueryTarget,
+						gatewayOptions,
+					);
 					actorId = "directId" in target ? target.directId : undefined;
 
 					return await createQueueSender({
@@ -150,9 +156,7 @@ export class ActorHandleRaw {
 							return await this.#driver.sendRequest(
 								target,
 								request,
-								resolveActorGatewayOptions(
-									this.#gatewayOptions,
-								),
+								gatewayOptions,
 							);
 						},
 					}).send(name, body, options as any);
@@ -269,7 +273,10 @@ export class ActorHandleRaw {
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
 			let actorId: string | undefined;
 			try {
-				const target = await this.#resolveActionTarget(useQueryTarget);
+				const target = await this.#resolveGatewayRequestTarget(
+					useQueryTarget,
+					gatewayOptions,
+				);
 				actorId = "directId" in target ? target.directId : undefined;
 
 				logger().debug(
@@ -558,6 +565,17 @@ export class ActorHandleRaw {
 		}
 	}
 
+	async #resolveGatewayRequestTarget(
+		useQueryTarget: boolean,
+		gatewayOptions: ActorGatewayOptions,
+	) {
+		if (gatewayOptions.skipReadyWait) {
+			return getGatewayTarget(this.#actorResolutionState);
+		}
+
+		return await this.#resolveActionTarget(useQueryTarget);
+	}
+
 	/**
 	 * Establishes a persistent connection to the actor.
 	 *
@@ -616,7 +634,10 @@ export class ActorHandleRaw {
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
 			let actorId: string | undefined;
 			try {
-				const target = await this.#resolveActionTarget(useQueryTarget);
+				const target = await this.#resolveGatewayRequestTarget(
+					useQueryTarget,
+					gatewayOptions,
+				);
 				actorId = "directId" in target ? target.directId : undefined;
 				const response = await rawHttpFetch(
 					this.#driver,
@@ -836,9 +857,10 @@ export class ActorHandleRaw {
 			this.#gatewayOptions,
 			options,
 		);
-		const target = gatewayOptions.skipReadyWait
-			? await this.#resolveActionTarget(false)
-			: getGatewayTarget(this.#actorResolutionState);
+		const target = await this.#resolveGatewayRequestTarget(
+			false,
+			gatewayOptions,
+		);
 		return await rawWebSocket(
 			this.#driver,
 			target,
