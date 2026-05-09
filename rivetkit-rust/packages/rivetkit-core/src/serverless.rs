@@ -247,14 +247,37 @@ impl CoreServerlessRuntime {
 				"text/plain; charset=utf-8",
 				"This is a RivetKit server.\n\nLearn more at https://rivet.dev",
 			)),
-			("GET", "/health") => Ok(json_response(
-				StatusCode::OK,
-				json!({
-					"status": "ok",
-					"runtime": "rivetkit",
-					"version": self.settings.package_version,
-				}),
-			)),
+			("GET", "/health") => {
+				// Report unhealthy when an envoy is currently running but its link to the
+				// engine has gone silent. A 503 is the conventional "recycle me" signal for
+				// container hosts (Cloud Run, k8s, etc.) running behind an HTTP health probe.
+				let envoy_unhealthy = {
+					let guard = self.envoy.lock().await;
+					guard
+						.as_ref()
+						.map(|handle| !handle.is_ping_healthy())
+						.unwrap_or(false)
+				};
+				if envoy_unhealthy {
+					Ok(json_response(
+						StatusCode::SERVICE_UNAVAILABLE,
+						json!({
+							"status": "engine_ping_stale",
+							"runtime": "rivetkit",
+							"version": self.settings.package_version,
+						}),
+					))
+				} else {
+					Ok(json_response(
+						StatusCode::OK,
+						json!({
+							"status": "ok",
+							"runtime": "rivetkit",
+							"version": self.settings.package_version,
+						}),
+					))
+				}
+			}
 			("GET", "/metadata") => Ok(self.metadata_response()),
 			("GET", "/start") | ("POST", "/start") => self.start_response(req).await,
 			("OPTIONS", _) => Ok(bytes_response(

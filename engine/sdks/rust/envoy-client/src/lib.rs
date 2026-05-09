@@ -16,6 +16,21 @@ pub(crate) mod time {
 	pub use std::time::Instant;
 	#[cfg(target_arch = "wasm32")]
 	pub use web_time::Instant;
+
+	pub fn now_millis() -> i64 {
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.expect("system clock should be after UNIX epoch")
+				.as_millis() as i64
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		{
+			js_sys::Date::now() as i64
+		}
+	}
 }
 pub mod tunnel;
 pub mod utils;

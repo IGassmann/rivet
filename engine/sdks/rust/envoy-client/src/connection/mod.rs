@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use rivet_envoy_protocol as protocol;
 #[cfg(any(
 	feature = "native-transport",
@@ -83,6 +85,9 @@ async fn forward_to_envoy(shared: &SharedContext, message: protocol::ToEnvoy) {
 
 	match message {
 		protocol::ToEnvoy::ToEnvoyPing(ping) => {
+			shared
+				.last_ping_ts
+				.store(crate::time::now_millis(), Ordering::Release);
 			ws_send(
 				shared,
 				protocol::ToRivet::ToRivetPong(protocol::ToRivetPong { ts: ping.ts }),

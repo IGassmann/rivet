@@ -172,6 +172,7 @@ mod tests {
 			)),
 			protocol_metadata: Arc::new(tokio::sync::Mutex::new(None)),
 			shutting_down: std::sync::atomic::AtomicBool::new(false),
+			last_ping_ts: std::sync::atomic::AtomicI64::new(crate::time::now_millis()),
 			stopped_tx: tokio::sync::watch::channel(true).0,
 		});
 		let handle = EnvoyHandle {

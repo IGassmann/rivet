@@ -215,6 +215,19 @@ impl ToxiproxyProxy {
 		.await
 	}
 
+	pub async fn timeout_upstream(&self, timeout_ms: u64, toxicity: f32) -> Result<()> {
+		self.add_toxic(
+			"timeout-upstream",
+			"timeout",
+			ToxiproxyDirection::Upstream,
+			toxicity,
+			TimeoutAttributes {
+				timeout: timeout_ms,
+			},
+		)
+		.await
+	}
+
 	pub async fn bandwidth_downstream(&self, kbps: u64) -> Result<()> {
 		self.add_toxic(
 			"bandwidth-downstream",

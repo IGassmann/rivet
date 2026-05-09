@@ -254,6 +254,14 @@ impl Envoy {
 		}
 	}
 
+	pub async fn is_ping_healthy(&self) -> Option<bool> {
+		self.handle
+			.lock()
+			.await
+			.as_ref()
+			.map(|handle| handle.is_ping_healthy())
+	}
+
 	pub async fn shutdown(&self) {
 		if let Some(handle) = self.handle.lock().await.take() {
 			handle.shutdown_and_wait(false).await;
@@ -299,7 +307,10 @@ impl TestEnvoyCallbacks {
 
 impl rivet_test_envoy::EnvoyCallbacks for TestEnvoyCallbacks {
 	fn on_connect(&self, _handle: EnvoyHandle) {
-		let _ = self.inner.connection_tx.send(EnvoyConnectionEvent::Connected);
+		let _ = self
+			.inner
+			.connection_tx
+			.send(EnvoyConnectionEvent::Connected);
 	}
 
 	fn on_disconnect(&self, _handle: EnvoyHandle) {

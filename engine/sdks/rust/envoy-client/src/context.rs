@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 
 use crate::async_counter::AsyncCounter;
 use rivet_envoy_protocol as protocol;
@@ -32,6 +32,11 @@ pub struct SharedContext {
 	pub ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WsTxMessage>>>>,
 	pub protocol_metadata: Arc<Mutex<Option<protocol::ProtocolMetadata>>>,
 	pub shutting_down: AtomicBool,
+	/// Epoch ms timestamp of the most recent ping packet received from the engine. Used by
+	/// `EnvoyHandle::is_ping_healthy` to surface a dead engine link to upstream health checks.
+	/// Initialized to the construction time so a freshly created envoy reports healthy until
+	/// its first ping arrives or the threshold elapses without one.
+	pub last_ping_ts: AtomicI64,
 	// Latched signal fired by `envoy_loop` after its cleanup block completes.
 	// Waiters observing `true` are guaranteed that the loop has exited and
 	// every pending KV/SQLite request has been resolved (with `EnvoyShutdownError`
