@@ -5,15 +5,17 @@ mod moved_tests {
 	use std::time::Duration;
 
 	use super::{
-		HttpRequest, HttpResponseEncoding, authorization_bearer_token,
-		authorization_bearer_token_map, framework_action_error_response, is_actor_request_path,
-		message_boundary_error_response, normalize_actor_request_path, request_encoding,
-		request_has_bearer_token, workflow_dispatch_result,
+		HttpResponseEncoding, authorization_bearer_token, authorization_bearer_token_map,
+		framework_action_error_response, framework_anyhow_error_response_with_actor,
+		is_actor_request_path, message_boundary_error_response,
+		message_boundary_error_response_with_actor, normalize_actor_request_path,
+		request_encoding,
+		workflow_dispatch_result,
 	};
 	use crate::actor::action::ActionDispatchError;
 	use crate::error::ActorLifecycle as ActorLifecycleError;
 	use http::StatusCode;
-	use rivet_error::RivetError;
+	use rivet_error::{ActorSpecifier, MacroMarker, RivetError, RivetErrorSchema};
 	use serde_json::json;
 	use vbare::OwnedVersionedData;
 
@@ -81,23 +83,6 @@ mod moved_tests {
 		assert_eq!(authorization_bearer_token_map(&map), Some("test-token"));
 	}
 
-	#[test]
-	fn request_has_bearer_token_uses_same_authorization_parser() {
-		let request = HttpRequest {
-			method: "GET".to_owned(),
-			path: "/metrics".to_owned(),
-			headers: HashMap::from([(
-				http::header::AUTHORIZATION.as_str().to_owned(),
-				"Bearer   configured".to_owned(),
-			)]),
-			body: Some(Vec::new()),
-			body_stream: None,
-		};
-
-		assert!(request_has_bearer_token(&request, Some("configured")));
-		assert!(!request_has_bearer_token(&request, Some("other")));
-	}
-
 	#[tokio::test]
 	async fn action_dispatch_timeout_returns_structured_error() {
 		let error = super::with_action_dispatch_timeout(Duration::from_millis(1), async {
@@ -136,7 +121,9 @@ mod moved_tests {
 				code: "action_timed_out".to_owned(),
 				message: "Action timed out".to_owned(),
 				metadata: None,
+				actor: None,
 			},
+			None,
 		)
 		.expect("timeout error response should serialize");
 
@@ -148,6 +135,35 @@ mod moved_tests {
 					"group": "actor",
 					"code": "action_timed_out",
 					"message": "Action timed out",
+				}))
+				.expect("json body should encode")
+			)
+		);
+	}
+
+	#[test]
+	fn framework_action_error_response_sanitizes_internal_message() {
+		let response = framework_action_error_response(
+			HttpResponseEncoding::Json,
+			ActionDispatchError {
+				group: "rivetkit".to_owned(),
+				code: "internal_error".to_owned(),
+				message: "plain failure".to_owned(),
+				metadata: Some(json!({ "error": "plain failure" })),
+				actor: None,
+			},
+			None,
+		)
+		.expect("internal error response should serialize");
+
+		assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR.as_u16());
+		assert_eq!(
+			response.body,
+			Some(
+				serde_json::to_vec(&json!({
+					"group": "rivetkit",
+					"code": "internal_error",
+					"message": "An internal error occurred",
 				}))
 				.expect("json body should encode")
 			)
@@ -182,6 +198,36 @@ mod moved_tests {
 	}
 
 	#[test]
+	fn framework_anyhow_error_response_sanitizes_internal_message() {
+		static TEST_ERROR: RivetErrorSchema = RivetErrorSchema {
+			group: "rivetkit",
+			code: "internal_error",
+			default_message: "plain failure",
+			meta_type: None,
+			_macro_marker: MacroMarker { _private: () },
+		};
+		let response = framework_anyhow_error_response_with_actor(
+			HttpResponseEncoding::Json,
+			TEST_ERROR.build(),
+			None,
+		)
+		.expect("internal error response should serialize");
+
+		assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR.as_u16());
+		assert_eq!(
+			response.body,
+			Some(
+				serde_json::to_vec(&json!({
+					"group": "rivetkit",
+					"code": "internal_error",
+					"message": "An internal error occurred",
+				}))
+				.expect("json body should encode")
+			)
+		);
+	}
+
+	#[test]
 	fn request_encoding_reads_cbor_header() {
 		let mut headers = http::HeaderMap::new();
 		headers.insert("x-rivet-encoding", "cbor".parse().unwrap());
@@ -209,6 +255,47 @@ mod moved_tests {
 		assert_eq!(normalize_actor_request_path("/"), "/");
 		assert_eq!(normalize_actor_request_path("/action/ping"), "/action/ping");
 		assert_eq!(normalize_actor_request_path("/requestfoo"), "/requestfoo");
+	}
+
+	#[test]
+	fn message_boundary_error_response_with_actor_sets_body_and_headers() {
+		let actor = ActorSpecifier::new("actor-http", 9).with_key("user/1");
+		let response = message_boundary_error_response_with_actor(
+			HttpResponseEncoding::Json,
+			StatusCode::BAD_REQUEST,
+			IncomingMessageTooLong.build(),
+			Some(&actor),
+		)
+		.expect("json response should serialize");
+
+		assert_eq!(
+			response.headers.get("x-rivet-actor"),
+			Some(&"actor-http".to_owned())
+		);
+		assert_eq!(
+			response.headers.get("x-rivet-actor-generation"),
+			Some(&"9".to_owned())
+		);
+		assert_eq!(
+			response.headers.get("x-rivet-actor-key"),
+			Some(&"user/1".to_owned())
+		);
+		assert_eq!(
+			response.body,
+			Some(
+				serde_json::to_vec(&json!({
+					"group": "message",
+					"code": "incoming_too_long",
+					"message": "Incoming message too long",
+					"actor": {
+						"actorId": "actor-http",
+						"generation": 9,
+						"key": "user/1",
+					},
+				}))
+				.expect("json body should encode")
+			)
+		);
 	}
 
 	#[test]

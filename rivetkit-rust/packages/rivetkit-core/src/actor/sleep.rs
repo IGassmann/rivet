@@ -13,16 +13,22 @@ use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use crate::actor::config::ActorConfig;
+#[cfg(not(feature = "wasm-runtime"))]
+use crate::actor::context::ActorWorkRegion;
 use crate::actor::context::ActorContext;
 use crate::actor::task_types::ShutdownKind;
 #[cfg(feature = "wasm-runtime")]
 use crate::actor::work_registry::LocalShutdownTask;
-use crate::actor::work_registry::{CountGuard, RegionGuard, WorkRegistry};
+#[cfg(not(feature = "wasm-runtime"))]
+use crate::actor::work_registry::ActorWorkPolicy;
+use crate::actor::work_registry::{
+	ActorWorkKind, CountGuard, RegionGuard, WorkRegistry,
+};
 #[cfg(feature = "wasm-runtime")]
 use crate::runtime::RuntimeSpawner;
+use crate::time::{Instant, sleep};
 #[cfg(test)]
 use crate::time::sleep_until;
-use crate::time::{Instant, sleep};
 #[cfg(test)]
 use crate::types::ActorKey;
 #[cfg(feature = "wasm-runtime")]
@@ -112,6 +118,10 @@ impl std::fmt::Debug for SleepState {
 			.field(
 				"websocket_callback_count",
 				&self.work.websocket_callback.load(),
+			)
+			.field(
+				"disconnect_callback_count",
+				&self.work.disconnect_callback.load(),
 			)
 			.finish()
 	}
@@ -412,6 +422,29 @@ impl ActorContext {
 		}
 	}
 
+	pub async fn wait_for_tracked_shutdown_work(&self) -> bool {
+		let shutdown_deadline = self.shutdown_deadline_token();
+		tokio::select! {
+			_ = self.wait_for_tracked_shutdown_work_drained() => true,
+			_ = shutdown_deadline.cancelled() => false,
+		}
+	}
+
+	async fn wait_for_tracked_shutdown_work_drained(&self) {
+		loop {
+			let shutdown_count = self.shutdown_task_count();
+			let websocket_count = self.websocket_callback_count();
+			if shutdown_count == 0 && websocket_count == 0 {
+				return;
+			}
+
+			tokio::select! {
+				_ = self.0.sleep.work.shutdown_counter.wait_zero_unbounded(), if shutdown_count > 0 => {}
+				_ = self.0.sleep.work.websocket_callback.wait_zero_unbounded(), if websocket_count > 0 => {}
+			}
+		}
+	}
+
 	pub(crate) async fn wait_for_http_requests_drained(&self, deadline: Instant) -> bool {
 		let Some(counter) = self.http_request_counter() else {
 			return true;
@@ -459,6 +492,135 @@ impl ActorContext {
 
 	pub(crate) fn websocket_callback_count(&self) -> usize {
 		self.0.sleep.work.websocket_callback.load()
+	}
+
+	pub(crate) fn disconnect_callback_region_state(&self) -> RegionGuard {
+		self.0.sleep.work.disconnect_callback_guard()
+	}
+
+	#[cfg(not(feature = "wasm-runtime"))]
+	pub(crate) fn spawn_work_inner<F>(&self, kind: ActorWorkKind, fut: F) -> bool
+	where
+		F: Future<Output = ()> + Send + 'static,
+	{
+		if Handle::try_current().is_err() {
+			tracing::warn!(kind = kind.label(), "actor work spawned without tokio runtime");
+			return false;
+		}
+
+		let policy = kind.policy();
+		if policy.aborts_at_shutdown_deadline {
+			let mut shutdown_tasks = self.0.sleep.work.shutdown_tasks.lock();
+			if self.0.sleep.work.teardown_started.load(Ordering::Acquire) {
+				tracing::warn!(kind = kind.label(), "actor work spawned after teardown; aborting immediately");
+				return false;
+			}
+			let region = self.begin_work_region(kind);
+			shutdown_tasks.spawn(self.build_spawned_work_task(kind, policy, region, fut));
+		} else {
+			let mut unabortable_shutdown_tasks =
+				self.0.sleep.work.unabortable_shutdown_tasks.lock();
+			if self.0.sleep.work.teardown_started.load(Ordering::Acquire) {
+				tracing::warn!(kind = kind.label(), "actor work spawned after teardown; aborting immediately");
+				return false;
+			}
+			let region = self.begin_work_region(kind);
+			unabortable_shutdown_tasks
+				.spawn(self.build_spawned_work_task(kind, policy, region, fut));
+		}
+		self.reset_sleep_timer();
+		true
+	}
+
+	#[cfg(not(feature = "wasm-runtime"))]
+	fn build_spawned_work_task<F>(
+		&self,
+		kind: ActorWorkKind,
+		policy: ActorWorkPolicy,
+		region: ActorWorkRegion,
+		fut: F,
+	) -> impl Future<Output = ()> + Send + 'static
+	where
+		F: Future<Output = ()> + Send + 'static,
+	{
+		let ctx = self.clone();
+		async move {
+			let _region = region;
+			if policy.aborts_at_shutdown_deadline {
+				let shutdown_deadline = ctx.shutdown_deadline_token();
+				tokio::select! {
+					_ = fut => {}
+					_ = shutdown_deadline.cancelled() => {
+						tracing::warn!(
+							actor_id = %ctx.actor_id(),
+							kind = kind.label(),
+							reason = "shutdown_deadline_elapsed",
+							"actor work cancelled by shutdown deadline"
+						);
+					}
+				}
+			} else {
+				fut.await;
+			}
+			ctx.reset_sleep_timer();
+		}
+		.in_current_span()
+	}
+
+	#[cfg(feature = "wasm-runtime")]
+	pub(crate) fn spawn_work_inner<F>(&self, kind: ActorWorkKind, fut: F) -> bool
+	where
+		F: Future<Output = ()> + 'static,
+	{
+		let mut local_shutdown_tasks = self.0.sleep.work.local_shutdown_tasks.lock();
+		if self.0.sleep.work.teardown_started.load(Ordering::Acquire) {
+			tracing::warn!(kind = kind.label(), "actor work spawned after teardown; aborting immediately");
+			return false;
+		}
+
+		let policy = kind.policy();
+		let region = self.begin_work_region(kind);
+		let ctx = self.clone();
+		let (complete_tx, complete_rx) = futures_oneshot::channel();
+		let (abort_handle, abort_registration) = AbortHandle::new_pair();
+		local_shutdown_tasks.push(LocalShutdownTask {
+			abort_handle,
+			complete_rx,
+			aborts_at_shutdown_deadline: policy.aborts_at_shutdown_deadline,
+		});
+		drop(local_shutdown_tasks);
+		let ctx_for_task = ctx.clone();
+		wasm_bindgen_futures::spawn_local(
+			async move {
+				let task = async move {
+					let _region = region;
+					if policy.aborts_at_shutdown_deadline {
+						let shutdown_deadline = ctx_for_task.shutdown_deadline_token();
+						tokio::select! {
+							_ = fut => {}
+							_ = shutdown_deadline.cancelled() => {
+								tracing::warn!(
+									actor_id = %ctx_for_task.actor_id(),
+									kind = kind.label(),
+									reason = "shutdown_deadline_elapsed",
+									"actor work cancelled by shutdown deadline"
+								);
+							}
+						}
+					} else {
+						fut.await;
+					}
+					let _ = complete_tx.send(());
+					ctx_for_task.reset_sleep_timer();
+				};
+				if Abortable::new(task, abort_registration).await.is_err() {
+					ctx.reset_sleep_timer();
+				}
+			}
+			.in_current_span(),
+		);
+		self.reset_sleep_timer();
+		true
 	}
 
 	#[cfg(not(feature = "wasm-runtime"))]
@@ -519,6 +681,7 @@ impl ActorContext {
 		local_shutdown_tasks.push(LocalShutdownTask {
 			abort_handle,
 			complete_rx,
+			aborts_at_shutdown_deadline: true,
 		});
 		drop(local_shutdown_tasks);
 		let ctx_for_task = ctx.clone();
@@ -605,7 +768,9 @@ impl ActorContext {
 
 				if abort_remaining {
 					for task in local_shutdown_tasks {
-						task.abort_handle.abort();
+						if task.aborts_at_shutdown_deadline {
+							task.abort_handle.abort();
+						}
 						if task.complete_rx.await.is_err() {
 							tracing::debug!("aborted shutdown task during teardown");
 						}
@@ -628,10 +793,12 @@ impl ActorContext {
 
 		#[cfg(not(feature = "wasm-runtime"))]
 		loop {
-			let mut shutdown_tasks = {
+			let mut abortable_shutdown_tasks = {
 				let mut guard = self.0.sleep.work.shutdown_tasks.lock();
 				let taken = std::mem::take(&mut *guard);
-				if taken.is_empty() {
+				let mut unabortable_guard = self.0.sleep.work.unabortable_shutdown_tasks.lock();
+				let unabortable_taken = std::mem::take(&mut *unabortable_guard);
+				if taken.is_empty() && unabortable_taken.is_empty() {
 					self.0
 						.sleep
 						.work
@@ -639,18 +806,22 @@ impl ActorContext {
 						.store(true, Ordering::Release);
 					return;
 				}
-				taken
+				(taken, unabortable_taken)
 			};
 
-			if abort_remaining {
-				shutdown_tasks.shutdown().await;
-			} else {
-				while let Some(result) = shutdown_tasks.join_next().await {
-					if let Err(error) = result
-						&& !error.is_cancelled()
-					{
-						tracing::error!(?error, "shutdown task join failed during teardown");
-					}
+			abortable_shutdown_tasks.0.shutdown().await;
+			while let Some(result) = abortable_shutdown_tasks.0.join_next().await {
+				if let Err(error) = result
+					&& !error.is_cancelled()
+				{
+					tracing::error!(?error, "shutdown task join failed during teardown");
+				}
+			}
+			while let Some(result) = abortable_shutdown_tasks.1.join_next().await {
+				if let Err(error) = result
+					&& !error.is_cancelled()
+				{
+					tracing::error!(?error, "shutdown task join failed during teardown");
 				}
 			}
 		}

@@ -10,6 +10,7 @@ use crate::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as AnyhowContext, Result};
 use futures::future::BoxFuture;
 use parking_lot::{Mutex, RwLock};
+use rivet_error::ActorSpecifier;
 use rivet_envoy_client::handle::EnvoyHandle;
 use rivet_envoy_client::tunnel::HibernatingWebSocketMetadata;
 use scc::HashMap as SccHashMap;
@@ -33,15 +34,13 @@ use crate::actor::schedule::{InternalKeepAwakeCallback, LocalAlarmCallback};
 use crate::actor::sleep::{CanSleep, SleepState};
 use crate::actor::state::{PendingSave, PersistedActor, RequestSaveOpts};
 use crate::actor::task::LifecycleEvent;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::actor::task::{LIFECYCLE_EVENT_INBOX_CHANNEL, actor_channel_overloaded_error};
 use crate::actor::task_types::UserTaskKind;
-use crate::actor::work_registry::RegionGuard;
+use crate::actor::work_registry::{ActorWorkKind, CountGuard, RegionGuard};
 use crate::error::{ActorLifecycle as ActorLifecycleError, ActorRuntime};
 use crate::inspector::{Inspector, InspectorSnapshot};
 use crate::kv::Kv;
 use crate::sqlite::SqliteDb;
-use crate::types::{ActorKey, ConnId, ListOpts};
+use crate::types::{ActorKey, ConnId, ListOpts, format_actor_key};
 
 /// Shared actor runtime context.
 ///
@@ -128,7 +127,6 @@ pub(crate) struct ActorContextInner {
 	pub(super) connection_disconnect_state: Mutex<()>,
 	pub(super) sleep: SleepState,
 	activity: ActivityState,
-	pending_disconnect_count: AtomicUsize,
 	sleep_requested: AtomicBool,
 	destroy_requested: AtomicBool,
 	destroy_completed: AtomicBool,
@@ -141,9 +139,8 @@ pub(crate) struct ActorContextInner {
 	inspector_attach_count: RwLock<Option<Arc<AtomicU32>>>,
 	inspector_overlay_tx: RwLock<Option<broadcast::Sender<Arc<Vec<u8>>>>>,
 	actor_events: RwLock<Option<mpsc::UnboundedSender<ActorEvent>>>,
-	pub(super) lifecycle_events: RwLock<Option<mpsc::Sender<LifecycleEvent>>>,
+	pub(super) lifecycle_events: RwLock<Option<mpsc::UnboundedSender<LifecycleEvent>>>,
 	hibernated_connection_liveness_override: RwLock<Option<BTreeSet<(Vec<u8>, Vec<u8>)>>>,
-	pub(super) lifecycle_event_inbox_capacity: usize,
 	pub(super) metrics: ActorMetrics,
 	diagnostics: ActorDiagnostics,
 	actor_id: String,
@@ -179,6 +176,8 @@ impl ActorContext {
 			name.into(),
 			key,
 			region.into(),
+			None,
+			String::new(),
 			ActorConfig::default(),
 			Kv::default(),
 			SqliteDb::default(),
@@ -197,6 +196,8 @@ impl ActorContext {
 			name.into(),
 			key,
 			region.into(),
+			None,
+			String::new(),
 			ActorConfig::default(),
 			kv,
 			SqliteDb::default(),
@@ -210,6 +211,8 @@ impl ActorContext {
 			"state-test".to_owned(),
 			Vec::new(),
 			"local".to_owned(),
+			None,
+			String::new(),
 			config,
 			kv,
 			SqliteDb::default(),
@@ -221,17 +224,23 @@ impl ActorContext {
 		name: String,
 		key: ActorKey,
 		region: String,
+		generation: Option<u32>,
+		envoy_key: String,
 		config: ActorConfig,
 		kv: Kv,
 		sql: SqliteDb,
 	) -> Self {
-		let metrics = ActorMetrics::new(actor_id.clone(), name.clone());
+		let metrics = ActorMetrics::new(
+			actor_id.clone(),
+			generation,
+			format_actor_key(&key),
+			envoy_key,
+		);
 		#[cfg(feature = "sqlite-local")]
 		let mut sql = sql;
 		#[cfg(feature = "sqlite-local")]
 		sql.set_vfs_metrics(Arc::new(metrics.clone()));
 		let diagnostics = ActorDiagnostics::new(actor_id.clone());
-		let lifecycle_event_inbox_capacity = config.lifecycle_event_inbox_capacity;
 		let state_save_interval = config.state_save_interval;
 		let abort_signal = CancellationToken::new();
 		let shutdown_deadline = CancellationToken::new();
@@ -296,7 +305,6 @@ impl ActorContext {
 			connection_disconnect_state: Mutex::new(()),
 			sleep,
 			activity: ActivityState::default(),
-			pending_disconnect_count: AtomicUsize::new(0),
 			sleep_requested: AtomicBool::new(false),
 			destroy_requested: AtomicBool::new(false),
 			destroy_completed: AtomicBool::new(false),
@@ -309,7 +317,6 @@ impl ActorContext {
 			actor_events: RwLock::new(None),
 			lifecycle_events: RwLock::new(None),
 			hibernated_connection_liveness_override: RwLock::new(None),
-			lifecycle_event_inbox_capacity,
 			metrics,
 			diagnostics,
 			actor_id,
@@ -543,83 +550,34 @@ impl ActorContext {
 
 	#[cfg(not(feature = "wasm-runtime"))]
 	pub fn wait_until(&self, future: impl Future<Output = ()> + Send + 'static) {
-		if Handle::try_current().is_err() {
-			tracing::warn!("skipping wait_until without a tokio runtime");
-			return;
-		}
-
-		let ctx = self.clone();
-		// Intentionally detached but tracked by the actor sleep state: waitUntil work
-		// is a public side task that shutdown drains/aborts through
-		// `shutdown_tasks`, not an ActorTask dispatch child.
-		self.track_shutdown_task(async move {
-			ctx.record_user_task_started(UserTaskKind::WaitUntil);
-			let started_at = Instant::now();
-			future.await;
-			ctx.record_user_task_finished(UserTaskKind::WaitUntil, started_at.elapsed());
-			ctx.reset_sleep_timer();
-		});
+		self.spawn_work(ActorWorkKind::WaitUntil, future);
 	}
 
 	#[cfg(not(feature = "wasm-runtime"))]
 	pub fn register_task(&self, future: impl Future<Output = ()> + Send + 'static) {
-		let ctx = self.clone();
-		self.track_shutdown_task(async move {
-			Self::run_registered_task(ctx, future).await;
-		});
+		self.spawn_work(ActorWorkKind::RegisteredTask, future);
 	}
 
 	#[cfg(feature = "wasm-runtime")]
 	pub fn wait_until(&self, future: impl Future<Output = ()> + 'static) {
-		let ctx = self.clone();
-		self.track_shutdown_task(async move {
-			ctx.record_user_task_started(UserTaskKind::WaitUntil);
-			let started_at = Instant::now();
-			future.await;
-			ctx.record_user_task_finished(UserTaskKind::WaitUntil, started_at.elapsed());
-			ctx.reset_sleep_timer();
-		});
+		self.spawn_work(ActorWorkKind::WaitUntil, future);
 	}
 
 	#[cfg(feature = "wasm-runtime")]
 	pub fn register_task(&self, future: impl Future<Output = ()> + 'static) {
-		let ctx = self.clone();
-		self.track_shutdown_task(async move {
-			Self::run_registered_task(ctx, future).await;
-		});
-	}
-
-	async fn run_registered_task<F>(ctx: ActorContext, future: F)
-	where
-		F: Future<Output = ()>,
-	{
-		let shutdown_deadline = ctx.shutdown_deadline_token();
-		ctx.record_user_task_started(UserTaskKind::RegisteredTask);
-		let started_at = Instant::now();
-		tokio::select! {
-			_ = future => {}
-			_ = shutdown_deadline.cancelled() => {
-				tracing::warn!(
-					actor_id = %ctx.actor_id(),
-					reason = "shutdown_deadline_elapsed",
-					"registered task cancelled by shutdown deadline"
-				);
-			}
-		}
-		ctx.record_user_task_finished(UserTaskKind::RegisteredTask, started_at.elapsed());
+		self.spawn_work(ActorWorkKind::RegisteredTask, future);
 	}
 
 	pub async fn keep_awake<F>(&self, future: F) -> F::Output
 	where
 		F: Future,
 	{
-		let _guard = self.keep_awake_guard();
-		future.await
+		self.track_work(ActorWorkKind::KeepAwake, future).await
 	}
 
 	pub fn keep_awake_region(&self) -> KeepAwakeRegion {
 		KeepAwakeRegion {
-			guard: Some(self.keep_awake_guard()),
+			region: Some(self.begin_work_region(ActorWorkKind::KeepAwake)),
 		}
 	}
 
@@ -627,8 +585,8 @@ impl ActorContext {
 	where
 		F: Future,
 	{
-		let _guard = self.internal_keep_awake_guard();
-		future.await
+		self.track_work(ActorWorkKind::InternalKeepAwake, future)
+			.await
 	}
 
 	pub fn keep_awake_count(&self) -> usize {
@@ -637,6 +595,36 @@ impl ActorContext {
 
 	pub fn internal_keep_awake_count(&self) -> usize {
 		self.sleep_internal_keep_awake_count()
+	}
+
+	pub async fn track_work<F>(&self, kind: ActorWorkKind, future: F) -> F::Output
+	where
+		F: Future,
+	{
+		let _region = self.begin_work_region(kind);
+		future.await
+	}
+
+	#[cfg(not(feature = "wasm-runtime"))]
+	pub fn spawn_work<F>(&self, kind: ActorWorkKind, future: F)
+	where
+		F: Future<Output = ()> + Send + 'static,
+	{
+		self.spawn_work_inner(kind, future);
+	}
+
+	#[cfg(feature = "wasm-runtime")]
+	pub fn spawn_work<F>(&self, kind: ActorWorkKind, future: F)
+	where
+		F: Future<Output = ()> + 'static,
+	{
+		self.spawn_work_inner(kind, future);
+	}
+
+	pub fn begin_work_region(&self, kind: ActorWorkKind) -> ActorWorkRegion {
+		ActorWorkRegion {
+			guard: Some(ActorWorkGuard::new(self.clone(), kind)),
+		}
 	}
 
 	pub fn actor_id(&self) -> &str {
@@ -649,6 +637,20 @@ impl ActorContext {
 
 	pub fn key(&self) -> &ActorKey {
 		&self.0.key
+	}
+
+	pub(crate) fn actor_specifier(&self) -> Option<ActorSpecifier> {
+		Some(
+			ActorSpecifier::new(self.actor_id().to_owned(), self.sleep_generation()? as u64)
+				.with_key(format_actor_key(self.key())),
+		)
+	}
+
+	pub(crate) fn attach_actor_to_error(&self, error: anyhow::Error) -> anyhow::Error {
+		match self.actor_specifier() {
+			Some(actor) => error.context(actor),
+			None => error,
+		}
 	}
 
 	pub fn region(&self) -> &str {
@@ -802,15 +804,6 @@ impl ActorContext {
 				"actor dispatch may be parked behind the current instance"
 			);
 		}
-	}
-
-	#[doc(hidden)]
-	pub fn render_metrics(&self) -> Result<String> {
-		self.0.metrics.render()
-	}
-
-	pub(crate) fn metrics_content_type(&self) -> String {
-		self.0.metrics.metrics_content_type()
 	}
 
 	#[cfg(test)]
@@ -1252,7 +1245,7 @@ impl ActorContext {
 	}
 
 	pub(crate) fn pending_disconnect_count(&self) -> usize {
-		self.0.pending_disconnect_count.load(Ordering::SeqCst)
+		self.0.sleep.work.disconnect_callback.load()
 	}
 
 	pub async fn with_disconnect_callback<F, Fut, T>(&self, run: F) -> T
@@ -1260,11 +1253,14 @@ impl ActorContext {
 		F: FnOnce() -> Fut,
 		Fut: Future<Output = T>,
 	{
-		let _guard = DisconnectCallbackGuard::new(self.clone());
-		run().await
+		self.track_work(ActorWorkKind::DisconnectCallback, run())
+			.await
 	}
 
-	pub(crate) fn configure_lifecycle_events(&self, sender: Option<mpsc::Sender<LifecycleEvent>>) {
+	pub(crate) fn configure_lifecycle_events(
+		&self,
+		sender: Option<mpsc::UnboundedSender<LifecycleEvent>>,
+	) {
 		*self.0.lifecycle_events.write() = sender;
 	}
 
@@ -1329,24 +1325,6 @@ impl ActorContext {
 		self.0.sleep_requested.store(false, Ordering::SeqCst);
 	}
 
-	fn keep_awake_guard(&self) -> KeepAwakeGuard {
-		let region = self
-			.keep_awake_region_state()
-			.with_log_fields("keep_awake", Some(self.actor_id().to_owned()));
-		let guard = KeepAwakeGuard::new(self.clone(), region);
-		self.reset_sleep_timer();
-		guard
-	}
-
-	fn internal_keep_awake_guard(&self) -> KeepAwakeGuard {
-		let region = self
-			.internal_keep_awake_region()
-			.with_log_fields("internal_keep_awake", Some(self.actor_id().to_owned()));
-		let guard = KeepAwakeGuard::new(self.clone(), region);
-		self.reset_sleep_timer();
-		guard
-	}
-
 	pub(crate) async fn internal_keep_awake_task(
 		&self,
 		future: BoxFuture<'static, Result<()>>,
@@ -1356,7 +1334,7 @@ impl ActorContext {
 
 	pub fn websocket_callback_region(&self) -> WebSocketCallbackRegion {
 		WebSocketCallbackRegion {
-			guard: Some(self.websocket_callback_guard(UserTaskKind::WebSocketCallback)),
+			region: Some(self.begin_work_region(ActorWorkKind::WebSocketCallback)),
 		}
 	}
 
@@ -1369,11 +1347,25 @@ impl ActorContext {
 		run().await
 	}
 
-	fn websocket_callback_guard(&self, kind: UserTaskKind) -> WebSocketCallbackGuard {
-		let region = self.websocket_callback_region_state();
-		self.record_user_task_started(kind);
-		self.reset_sleep_timer();
-		WebSocketCallbackGuard::new(self.clone(), kind, region)
+	fn idle_work_region(&self, kind: ActorWorkKind) -> Option<RegionGuard> {
+		if !kind.policy().blocks_idle_sleep {
+			return None;
+		}
+		let region = match kind {
+			ActorWorkKind::KeepAwake => self.keep_awake_region_state(),
+			ActorWorkKind::InternalKeepAwake => self.internal_keep_awake_region(),
+			ActorWorkKind::WaitUntil => return None,
+			ActorWorkKind::RegisteredTask => return None,
+			ActorWorkKind::WebSocketCallback => self.websocket_callback_region_state(),
+			ActorWorkKind::DisconnectCallback => self.disconnect_callback_region_state(),
+		};
+		Some(region.with_log_fields(kind.label(), Some(self.actor_id().to_owned())))
+	}
+
+	fn shutdown_work_region(&self) -> CountGuard {
+		let counter = self.0.sleep.work.shutdown_counter.clone();
+		counter.increment();
+		CountGuard::from_incremented(counter)
 	}
 
 	fn configure_sleep_hooks(&self) {
@@ -1435,10 +1427,10 @@ impl ActorContext {
 		self.cancel_scheduled_event(event_id);
 		let ctx = self.clone();
 		let event_id = event_id.to_owned();
-		let keep_awake_guard = self.internal_keep_awake_guard();
+		let internal_keep_awake_region = self.begin_work_region(ActorWorkKind::InternalKeepAwake);
 
 		self.track_shutdown_task(async move {
-			let _keep_awake_guard = keep_awake_guard;
+			let _internal_keep_awake_region = internal_keep_awake_region;
 			ctx.record_user_task_started(UserTaskKind::ScheduledAction);
 			let started_at = Instant::now();
 			let action_name = action.clone();
@@ -1491,28 +1483,12 @@ impl ActorContext {
 	}
 
 	fn try_send_lifecycle_event(&self, event: LifecycleEvent, operation: &'static str) {
-		#[cfg(target_arch = "wasm32")]
-		let _ = operation;
-
 		let Some(sender) = self.0.lifecycle_events.read().clone() else {
 			return;
 		};
 
-		match sender.try_reserve() {
-			Ok(permit) => {
-				permit.send(event);
-			}
-			#[cfg(target_arch = "wasm32")]
-			Err(_) => {}
-			#[cfg(not(target_arch = "wasm32"))]
-			Err(_) => {
-				let _ = actor_channel_overloaded_error(
-					LIFECYCLE_EVENT_INBOX_CHANNEL,
-					self.0.lifecycle_event_inbox_capacity,
-					operation,
-					Some(&self.0.metrics),
-				);
-			}
+		if sender.send(event).is_err() {
+			tracing::warn!(operation, "failed to enqueue actor lifecycle event");
 		}
 	}
 }
@@ -1524,46 +1500,62 @@ fn now_timestamp_ms() -> i64 {
 	i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
-struct KeepAwakeGuard {
+struct ActorWorkGuard {
 	ctx: ActorContext,
-	region: Option<RegionGuard>,
+	kind: ActorWorkKind,
+	started_at: Option<Instant>,
+	idle_region: Option<RegionGuard>,
+	shutdown_region: Option<CountGuard>,
 }
 
 #[must_use]
-struct DisconnectCallbackGuard {
-	ctx: ActorContext,
-	started_at: Instant,
+pub struct ActorWorkRegion {
+	guard: Option<ActorWorkGuard>,
 }
 
-impl DisconnectCallbackGuard {
-	fn new(ctx: ActorContext) -> Self {
-		ctx.0
-			.pending_disconnect_count
-			.fetch_add(1, Ordering::SeqCst);
-		ctx.record_user_task_started(UserTaskKind::DisconnectCallback);
+impl ActorWorkGuard {
+	fn new(ctx: ActorContext, kind: ActorWorkKind) -> Self {
+		let policy = kind.policy();
+		let idle_region = ctx.idle_work_region(kind);
+		let shutdown_region = if policy.drains_shutdown_grace {
+			Some(ctx.shutdown_work_region())
+		} else {
+			None
+		};
+		let started_at = if let Some(user_task_kind) = policy.user_task_kind {
+			ctx.record_user_task_started(user_task_kind);
+			Some(Instant::now())
+		} else {
+			None
+		};
 		ctx.reset_sleep_timer();
 		Self {
 			ctx,
-			started_at: Instant::now(),
+			kind,
+			started_at,
+			idle_region,
+			shutdown_region,
 		}
 	}
 }
 
-impl Drop for DisconnectCallbackGuard {
+impl Drop for ActorWorkGuard {
 	fn drop(&mut self) {
-		let Ok(previous) = self.ctx.0.pending_disconnect_count.fetch_update(
-			Ordering::SeqCst,
-			Ordering::SeqCst,
-			|current| current.checked_sub(1),
-		) else {
-			return;
-		};
-		if previous == 0 {
-			return;
+		if let Some(started_at) = self.started_at.take()
+			&& let Some(user_task_kind) = self.kind.policy().user_task_kind
+		{
+			self.ctx
+				.record_user_task_finished(user_task_kind, started_at.elapsed());
 		}
-		self.ctx
-			.record_user_task_finished(UserTaskKind::DisconnectCallback, self.started_at.elapsed());
+		self.idle_region.take();
+		self.shutdown_region.take();
 		self.ctx.reset_sleep_timer();
+	}
+}
+
+impl Drop for ActorWorkRegion {
+	fn drop(&mut self) {
+		self.guard.take();
 	}
 }
 
@@ -1616,67 +1608,24 @@ impl Drop for InspectorAttachGuard {
 	}
 }
 
-impl KeepAwakeGuard {
-	fn new(ctx: ActorContext, region: RegionGuard) -> Self {
-		Self {
-			ctx,
-			region: Some(region),
-		}
-	}
-}
-
-impl Drop for KeepAwakeGuard {
-	fn drop(&mut self) {
-		self.region.take();
-		self.ctx.reset_sleep_timer();
-	}
-}
-
-struct WebSocketCallbackGuard {
-	ctx: ActorContext,
-	kind: UserTaskKind,
-	started_at: Instant,
-	region: Option<RegionGuard>,
-}
-
 pub struct WebSocketCallbackRegion {
-	guard: Option<WebSocketCallbackGuard>,
+	region: Option<ActorWorkRegion>,
 }
 
 pub struct KeepAwakeRegion {
-	guard: Option<KeepAwakeGuard>,
-}
-
-impl WebSocketCallbackGuard {
-	fn new(ctx: ActorContext, kind: UserTaskKind, region: RegionGuard) -> Self {
-		Self {
-			ctx,
-			kind,
-			started_at: Instant::now(),
-			region: Some(region),
-		}
-	}
-}
-
-impl Drop for WebSocketCallbackGuard {
-	fn drop(&mut self) {
-		self.ctx
-			.record_user_task_finished(self.kind, self.started_at.elapsed());
-		self.region.take();
-		self.ctx.reset_sleep_timer();
-	}
+	region: Option<ActorWorkRegion>,
 }
 
 impl Drop for WebSocketCallbackRegion {
 	fn drop(&mut self) {
-		self.guard.take();
+		self.region.take();
 	}
 }
 
 impl Drop for KeepAwakeRegion {
 	fn drop(&mut self) {
-		// Take the guard explicitly to mirror WebSocketCallbackRegion.
-		self.guard.take();
+		// Take the region explicitly to mirror WebSocketCallbackRegion.
+		self.region.take();
 	}
 }
 

@@ -202,6 +202,7 @@ impl RegistryDispatcher {
 							message: rivet_error.message().to_owned(),
 							metadata,
 							action_id: None,
+							actor: rivet_error.actor().cloned(),
 						},
 						max_outgoing_message_size,
 					));
@@ -223,6 +224,7 @@ impl RegistryDispatcher {
 							),
 							metadata: None,
 							action_id: None,
+							actor: None,
 						},
 						max_outgoing_message_size,
 					));
@@ -244,8 +246,6 @@ impl RegistryDispatcher {
 		let on_message_conn = conn.clone();
 		let on_message_ctx = instance.ctx.clone();
 		let on_message_dispatch = instance.dispatch.clone();
-		let on_message_dispatch_capacity =
-			instance.factory.config().dispatch_command_inbox_capacity;
 
 		let on_open: Option<Box<dyn FnOnce(WebSocketSender) -> EnvoyBoxFuture<()> + Send>> =
 			if is_restoring_hibernatable {
@@ -359,7 +359,6 @@ impl RegistryDispatcher {
 								async move {
 									let response = match dispatch_action_through_task(
 										&dispatch,
-										on_message_dispatch_capacity,
 										conn.clone(),
 										request.name.clone(),
 										request.args.into_vec(),
@@ -424,6 +423,7 @@ impl RegistryDispatcher {
 													message: "Outgoing message too long".to_owned(),
 													metadata: None,
 													action_id: Some(request.id),
+													actor: None,
 												});
 											if let Err(error) = send_actor_connect_message(
 												&sender,
@@ -542,7 +542,6 @@ impl RegistryDispatcher {
 		};
 		let ctx = instance.ctx.clone();
 		let dispatch = instance.dispatch.clone();
-		let dispatch_capacity = instance.factory.config().dispatch_command_inbox_capacity;
 		let conn_for_close = conn.clone();
 		let conn_for_message = conn.clone();
 		let conn_for_open = conn.clone();
@@ -666,7 +665,6 @@ impl RegistryDispatcher {
 					ws.configure_sender(sender);
 					let result = dispatch_websocket_open_through_task(
 						&dispatch,
-						dispatch_capacity,
 						conn,
 						ws.clone(),
 						Some(request),

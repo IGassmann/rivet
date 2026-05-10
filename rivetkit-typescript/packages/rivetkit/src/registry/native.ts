@@ -29,22 +29,9 @@ import {
 	createClientWithDriver,
 } from "@/client/client";
 import { convertRegistryConfigToClientConfig } from "@/client/config";
-import {
-	HEADER_CONN_PARAMS,
-	HEADER_ENCODING,
-} from "@/common/actor-router-consts";
-import type * as protocol from "@/common/client-protocol";
-import {
-	CURRENT_VERSION as CLIENT_PROTOCOL_CURRENT_VERSION,
-	HTTP_RESPONSE_ERROR_VERSIONED,
-} from "@/common/client-protocol-versioned";
-import {
-	type HttpResponseError as HttpResponseErrorJson,
-	HttpResponseErrorSchema,
-} from "@/common/client-protocol-zod";
+import { HEADER_CONN_PARAMS } from "@/common/actor-router-consts";
 import type { AnyDatabaseProvider } from "@/common/database/config";
 import { wrapJsNativeDatabase } from "@/common/database/native-database";
-import type { Encoding } from "@/common/encoding";
 import { decodeWorkflowHistoryTransport } from "@/common/inspector-transport";
 import { deconstructError, stringifyError } from "@/common/utils";
 import type {
@@ -61,11 +48,9 @@ import type {
 	SqliteBackend,
 } from "@/registry/config";
 import {
-	contentTypeForEncoding,
 	decodeCborCompat,
 	decodeCborJsonCompat,
 	encodeCborCompat,
-	serializeWithEncoding,
 } from "@/serde";
 import { getEnvUniversal, VERSION } from "@/utils";
 import { logger } from "./log";
@@ -269,9 +254,6 @@ type NativeDatabaseClientState = {
 type NativeActorRuntimeState = {
 	sql?: ReturnType<typeof wrapJsNativeDatabase>;
 	databaseClient?: NativeDatabaseClientState;
-	keepAwakeCount?: number;
-	deferSleepCleanupUntilKeepAwakeIdle?: boolean;
-	deferredSleepCleanupActorCtx?: ActorContextHandleAdapter;
 	varsInitialized?: boolean;
 	vars?: unknown;
 	destroyGate?: NativeDestroyGate;
@@ -424,24 +406,10 @@ async function cleanupNativeSleepRuntimeState(
 	runtime: CoreRuntime,
 	ctx: ActorContextHandle,
 ): Promise<void> {
+	await runtime.actorWaitForTrackedShutdownWork(ctx);
 	await closeNativeDatabaseClient(runtime, ctx);
 	await closeNativeSqlDatabase(runtime, ctx);
 	clearNativeRuntimeState(runtime, ctx);
-}
-
-async function cleanupDeferredNativeSleepRuntimeState(
-	runtime: CoreRuntime,
-	ctx: ActorContextHandle,
-	runtimeState: NativeActorRuntimeState,
-): Promise<void> {
-	runtimeState.deferSleepCleanupUntilKeepAwakeIdle = false;
-	const actorCtx = runtimeState.deferredSleepCleanupActorCtx;
-	runtimeState.deferredSleepCleanupActorCtx = undefined;
-	try {
-		await cleanupNativeSleepRuntimeState(runtime, ctx);
-	} finally {
-		await actorCtx?.dispose();
-	}
 }
 
 function closeNativeSqlDatabase(
@@ -670,28 +638,7 @@ function isStructuredBridgeError(
 function encodeNativeCallbackError(error: unknown): Error {
 	const structuredError = isStructuredBridgeError(error)
 		? error
-		: deconstructError(error, logger(), {
-				bridge: "native_callback",
-			});
-	let stack: string | undefined;
-	if (error instanceof Error) {
-		try {
-			stack = error.stack;
-		} catch {
-			stack = undefined;
-		}
-	}
-
-	logger().warn({
-		msg: "native callback error encoded for bridge",
-		group: structuredError.group,
-		code: structuredError.code,
-		message: structuredError.message,
-		metadata: structuredError.metadata,
-		originalError: stringifyError(error),
-		stack,
-		bridge: "native_callback",
-	});
+		: deconstructError(error, true);
 
 	const bridgeError = new Error(encodeBridgeRivetError(structuredError), {
 		cause: error instanceof Error ? error : undefined,
@@ -2807,11 +2754,6 @@ export class ActorContextHandleAdapter {
 	}
 
 	keepAwake<T>(promise: Promise<T>): Promise<T> {
-		const runtimeState = getNativeRuntimeState(this.#runtime, this.#ctx);
-		// Increment before native registration so sleep cleanup observes JS work
-		// even if the promise settles immediately.
-		runtimeState.keepAwakeCount = (runtimeState.keepAwakeCount ?? 0) + 1;
-		let registered = false;
 		const trackedPromise = Promise.resolve(promise)
 			.catch((error) => {
 				logger().warn({
@@ -2819,36 +2761,12 @@ export class ActorContextHandleAdapter {
 					error: stringifyError(error),
 				});
 			})
-			.finally(async () => {
-				if (!registered) {
-					return;
-				}
-				runtimeState.keepAwakeCount = Math.max(
-					(runtimeState.keepAwakeCount ?? 1) - 1,
-					0,
-				);
-				if (
-					runtimeState.keepAwakeCount === 0 &&
-					runtimeState.deferSleepCleanupUntilKeepAwakeIdle
-				) {
-					await cleanupDeferredNativeSleepRuntimeState(
-						this.#runtime,
-						this.#ctx,
-						runtimeState,
-					);
-				}
-			})
 			.then(() => null);
 		try {
 			callNativeSync(() =>
 				this.#runtime.actorKeepAwake(this.#ctx, trackedPromise),
 			);
-			registered = true;
 		} catch (error) {
-			runtimeState.keepAwakeCount = Math.max(
-				(runtimeState.keepAwakeCount ?? 1) - 1,
-				0,
-			);
 			if (!isClosedTaskRegistrationError(error)) {
 				throw error;
 			}
@@ -3263,52 +3181,6 @@ function withConnContext(
 			),
 		},
 	);
-}
-
-function buildNativeRequestErrorResponse(
-	encoding: Encoding,
-	path: string,
-	error: unknown,
-): Response {
-	const { statusCode, group, code, message, metadata } = deconstructError(
-		error,
-		logger(),
-		{
-			path,
-			runtime: "native",
-		},
-		false,
-	);
-	const body = serializeWithEncoding<
-		protocol.HttpResponseError,
-		HttpResponseErrorJson,
-		{ group: string; code: string; message: string; metadata?: unknown }
-	>(
-		encoding,
-		{ group, code, message, metadata },
-		HTTP_RESPONSE_ERROR_VERSIONED,
-		CLIENT_PROTOCOL_CURRENT_VERSION,
-		HttpResponseErrorSchema,
-		(value) => value,
-		(value) => ({
-			group: value.group,
-			code: value.code,
-			message: value.message,
-			metadata:
-				value.metadata === undefined
-					? null
-					: runtimeBytesToArrayBuffer(
-							encodeCborCompat(value.metadata),
-						),
-		}),
-	);
-
-	return new Response(body, {
-		status: statusCode,
-		headers: {
-			"Content-Type": contentTypeForEncoding(encoding),
-		},
-	});
 }
 
 function buildActorConfig(
@@ -4013,12 +3885,9 @@ export function buildNativeFactory(
 						}
 					}
 				} finally {
-					const runtimeState = getNativeRuntimeState(runtime, ctx);
-					if ((runtimeState.keepAwakeCount ?? 0) > 0) {
-						runtimeState.deferSleepCleanupUntilKeepAwakeIdle = true;
-						runtimeState.deferredSleepCleanupActorCtx = actorCtx;
-					} else {
+					try {
 						await cleanupNativeSleepRuntimeState(runtime, ctx);
+					} finally {
 						await actorCtx.dispose();
 					}
 				}
@@ -4366,22 +4235,6 @@ export function buildNativeFactory(
 							);
 						}
 						return await toRuntimeHttpResponse(response);
-					} catch (error) {
-						const encodingHeader =
-							jsRequest.headers.get(HEADER_ENCODING);
-						const encoding: Encoding =
-							encodingHeader === "cbor" ||
-							encodingHeader === "bare"
-								? encodingHeader
-								: "json";
-						const path = new URL(jsRequest.url).pathname;
-						return await toRuntimeHttpResponse(
-							buildNativeRequestErrorResponse(
-								encoding,
-								path,
-								error,
-							),
-						);
 					} finally {
 						await requestCtx?.dispose();
 						if (conn) {

@@ -56,7 +56,6 @@ import {
 	type QueueSendResult,
 	type QueueSendWaitOptions,
 } from "./queue";
-import { resolveGatewayTarget } from "./resolve-gateway-target";
 import {
 	type WebSocketMessage as ConnMessage,
 	messageLength,
@@ -578,9 +577,7 @@ export class ActorConnRaw {
 
 	async #connectWebSocket() {
 		const params = await this.#resolveConnectionParams();
-		const target = this.#gatewayOptions.skipReadyWait
-			? await this.#resolveGatewayTargetForSkipReadyWait()
-			: getGatewayTarget(this.#actorResolutionState);
+		const target = getGatewayTarget(this.#actorResolutionState);
 		const ws = await this.#driver.openWebSocket(
 			PATH_CONNECT,
 			target,
@@ -632,25 +629,6 @@ export class ActorConnRaw {
 				});
 			}
 		});
-	}
-
-	async #resolveGatewayTargetForSkipReadyWait() {
-		if ("getForId" in this.#actorResolutionState) {
-			return {
-				directId: this.#actorResolutionState.getForId.actorId,
-			} as const;
-		}
-
-		if (this.#actorId) {
-			return { directId: this.#actorId } as const;
-		}
-
-		return {
-			directId: await resolveGatewayTarget(
-				this.#driver,
-				this.#actorResolutionState,
-			),
-		} as const;
 	}
 
 	/** Called by the onopen event from drivers. */
@@ -754,7 +732,7 @@ export class ActorConnRaw {
 			this.#handleOnOpen();
 		} else if (response.body.tag === "Error") {
 			// Connection error
-			const { group, code, message, metadata, actionId } =
+			const { group, code, message, metadata, actionId, actor } =
 				response.body.val;
 
 			if (actionId !== null) {
@@ -769,10 +747,16 @@ export class ActorConnRaw {
 					code,
 					message,
 					metadata,
+					actorId: actor?.actorId,
+					generation: actor?.generation,
+					actorKey: actor?.key,
 				});
 
 				inFlight.reject(
-					new errors.ActorError(group, code, message, metadata),
+					new errors.ActorError(group, code, message, {
+						metadata,
+						actor,
+					}),
 				);
 			} else {
 				logger().warn({
@@ -781,12 +765,18 @@ export class ActorConnRaw {
 					code,
 					message,
 					metadata,
+					actorId: actor?.actorId,
+					generation: actor?.generation,
+					actorKey: actor?.key,
 				});
 
 				if (this.#shouldReconnectForStaleActor(group, code)) {
 					this.#clearResolvedActorIdentity();
 					this.#onOpenPromise?.reject(
-						new errors.ActorError(group, code, message, metadata),
+						new errors.ActorError(group, code, message, {
+							metadata,
+							actor,
+						}),
 					);
 					return;
 				}
@@ -796,7 +786,7 @@ export class ActorConnRaw {
 					group,
 					code,
 					message,
-					metadata,
+					{ metadata, actor },
 				);
 				if (errors.isSchedulingError(group, code) && this.#actorId) {
 					const schedulingError = await checkForSchedulingError(
@@ -1368,6 +1358,7 @@ export class ActorConnRaw {
 						message: string;
 						metadata: unknown;
 						actionId: bigint | null;
+						actor?: errors.ActorSpecifier;
 					};
 			  }
 			| { tag: "ActionResponse"; val: { id: bigint; output: unknown } }
@@ -1382,8 +1373,26 @@ export class ActorConnRaw {
 			buffer,
 			CLIENT_PROTOCOL_TO_CLIENT,
 			ToClientSchema,
-			// JSON: values are already the correct type
-			(msg): ToClientJson => msg as ToClientJson,
+			// JSON/CBOR: normalize actor generation to the public number shape.
+			(msg): any => {
+				if (msg.body.tag !== "Error" || !msg.body.val.actor) {
+					return msg as ToClientJson;
+				}
+				return {
+					body: {
+						tag: "Error",
+						val: {
+							...msg.body.val,
+							actor: {
+								...msg.body.val.actor,
+								generation: Number(
+									msg.body.val.actor.generation,
+								),
+							},
+						},
+					},
+				};
+			},
 			// BARE: need to decode ArrayBuffer fields back to unknown
 			(msg): any => {
 				if (msg.body.tag === "Error") {
@@ -1402,6 +1411,17 @@ export class ActorConnRaw {
 										)
 									: null,
 								actionId: msg.body.val.actionId,
+								actor: msg.body.val.actor
+									? {
+											actorId: msg.body.val.actor.actorId,
+											generation: Number(
+												msg.body.val.actor.generation,
+											),
+											key:
+												msg.body.val.actor.key ??
+												undefined,
+										}
+									: undefined,
 							},
 						},
 					};

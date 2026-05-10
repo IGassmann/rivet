@@ -23,6 +23,7 @@ Design constraints, invariants, and reference commands for the Rivet monorepo. F
 **Always use versioned BARE (`vbare`) instead of raw `serde_bare` for any persisted or wire-format encoding unless explicitly told otherwise.** Raw `serde_bare::to_vec` / `from_slice` has no version header, so any future schema change forces hand-rolled `LegacyXxx` fallback structs. `vbare::OwnedVersionedData` plus a versioned `*.bare` schema is the standard pattern. Acceptable raw-bare exceptions: ephemeral in-memory encodings that never cross a process boundary or hit disk, and wire formats whose protocol version is coordinated out-of-band (e.g. an HTTP path like `/v{PROTOCOL_VERSION}/...` or another channel that pins both peers to one schema per call).
 
 - Avoid raw `f64` fields in vbare protocol schemas that use hashable maps; generated Rust derives `Eq`/`Hash`, so encode floats as fixed bytes or an ordered wrapper.
+- Version converters must manually map fields between versions; never use serialize-deserialize round trips such as `transcode_version` or `serde_bare::to_vec` plus `from_slice`.
 
 When talking about "Rivet Actors" make sure to capitalize "Rivet Actor" as a proper noun and lowercase "actor" as a generic noun.
 
@@ -222,9 +223,10 @@ When the user asks to track something in a note, store it in `.agent/notes/` by 
 
 ## Memory Leaks
 
-- Never call `Box::leak` inside a per-request, per-error, or per-call code path. If the leak is for a `'static` reference required by an upstream API (e.g. `RivetErrorSchema`), intern the leaked value through a process-global `LazyLock<scc::HashMap<Key, &'static T>>` keyed on its identity so each unique value is leaked at most once. Examples: `BRIDGE_RIVET_ERROR_SCHEMAS` in `rivetkit-typescript/packages/rivetkit-napi/src/actor_factory.rs`.
-- If every field in a leaked struct is a compile-time constant, use a `static`/`const` instead of `Box::leak(Box::new(...))`.
-- `std::mem::forget` is only acceptable when an FFI handle cannot be dropped in the current context (e.g. napi `Ref::unref` requires an `Env`). Document the constraint inline and ensure the leak is bounded per actor/connection lifetime, not per call. Prefer routing the drop through an Env-bearing thread when possible.
+- Do not introduce intentional leaks (`Box::leak`, `std::mem::forget`, `*_into_raw` without matching cleanup) unless an upstream API makes ownership impossible to express safely.
+- Never call `Box::leak` inside a per-request, per-error, or per-call code path; if a `'static` reference is required, use a compile-time `static`/`const` or intern it through a process-global map keyed by identity.
+- Interned leaks must be bounded by unique schema/config identity and must not include unbounded user input such as raw error messages, SQL, actor keys, request paths, or headers.
+- `std::mem::forget` is only acceptable when an FFI handle cannot be dropped in the current context; document the constraint inline, prove the leak is bounded, and prefer routing cleanup through an Env-bearing owner.
 - Spawned futures that capture JS callbacks or other heavy resources must have a guaranteed completion path (e.g. a `CancellationToken` whose clones are guaranteed to drop). A `spawn_local(async move { token.cancelled().await; ... })` only drains if every clone of the token is dropped or cancelled.
 
 ## Async Rust Locks

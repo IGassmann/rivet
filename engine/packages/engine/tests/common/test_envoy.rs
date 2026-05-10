@@ -20,6 +20,46 @@ type ActorFactory = Arc<dyn Fn(ActorConfig) -> Box<dyn TestActor> + Send + Sync>
 
 pub type TestEnvoy = Envoy;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnvoyConnectionEvent {
+	Connected,
+	Disconnected,
+}
+
+pub struct EnvoyConnectionEventWaiter {
+	rx: broadcast::Receiver<EnvoyConnectionEvent>,
+	expected: EnvoyConnectionEvent,
+	timeout: std::time::Duration,
+}
+
+impl EnvoyConnectionEventWaiter {
+	pub fn assert_no_event(&mut self) {
+		match self.rx.try_recv() {
+			Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+			Ok(event) => panic!("unexpected Envoy connection event before fault: {event:?}"),
+			Err(tokio::sync::broadcast::error::TryRecvError::Lagged(count)) => {
+				panic!("missed {count} Envoy connection events before fault")
+			}
+			Err(err) => panic!("Envoy connection event channel closed: {err}"),
+		}
+	}
+
+	pub async fn wait(mut self) {
+		tokio::time::timeout(self.timeout, async {
+			loop {
+				match self.rx.recv().await {
+					Ok(event) if event == self.expected => break,
+					Ok(_) => {}
+					Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+					Err(err) => panic!("Envoy connection event channel closed: {err}"),
+				}
+			}
+		})
+		.await
+		.expect("timed out waiting for Envoy connection event");
+	}
+}
+
 #[derive(Clone)]
 pub struct EnvoyConfig {
 	endpoint: String,
@@ -119,6 +159,7 @@ impl EnvoyBuilder {
 				actor_factories: self.actor_factories,
 				actors: tokio::sync::Mutex::new(HashMap::new()),
 				lifecycle_tx,
+				connection_tx: broadcast::channel(100).0,
 			}),
 			handle: tokio::sync::Mutex::new(None),
 			envoy_key: uuid::Uuid::new_v4().to_string(),
@@ -130,6 +171,7 @@ struct EnvoyInner {
 	actor_factories: HashMap<String, ActorFactory>,
 	actors: tokio::sync::Mutex<HashMap<String, Box<dyn TestActor>>>,
 	lifecycle_tx: broadcast::Sender<ActorLifecycleEvent>,
+	connection_tx: broadcast::Sender<EnvoyConnectionEvent>,
 }
 
 pub struct Envoy {
@@ -197,6 +239,29 @@ impl Envoy {
 		self.inner.lifecycle_tx.subscribe()
 	}
 
+	pub fn subscribe_connection_events(&self) -> broadcast::Receiver<EnvoyConnectionEvent> {
+		self.inner.connection_tx.subscribe()
+	}
+
+	pub fn wait_for_next_connection_event(
+		&self,
+		expected: EnvoyConnectionEvent,
+	) -> EnvoyConnectionEventWaiter {
+		EnvoyConnectionEventWaiter {
+			rx: self.subscribe_connection_events(),
+			expected,
+			timeout: std::time::Duration::from_secs(20),
+		}
+	}
+
+	pub async fn is_ping_healthy(&self) -> Option<bool> {
+		self.handle
+			.lock()
+			.await
+			.as_ref()
+			.map(|handle| handle.is_ping_healthy())
+	}
+
 	pub async fn shutdown(&self) {
 		if let Some(handle) = self.handle.lock().await.take() {
 			handle.shutdown_and_wait(false).await;
@@ -241,6 +306,20 @@ impl TestEnvoyCallbacks {
 }
 
 impl rivet_test_envoy::EnvoyCallbacks for TestEnvoyCallbacks {
+	fn on_connect(&self, _handle: EnvoyHandle) {
+		let _ = self
+			.inner
+			.connection_tx
+			.send(EnvoyConnectionEvent::Connected);
+	}
+
+	fn on_disconnect(&self, _handle: EnvoyHandle) {
+		let _ = self
+			.inner
+			.connection_tx
+			.send(EnvoyConnectionEvent::Disconnected);
+	}
+
 	fn on_actor_start(
 		&self,
 		handle: EnvoyHandle,
@@ -527,6 +606,7 @@ pub struct TestEnvoyBuilder {
 	namespace: String,
 	pool_name: String,
 	version: u32,
+	endpoint: Option<String>,
 	actor_factories: HashMap<String, ActorFactory>,
 }
 
@@ -536,6 +616,7 @@ impl TestEnvoyBuilder {
 			namespace: namespace.to_string(),
 			pool_name: "test-envoy".to_string(),
 			version: 1,
+			endpoint: None,
 			actor_factories: HashMap::new(),
 		}
 	}
@@ -550,6 +631,11 @@ impl TestEnvoyBuilder {
 		self
 	}
 
+	pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+		self.endpoint = Some(endpoint.into());
+		self
+	}
+
 	pub fn with_actor_behavior<F>(mut self, actor_name: &str, factory: F) -> Self
 	where
 		F: Fn(ActorConfig) -> Box<dyn TestActor> + Send + Sync + 'static,
@@ -561,7 +647,10 @@ impl TestEnvoyBuilder {
 
 	pub async fn build(self, dc: &super::TestDatacenter) -> Result<Envoy> {
 		let config = EnvoyConfig::builder()
-			.endpoint(format!("http://127.0.0.1:{}", dc.guard_port()))
+			.endpoint(
+				self.endpoint
+					.unwrap_or_else(|| format!("http://127.0.0.1:{}", dc.guard_port())),
+			)
 			.token("dev")
 			.namespace(&self.namespace)
 			.pool_name(&self.pool_name)

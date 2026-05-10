@@ -2,23 +2,25 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
-use rivet_error::{MacroMarker, RivetError as RivetTransportError, RivetErrorSchema};
+use rivet_error::{
+	ActorSpecifier, RivetError as RivetTransportError, RivetErrorKind,
+};
 use rivetkit_core::error::public_error_status_code;
 use rivetkit_core::inspector::InspectorAuth;
 use rivetkit_core::{
 	ActorConfig, ActorConfigInput, ActorEvent, ActorFactory as CoreActorFactory, ActorStart,
+	ActorWorkKind,
 	BindParam, ColumnValue, CoreRegistry as NativeCoreRegistry, CoreServerlessRuntime,
 	EnqueueAndWaitOpts, KeepAwakeRegion, ListOpts, QueueMessage, QueueNextBatchOpts,
 	QueueSendResult, QueueSendStatus, QueueTryNextBatchOpts, QueueWaitOpts, Request,
 	RequestSaveOpts, Response, RuntimeSpawner, SerializeStateReason, ServeConfig,
 	ServerlessRequest, StateDelta, WebSocket, WebSocketCallbackRegion, WsMessage,
 };
-use scc::HashMap as SccHashMap;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken as CoreCancellationToken;
 use wasm_bindgen::prelude::*;
@@ -26,12 +28,6 @@ use wasm_bindgen::{JsCast, UnwrapThrowExt};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 const BRIDGE_RIVET_ERROR_PREFIX: &str = "__RIVET_ERROR_JSON__:";
-
-type BridgeRivetErrorSchemaKey = (String, String);
-
-static BRIDGE_RIVET_ERROR_SCHEMAS: LazyLock<
-	SccHashMap<BridgeRivetErrorSchemaKey, &'static RivetErrorSchema>,
-> = LazyLock::new(SccHashMap::new);
 
 #[derive(rivet_error::RivetError, serde::Serialize)]
 #[error(
@@ -67,6 +63,7 @@ struct BridgeRivetErrorPayload {
 	public_: Option<bool>,
 	#[serde(rename = "statusCode")]
 	status_code: Option<u16>,
+	actor: Option<ActorSpecifier>,
 }
 
 #[derive(Debug)]
@@ -1405,13 +1402,16 @@ impl WasmActorContext {
 		});
 	}
 
+	#[wasm_bindgen(js_name = waitForTrackedShutdownWork)]
+	pub async fn wait_for_tracked_shutdown_work(&self) -> bool {
+		self.inner.wait_for_tracked_shutdown_work().await
+	}
+
 	#[wasm_bindgen(js_name = keepAwake)]
 	pub fn keep_awake(&self, promise: Promise) {
 		console_error("keepAwake binding is deprecated; use beginKeepAwake/endKeepAwake");
-		let region = self.inner.keep_awake_region();
 		let actor_id = self.inner.actor_id().to_owned();
-		self.inner.register_task(async move {
-			let _region = region;
+		self.inner.spawn_work(ActorWorkKind::KeepAwake, async move {
 			if let Err(error) = JsFuture::from(promise).await {
 				console_error(&format!(
 					"actor keepAwake promise rejected for actor {actor_id}: {}",
@@ -2692,28 +2692,6 @@ fn js_value_to_anyhow(value: JsValue) -> anyhow::Error {
 	anyhow!("JavaScript callback failed")
 }
 
-fn leak_str(value: String) -> &'static str {
-	Box::leak(value.into_boxed_str())
-}
-
-fn bridge_rivet_error_schema(payload: &BridgeRivetErrorPayload) -> &'static RivetErrorSchema {
-	let key = (payload.group.clone(), payload.code.clone());
-	match BRIDGE_RIVET_ERROR_SCHEMAS.entry_sync(key) {
-		scc::hash_map::Entry::Occupied(entry) => *entry.get(),
-		scc::hash_map::Entry::Vacant(entry) => {
-			let schema = Box::leak(Box::new(RivetErrorSchema {
-				group: leak_str(payload.group.clone()),
-				code: leak_str(payload.code.clone()),
-				default_message: leak_str(payload.message.clone()),
-				meta_type: None,
-				_macro_marker: MacroMarker { _private: () },
-			}));
-			entry.insert_entry(schema);
-			schema
-		}
-	}
-}
-
 fn parse_bridge_rivet_error(reason: &str) -> Option<anyhow::Error> {
 	let prefix_index = reason.find(BRIDGE_RIVET_ERROR_PREFIX)?;
 	let payload = &reason[prefix_index + BRIDGE_RIVET_ERROR_PREFIX.len()..];
@@ -2724,16 +2702,20 @@ fn parse_bridge_rivet_error(reason: &str) -> Option<anyhow::Error> {
 			return None;
 		}
 	};
-	let schema = bridge_rivet_error_schema(&payload);
 	let meta = payload
 		.metadata
 		.as_ref()
 		.and_then(|metadata| serde_json::value::to_raw_value(metadata).ok());
 	let message = payload.message;
 	let error = anyhow::Error::new(RivetTransportError {
-		schema,
+		kind: RivetErrorKind::Dynamic {
+			group: payload.group,
+			code: payload.code,
+			default_message: message.clone(),
+		},
 		meta,
 		message: Some(message.clone()),
+		actor: payload.actor,
 	});
 	Some(error.context(BridgeRivetErrorContext {
 		message: Some(message),
@@ -2826,12 +2808,14 @@ fn anyhow_to_bridge_rivet_error_payload(error: anyhow::Error) -> serde_json::Val
 		"metadata": error.metadata(),
 		"public": public_,
 		"statusCode": status_code,
+		"actor": error.actor(),
 	})
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use rivet_error::{MacroMarker, RivetErrorSchema};
 
 	fn test_serve_config(engine_binary_path: Option<String>) -> WasmServeConfig {
 		WasmServeConfig {
@@ -2873,45 +2857,37 @@ mod tests {
 		_macro_marker: MacroMarker { _private: () },
 	};
 
-	fn transport_schema(error: &anyhow::Error) -> &'static RivetErrorSchema {
+	fn transport_error(error: &anyhow::Error) -> &RivetTransportError {
 		error
 			.chain()
 			.find_map(|cause| cause.downcast_ref::<RivetTransportError>())
 			.expect("bridge error should carry RivetTransportError")
-			.schema
 	}
 
 	fn transport_message(error: &anyhow::Error) -> String {
-		error
-			.chain()
-			.find_map(|cause| cause.downcast_ref::<RivetTransportError>())
-			.expect("bridge error should carry RivetTransportError")
+		transport_error(error)
 			.message()
 			.to_owned()
 	}
 
 	#[test]
-	fn parse_bridge_rivet_error_reuses_interned_schema() {
-		// This test owns the `(wasm_schema_cache_test, same_payload)` cache key so
-		// concurrent tests do not perturb the global schema-count delta.
-		let initial_count = BRIDGE_RIVET_ERROR_SCHEMAS.len();
+	fn parse_bridge_rivet_error_uses_dynamic_error_kind() {
 		let reason = bridge_reason(
 			"wasm_schema_cache_test",
 			"same_payload",
 			"same payload message",
 		);
 		let first = parse_bridge_rivet_error(&reason).expect("bridge error should decode");
-		let first_schema = transport_schema(&first) as *const RivetErrorSchema;
 
 		assert_eq!(first.to_string(), "same payload message");
+		assert!(transport_error(&first).schema().is_none());
+		assert_eq!(transport_error(&first).group(), "wasm_schema_cache_test");
+		assert_eq!(transport_error(&first).code(), "same_payload");
 
 		for _ in 0..100 {
 			let error = parse_bridge_rivet_error(&reason).expect("bridge error should decode");
-			let schema = transport_schema(&error) as *const RivetErrorSchema;
-			assert_eq!(schema, first_schema);
+			assert!(transport_error(&error).schema().is_none());
 		}
-
-		assert_eq!(BRIDGE_RIVET_ERROR_SCHEMAS.len(), initial_count + 1);
 
 		let different_message = bridge_reason(
 			"wasm_schema_cache_test",
@@ -2920,11 +2896,8 @@ mod tests {
 		);
 		let error =
 			parse_bridge_rivet_error(&different_message).expect("bridge error should decode");
-		let schema = transport_schema(&error) as *const RivetErrorSchema;
 
-		assert_eq!(schema, first_schema);
 		assert_eq!(transport_message(&error), "different default message");
-		assert_eq!(BRIDGE_RIVET_ERROR_SCHEMAS.len(), initial_count + 1);
 
 		let different_code = bridge_reason(
 			"wasm_schema_cache_test",
@@ -2932,19 +2905,18 @@ mod tests {
 			"different code message",
 		);
 		let error = parse_bridge_rivet_error(&different_code).expect("bridge error should decode");
-		let schema = transport_schema(&error) as *const RivetErrorSchema;
 
-		assert_ne!(schema, first_schema);
-		assert_eq!(BRIDGE_RIVET_ERROR_SCHEMAS.len(), initial_count + 2);
+		assert_eq!(transport_error(&error).code(), "different_code");
 	}
 
 	#[test]
 	fn wasm_bridge_payload_promotes_known_core_error_status() {
 		let payload =
 			anyhow_to_bridge_rivet_error_payload(anyhow::Error::new(RivetTransportError {
-				schema: &AUTH_FORBIDDEN_SCHEMA,
+				kind: RivetErrorKind::Static(&AUTH_FORBIDDEN_SCHEMA),
 				meta: None,
 				message: None,
+				actor: None,
 			}));
 
 		assert_eq!(

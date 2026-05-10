@@ -1,4 +1,5 @@
 import type { AnyActorDefinition } from "@/actor/definition";
+import type { ActorSpecifier } from "@/actor/errors";
 import type { Encoding } from "@/common/encoding";
 import {
 	HEADER_CONN_PARAMS,
@@ -139,7 +140,13 @@ export class ActorHandleRaw {
 			for (let attempt = 0; attempt < maxAttempts; attempt++) {
 				let actorId: string | undefined;
 				try {
-					const target = await this.#resolveActionTarget(useQueryTarget);
+					const gatewayOptions = resolveActorGatewayOptions(
+						this.#gatewayOptions,
+					);
+					const target = await this.#resolveGatewayRequestTarget(
+						useQueryTarget,
+						gatewayOptions,
+					);
 					actorId = "directId" in target ? target.directId : undefined;
 
 					return await createQueueSender({
@@ -149,17 +156,13 @@ export class ActorHandleRaw {
 							return await this.#driver.sendRequest(
 								target,
 								request,
-								resolveActorGatewayOptions(
-									this.#gatewayOptions,
-								),
+								gatewayOptions,
 							);
 						},
 					}).send(name, body, options as any);
 				} catch (err) {
-					const { group, code, message, metadata } = deconstructError(
+					const { group, code, message, metadata, actor } = deconstructError(
 						err,
-						logger(),
-						{},
 						true,
 					);
 
@@ -216,7 +219,7 @@ export class ActorHandleRaw {
 						continue;
 					}
 
-					throw new ActorError(group, code, message, metadata);
+					throw new ActorError(group, code, message, { metadata, actor });
 				}
 			}
 
@@ -270,7 +273,10 @@ export class ActorHandleRaw {
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
 			let actorId: string | undefined;
 			try {
-				const target = await this.#resolveActionTarget(useQueryTarget);
+				const target = await this.#resolveGatewayRequestTarget(
+					useQueryTarget,
+					gatewayOptions,
+				);
 				actorId = "directId" in target ? target.directId : undefined;
 
 				logger().debug(
@@ -337,10 +343,8 @@ export class ActorHandleRaw {
 				}
 				return output;
 			} catch (err) {
-				const { group, code, message, metadata } = deconstructError(
+				const { group, code, message, metadata, actor } = deconstructError(
 					err,
-					logger(),
-					{},
 					true,
 				);
 
@@ -382,7 +386,7 @@ export class ActorHandleRaw {
 						"actor",
 						"not_found",
 						"The actor does not exist or was destroyed.",
-						metadata,
+						{ metadata, actor },
 					);
 				}
 
@@ -398,7 +402,7 @@ export class ActorHandleRaw {
 					continue;
 				}
 
-				throw new ActorError(group, code, message, metadata);
+				throw new ActorError(group, code, message, { metadata, actor });
 			}
 		}
 
@@ -561,6 +565,17 @@ export class ActorHandleRaw {
 		}
 	}
 
+	async #resolveGatewayRequestTarget(
+		useQueryTarget: boolean,
+		gatewayOptions: ActorGatewayOptions,
+	) {
+		if (gatewayOptions.skipReadyWait) {
+			return getGatewayTarget(this.#actorResolutionState);
+		}
+
+		return await this.#resolveActionTarget(useQueryTarget);
+	}
+
 	/**
 	 * Establishes a persistent connection to the actor.
 	 *
@@ -619,7 +634,10 @@ export class ActorHandleRaw {
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
 			let actorId: string | undefined;
 			try {
-				const target = await this.#resolveActionTarget(useQueryTarget);
+				const target = await this.#resolveGatewayRequestTarget(
+					useQueryTarget,
+					gatewayOptions,
+				);
 				actorId = "directId" in target ? target.directId : undefined;
 				const response = await rawHttpFetch(
 					this.#driver,
@@ -644,10 +662,8 @@ export class ActorHandleRaw {
 				}
 				return response;
 			} catch (err) {
-				const { group, code, message, metadata } = deconstructError(
+				const { group, code, message, metadata, actor } = deconstructError(
 					err,
-					logger(),
-					{},
 					true,
 				);
 
@@ -691,7 +707,7 @@ export class ActorHandleRaw {
 					continue;
 				}
 
-				throw new ActorError(group, code, message, metadata);
+				throw new ActorError(group, code, message, { metadata, actor });
 			}
 		}
 
@@ -771,6 +787,7 @@ export class ActorHandleRaw {
 		code: string;
 		message: string;
 		metadata?: unknown;
+		actor?: ActorSpecifier;
 	} | null> {
 		if (response.ok) {
 			return null;
@@ -790,19 +807,35 @@ export class ActorHandleRaw {
 					code: string;
 					message: string;
 					metadata?: unknown;
+					actor?: ActorSpecifier;
 				}
 			>(
 				encoding,
 				new Uint8Array(await response.clone().arrayBuffer()),
 				HTTP_RESPONSE_ERROR_VERSIONED,
 				HttpResponseErrorSchema,
-				(json) => json as HttpResponseErrorJson,
+				(json) => ({
+					...json,
+					actor: json.actor
+						? {
+								...json.actor,
+								generation: Number(json.actor.generation),
+							}
+						: undefined,
+				}),
 				(bare) => ({
 					group: bare.group,
 					code: bare.code,
 					message: bare.message,
 					metadata: bare.metadata
 						? decodeCborCompat(new Uint8Array(bare.metadata))
+						: undefined,
+					actor: bare.actor
+						? {
+								actorId: bare.actor.actorId,
+								generation: Number(bare.actor.generation),
+								key: bare.actor.key ?? undefined,
+							}
 						: undefined,
 				}),
 			);
@@ -824,9 +857,10 @@ export class ActorHandleRaw {
 			this.#gatewayOptions,
 			options,
 		);
-		const target = gatewayOptions.skipReadyWait
-			? await this.#resolveActionTarget(false)
-			: getGatewayTarget(this.#actorResolutionState);
+		const target = await this.#resolveGatewayRequestTarget(
+			false,
+			gatewayOptions,
+		);
 		return await rawWebSocket(
 			this.#driver,
 			target,

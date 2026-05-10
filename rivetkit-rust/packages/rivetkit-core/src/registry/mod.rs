@@ -18,7 +18,7 @@ use rivet_envoy_client::config::{
 use rivet_envoy_client::envoy::start_envoy;
 use rivet_envoy_client::handle::EnvoyHandle;
 use rivet_envoy_client::protocol;
-use rivet_error::RivetError;
+use rivet_error::{ActorSpecifier, RivetError};
 use rivetkit_client_protocol as client_protocol;
 use scc::{HashMap as SccHashMap, hash_map::Entry as SccEntry};
 use serde::{Deserialize, Serialize};
@@ -41,12 +41,7 @@ use crate::actor::messages::{ActorEvent, QueueSendResult, Request, Response, Sta
 use crate::actor::preload::{PreloadedKv, PreloadedPersistedActor};
 use crate::actor::state::decode_persisted_actor;
 use crate::actor::task::{
-	ActorTask,
-	DispatchCommand,
-	LifecycleCommand,
-	// These helpers reserve bounded-channel capacity before sending; see
-	// `actor::task` for the backpressure and lifecycle reply rationale.
-	try_send_dispatch_command,
+	ActorTask, DispatchCommand, LifecycleCommand, try_send_dispatch_command,
 	try_send_lifecycle_command,
 };
 use crate::actor::task_types::ShutdownKind;
@@ -60,7 +55,7 @@ use crate::inspector::{Inspector, InspectorAuth, InspectorSignal, InspectorSubsc
 use crate::kv::Kv;
 use crate::runtime::RuntimeSpawner;
 use crate::sqlite::SqliteDb;
-use crate::types::{ActorKey, ActorKeySegment, WsMessage};
+use crate::types::{ActorKey, ActorKeySegment, WsMessage, format_actor_key};
 use crate::websocket::WebSocket;
 
 mod actor_connect;
@@ -94,8 +89,8 @@ struct ActorTaskHandle {
 	ctx: ActorContext,
 	factory: Arc<ActorFactory>,
 	inspector: Inspector,
-	lifecycle: mpsc::Sender<LifecycleCommand>,
-	dispatch: mpsc::Sender<DispatchCommand>,
+	lifecycle: mpsc::UnboundedSender<LifecycleCommand>,
+	dispatch: mpsc::UnboundedSender<DispatchCommand>,
 	join: Arc<TokioMutex<Option<JoinHandle<Result<()>>>>>,
 }
 
@@ -136,9 +131,6 @@ pub(crate) struct RegistryDispatcher {
 	starting_instances: SccHashMap<String, Arc<Notify>>,
 	pending_stops: SccHashMap<String, PendingStop>,
 	region: String,
-	/// Shared secret gating the Prometheus `/metrics` actor endpoint. When
-	/// unset, the endpoint fails closed and is effectively disabled.
-	metrics_token: Option<String>,
 	handle_inspector_http_in_runtime: bool,
 }
 
@@ -339,6 +331,7 @@ struct ActorConnectError {
 	message: String,
 	metadata: Option<ByteBuf>,
 	action_id: Option<u64>,
+	actor: Option<ActorSpecifier>,
 }
 
 #[derive(Debug)]
@@ -524,9 +517,6 @@ impl RegistryDispatcher {
 			starting_instances: SccHashMap::new(),
 			pending_stops: SccHashMap::new(),
 			region: env::var("RIVET_REGION").unwrap_or_default(),
-			metrics_token: env::var("_RIVET_METRICS_TOKEN")
-				.ok()
-				.filter(|token| !token.is_empty()),
 			handle_inspector_http_in_runtime,
 		}
 	}
@@ -594,30 +584,22 @@ impl RegistryDispatcher {
 				}
 				.build()
 			})?;
-		let config = factory.config().clone();
-		let (lifecycle_tx, lifecycle_rx) = mpsc::channel(config.lifecycle_command_inbox_capacity);
-		let (dispatch_tx, dispatch_rx) = mpsc::channel(config.dispatch_command_inbox_capacity);
-		let (lifecycle_events_tx, lifecycle_events_rx) =
-			mpsc::channel(config.lifecycle_event_inbox_capacity);
+		let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+		let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel();
+		let (lifecycle_events_tx, lifecycle_events_rx) = mpsc::unbounded_channel();
 		request
 			.ctx
 			.configure_lifecycle_events(Some(lifecycle_events_tx));
 		request.ctx.cancel_sleep_timer();
 		request.ctx.set_local_alarm_callback(Some(Arc::new({
 			let lifecycle_tx = lifecycle_tx.clone();
-			let metrics = request.ctx.metrics().clone();
-			let capacity = config.lifecycle_command_inbox_capacity;
 			move || {
 				let lifecycle_tx = lifecycle_tx.clone();
-				let metrics = metrics.clone();
 				Box::pin(async move {
 					let (reply_tx, reply_rx) = oneshot::channel();
 					if let Err(error) = try_send_lifecycle_command(
 						&lifecycle_tx,
-						capacity,
-						"fire_alarm",
 						LifecycleCommand::FireAlarm { reply: reply_tx },
-						Some(&metrics),
 					) {
 						tracing::warn!(?error, "failed to enqueue actor alarm");
 						return;
@@ -645,10 +627,7 @@ impl RegistryDispatcher {
 		let result: Result<Arc<ActorTaskHandle>> = async {
 			try_send_lifecycle_command(
 				&lifecycle_tx,
-				config.lifecycle_command_inbox_capacity,
-				"start_actor",
 				LifecycleCommand::Start { reply: start_tx },
-				Some(request.ctx.metrics()),
 			)
 			.context("send actor task start command")?;
 			start_rx
@@ -939,13 +918,10 @@ impl RegistryDispatcher {
 		let (reply_tx, reply_rx) = oneshot::channel();
 		let shutdown_result = match try_send_lifecycle_command(
 			&instance.lifecycle,
-			instance.factory.config().lifecycle_command_inbox_capacity,
-			"stop_actor",
 			LifecycleCommand::Stop {
 				reason: task_stop_reason,
 				reply: reply_tx,
 			},
-			Some(instance.ctx.metrics()),
 		) {
 			Ok(()) => reply_rx
 				.await
@@ -1037,16 +1013,20 @@ impl RegistryDispatcher {
 		key: ActorKey,
 		factory: &ActorFactory,
 	) -> ActorContext {
+		let formatted_key = format_actor_key(&key);
 		let ctx = ActorContext::build(
 			actor_id.to_owned(),
 			actor_name.to_owned(),
 			key,
 			self.region.clone(),
+			Some(generation),
+			handle.get_envoy_key().to_owned(),
 			factory.config().clone(),
 			Kv::new(handle.clone(), actor_id.to_owned()),
 			SqliteDb::new_with_remote_sqlite(
 				handle.clone(),
 				actor_id.to_owned(),
+				Some(formatted_key),
 				Some(generation as u64),
 				factory.config().has_database,
 				factory.config().remote_sqlite,

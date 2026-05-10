@@ -1,8 +1,12 @@
 use super::dispatch::*;
 use super::inspector::*;
 use super::*;
-use crate::error::ProtocolError;
+use crate::error::{client_error_message, client_error_metadata, ProtocolError};
 use ::http;
+
+const HEADER_RIVET_ACTOR: &str = "x-rivet-actor";
+const HEADER_RIVET_ACTOR_GENERATION: &str = "x-rivet-actor-generation";
+const HEADER_RIVET_ACTOR_KEY: &str = "x-rivet-actor-key";
 
 impl RegistryDispatcher {
 	pub(super) async fn handle_fetch(
@@ -10,11 +14,6 @@ impl RegistryDispatcher {
 		actor_id: &str,
 		request: HttpRequest,
 	) -> Result<HttpResponse> {
-		if request.path == "/metrics" {
-			let instance = self.active_actor(actor_id).await?;
-			return self.handle_metrics_fetch(&instance, &request);
-		}
-
 		let original_path = request.path.clone();
 		let request = build_http_request(request).await?;
 		let route = RegistryHttpRoute::from_paths(
@@ -35,7 +34,9 @@ impl RegistryDispatcher {
 				return Ok(inspector_anyhow_response(error));
 			}
 		};
-		if let Some(response) = self.handle_inspector_fetch(&instance, &request).await? {
+		let actor = actor_specifier_for_instance(&instance);
+		if let Some(mut response) = self.handle_inspector_fetch(&instance, &request).await? {
+			attach_actor_response_headers(&mut response, &actor);
 			return Ok(response);
 		}
 
@@ -51,7 +52,10 @@ impl RegistryDispatcher {
 				self.handle_user_request_fetch(&instance, request).await
 			}
 		};
-		response
+		response.map(|mut response| {
+			attach_actor_response_headers(&mut response, &actor);
+			response
+		})
 	}
 
 	async fn handle_user_request_fetch(
@@ -59,16 +63,14 @@ impl RegistryDispatcher {
 		instance: &ActorTaskHandle,
 		request: Request,
 	) -> Result<HttpResponse> {
+		let encoding = request_encoding(request.headers());
 		let (reply_tx, reply_rx) = oneshot::channel();
 		try_send_dispatch_command(
 			&instance.dispatch,
-			instance.factory.config().dispatch_command_inbox_capacity,
-			"dispatch_http",
 			DispatchCommand::Http {
 				request,
 				reply: reply_tx,
 			},
-			Some(instance.ctx.metrics()),
 		)
 		.context("send actor task HTTP dispatch command")?;
 
@@ -87,7 +89,11 @@ impl RegistryDispatcher {
 					"actor request callback failed"
 				);
 				rearm_sleep_after_request(instance.ctx.clone());
-				Ok(inspector_anyhow_response(error))
+				framework_anyhow_error_response_with_actor(
+					encoding,
+					error,
+					Some(&actor_specifier_for_instance(instance)),
+				)
 			}
 		}
 	}
@@ -98,6 +104,7 @@ impl RegistryDispatcher {
 		request: Request,
 		route: FrameworkHttpRoute,
 	) -> Result<HttpResponse> {
+		let actor = actor_specifier_for_instance(instance);
 		match route {
 			FrameworkHttpRoute::Action(name) => {
 				self.handle_action_fetch(instance, request, name).await
@@ -105,10 +112,10 @@ impl RegistryDispatcher {
 			FrameworkHttpRoute::Queue(name) => {
 				self.handle_queue_fetch(instance, request, name).await
 			}
-			FrameworkHttpRoute::Metadata => handle_metadata_fetch(&request),
-			FrameworkHttpRoute::Health => handle_health_fetch(&request),
-			FrameworkHttpRoute::Root => handle_root_fetch(&request),
-			FrameworkHttpRoute::NotFound => handle_not_found_fetch(&request),
+			FrameworkHttpRoute::Metadata => handle_metadata_fetch(&request, Some(&actor)),
+			FrameworkHttpRoute::Health => handle_health_fetch(&request, Some(&actor)),
+			FrameworkHttpRoute::Root => handle_root_fetch(&request, Some(&actor)),
+			FrameworkHttpRoute::NotFound => handle_not_found_fetch(&request, Some(&actor)),
 		}
 	}
 
@@ -119,8 +126,9 @@ impl RegistryDispatcher {
 		action_name: String,
 	) -> Result<HttpResponse> {
 		let encoding = request_encoding(request.headers());
+		let actor = actor_specifier_for_instance(instance);
 		if request.method() != http::Method::POST {
-			return message_boundary_error_response(
+			return message_boundary_error_response_with_actor(
 				encoding,
 				framework_error_status("actor", "method_not_allowed"),
 				MethodNotAllowed {
@@ -128,35 +136,39 @@ impl RegistryDispatcher {
 					path: request.uri().path().to_owned(),
 				}
 				.build(),
+				Some(&actor),
 			);
 		}
 
 		let config = instance.factory.config();
 		if request.body().len() > config.max_incoming_message_size as usize {
-			return message_boundary_error_response(
+			return message_boundary_error_response_with_actor(
 				encoding,
 				StatusCode::BAD_REQUEST,
 				IncomingMessageTooLong.build(),
+				Some(&actor),
 			);
 		}
 
 		let args = match decode_http_action_args(encoding, request.body()) {
 			Ok(args) => args,
 			Err(error) => {
-				return message_boundary_error_response(
+				return message_boundary_error_response_with_actor(
 					encoding,
 					StatusCode::BAD_REQUEST,
 					error.context("decode HTTP action request"),
+					Some(&actor),
 				);
 			}
 		};
 		let conn_params = match http_conn_params(request.headers()) {
 			Ok(params) => params,
 			Err(error) => {
-				return message_boundary_error_response(
+				return message_boundary_error_response_with_actor(
 					encoding,
 					StatusCode::BAD_REQUEST,
 					error.context("decode HTTP action connection params"),
+					Some(&actor),
 				);
 			}
 		};
@@ -169,10 +181,11 @@ impl RegistryDispatcher {
 		{
 			Ok(conn) => conn,
 			Err(error) => {
-				return message_boundary_error_response(
+				return message_boundary_error_response_with_actor(
 					encoding,
 					framework_anyhow_status(&error),
 					error.context("connect HTTP action request"),
+					Some(&actor),
 				);
 			}
 		};
@@ -181,7 +194,6 @@ impl RegistryDispatcher {
 			config.action_timeout,
 			dispatch_action_through_task(
 				&instance.dispatch,
-				config.dispatch_command_inbox_capacity,
 				conn.clone(),
 				action_name.clone(),
 				args,
@@ -204,10 +216,11 @@ impl RegistryDispatcher {
 				if response.body.as_ref().map(Vec::len).unwrap_or_default()
 					> config.max_outgoing_message_size as usize
 				{
-					return message_boundary_error_response(
+					return message_boundary_error_response_with_actor(
 						encoding,
 						StatusCode::BAD_REQUEST,
 						OutgoingMessageTooLong.build(),
+						Some(&actor),
 					);
 				}
 				Ok(response)
@@ -221,7 +234,7 @@ impl RegistryDispatcher {
 						"failed to disconnect HTTP action connection after error"
 					);
 				}
-				framework_action_error_response(encoding, error)
+				framework_action_error_response(encoding, error, Some(&actor))
 			}
 		}
 	}
@@ -233,8 +246,9 @@ impl RegistryDispatcher {
 		queue_name: String,
 	) -> Result<HttpResponse> {
 		let encoding = request_encoding(request.headers());
+		let actor = actor_specifier_for_instance(instance);
 		if request.method() != http::Method::POST {
-			return message_boundary_error_response(
+			return message_boundary_error_response_with_actor(
 				encoding,
 				framework_error_status("actor", "method_not_allowed"),
 				MethodNotAllowed {
@@ -242,35 +256,39 @@ impl RegistryDispatcher {
 					path: request.uri().path().to_owned(),
 				}
 				.build(),
+				Some(&actor),
 			);
 		}
 
 		let config = instance.factory.config();
 		if request.body().len() > config.max_incoming_message_size as usize {
-			return message_boundary_error_response(
+			return message_boundary_error_response_with_actor(
 				encoding,
 				StatusCode::BAD_REQUEST,
 				IncomingMessageTooLong.build(),
+				Some(&actor),
 			);
 		}
 
 		let queue_request = match decode_http_queue_request(encoding, request.body()) {
 			Ok(queue_request) => queue_request,
 			Err(error) => {
-				return message_boundary_error_response(
+				return message_boundary_error_response_with_actor(
 					encoding,
 					StatusCode::BAD_REQUEST,
 					error.context("decode HTTP queue request"),
+					Some(&actor),
 				);
 			}
 		};
 		let conn_params = match http_conn_params(request.headers()) {
 			Ok(params) => params,
 			Err(error) => {
-				return message_boundary_error_response(
+				return message_boundary_error_response_with_actor(
 					encoding,
 					StatusCode::BAD_REQUEST,
 					error.context("decode HTTP queue connection params"),
+					Some(&actor),
 				);
 			}
 		};
@@ -283,10 +301,11 @@ impl RegistryDispatcher {
 		{
 			Ok(conn) => conn,
 			Err(error) => {
-				return message_boundary_error_response(
+				return message_boundary_error_response_with_actor(
 					encoding,
 					framework_anyhow_status(&error),
 					error.context("connect HTTP queue request"),
+					Some(&actor),
 				);
 			}
 		};
@@ -294,8 +313,6 @@ impl RegistryDispatcher {
 		let (reply_tx, reply_rx) = oneshot::channel();
 		let dispatch_result = try_send_dispatch_command(
 			&instance.dispatch,
-			config.dispatch_command_inbox_capacity,
-			"dispatch_queue_send",
 			DispatchCommand::QueueSend {
 				name: queue_name,
 				body: queue_request.body,
@@ -305,7 +322,6 @@ impl RegistryDispatcher {
 				timeout_ms: queue_request.timeout,
 				reply: reply_tx,
 			},
-			Some(instance.ctx.metrics()),
 		);
 
 		let queue_result = match dispatch_result {
@@ -335,10 +351,11 @@ impl RegistryDispatcher {
 				if response.body.as_ref().map(Vec::len).unwrap_or_default()
 					> config.max_outgoing_message_size as usize
 				{
-					return message_boundary_error_response(
+					return message_boundary_error_response_with_actor(
 						encoding,
 						StatusCode::BAD_REQUEST,
 						OutgoingMessageTooLong.build(),
+						Some(&actor),
 					);
 				}
 				Ok(response)
@@ -352,39 +369,16 @@ impl RegistryDispatcher {
 						"failed to disconnect HTTP queue connection after error"
 					);
 				}
-				message_boundary_error_response(encoding, framework_anyhow_status(&error), error)
+				message_boundary_error_response_with_actor(
+					encoding,
+					framework_anyhow_status(&error),
+					error,
+					Some(&actor),
+				)
 			}
 		}
 	}
 
-	fn handle_metrics_fetch(
-		&self,
-		instance: &ActorTaskHandle,
-		request: &HttpRequest,
-	) -> Result<HttpResponse> {
-		if !request_has_bearer_token(request, self.metrics_token.as_deref()) {
-			return Ok(unauthorized_response());
-		}
-
-		let mut headers = HashMap::new();
-		headers.insert(
-			http::header::CONTENT_TYPE.to_string(),
-			instance.ctx.metrics_content_type().to_owned(),
-		);
-
-		Ok(HttpResponse {
-			status: http::StatusCode::OK.as_u16(),
-			headers,
-			body: Some(
-				instance
-					.ctx
-					.render_metrics()
-					.context("render actor prometheus metrics")?
-					.into_bytes(),
-			),
-			body_stream: None,
-		})
-	}
 }
 
 enum RegistryHttpRoute {
@@ -443,9 +437,12 @@ pub(super) struct DecodedHttpQueueRequest {
 	timeout: Option<u64>,
 }
 
-fn handle_metadata_fetch(request: &Request) -> Result<HttpResponse> {
+fn handle_metadata_fetch(
+	request: &Request,
+	actor: Option<&ActorSpecifier>,
+) -> Result<HttpResponse> {
 	if request.method() != http::Method::GET {
-		return method_not_allowed_response(request);
+		return method_not_allowed_response(request, actor);
 	}
 	let runtime_type = if std::env::var("NODE_ENV").as_deref() == Ok("production") {
 		"deployed"
@@ -462,16 +459,16 @@ fn handle_metadata_fetch(request: &Request) -> Result<HttpResponse> {
 	)
 }
 
-fn handle_health_fetch(request: &Request) -> Result<HttpResponse> {
+fn handle_health_fetch(request: &Request, actor: Option<&ActorSpecifier>) -> Result<HttpResponse> {
 	if request.method() != http::Method::GET {
-		return method_not_allowed_response(request);
+		return method_not_allowed_response(request, actor);
 	}
 	text_response(StatusCode::OK, "ok")
 }
 
-fn handle_root_fetch(request: &Request) -> Result<HttpResponse> {
+fn handle_root_fetch(request: &Request, actor: Option<&ActorSpecifier>) -> Result<HttpResponse> {
 	if request.method() != http::Method::GET {
-		return method_not_allowed_response(request);
+		return method_not_allowed_response(request, actor);
 	}
 	text_response(
 		StatusCode::OK,
@@ -479,9 +476,12 @@ fn handle_root_fetch(request: &Request) -> Result<HttpResponse> {
 	)
 }
 
-fn handle_not_found_fetch(request: &Request) -> Result<HttpResponse> {
+fn handle_not_found_fetch(
+	request: &Request,
+	actor: Option<&ActorSpecifier>,
+) -> Result<HttpResponse> {
 	let encoding = request_encoding(request.headers());
-	message_boundary_error_response(
+	message_boundary_error_response_with_actor(
 		encoding,
 		framework_error_status("actor", "not_found"),
 		ActorRuntime::NotFound {
@@ -489,6 +489,7 @@ fn handle_not_found_fetch(request: &Request) -> Result<HttpResponse> {
 			id: request.uri().path().to_owned(),
 		}
 		.build(),
+		actor,
 	)
 }
 
@@ -506,9 +507,12 @@ fn text_response(status: StatusCode, body: &str) -> Result<HttpResponse> {
 	})
 }
 
-fn method_not_allowed_response(request: &Request) -> Result<HttpResponse> {
+fn method_not_allowed_response(
+	request: &Request,
+	actor: Option<&ActorSpecifier>,
+) -> Result<HttpResponse> {
 	let encoding = request_encoding(request.headers());
-	message_boundary_error_response(
+	message_boundary_error_response_with_actor(
 		encoding,
 		framework_error_status("actor", "method_not_allowed"),
 		MethodNotAllowed {
@@ -516,6 +520,7 @@ fn method_not_allowed_response(request: &Request) -> Result<HttpResponse> {
 			path: request.uri().path().to_owned(),
 		}
 		.build(),
+		actor,
 	)
 }
 
@@ -649,6 +654,28 @@ pub(super) fn build_envoy_response(response: Response) -> Result<HttpResponse> {
 	})
 }
 
+fn actor_specifier_for_instance(instance: &ActorTaskHandle) -> ActorSpecifier {
+	ActorSpecifier::new(instance.actor_id.clone(), instance.generation as u64)
+		.with_key(format_actor_key(instance.ctx.key()))
+}
+
+fn attach_actor_response_headers(response: &mut HttpResponse, actor: &ActorSpecifier) {
+	response
+		.headers
+		.insert(HEADER_RIVET_ACTOR.to_owned(), actor.actor_id.clone());
+	response.headers.insert(
+		HEADER_RIVET_ACTOR_GENERATION.to_owned(),
+		actor.generation.to_string(),
+	);
+	if let Some(key) = actor.key.as_ref() {
+		if !key.contains('\r') && !key.contains('\n') {
+			response
+				.headers
+				.insert(HEADER_RIVET_ACTOR_KEY.to_owned(), key.clone());
+		}
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HttpResponseEncoding {
 	Json,
@@ -673,16 +700,38 @@ pub(super) fn message_boundary_error_response(
 	status: StatusCode,
 	error: anyhow::Error,
 ) -> Result<HttpResponse> {
+	message_boundary_error_response_with_actor(encoding, status, error, None)
+}
+
+pub(super) fn message_boundary_error_response_with_actor(
+	encoding: HttpResponseEncoding,
+	status: StatusCode,
+	error: anyhow::Error,
+	fallback_actor: Option<&ActorSpecifier>,
+) -> Result<HttpResponse> {
 	let error = RivetError::extract(&error);
+	let actor = error.actor().or(fallback_actor);
+	let metadata = error.metadata();
+	if let Some(actor) = actor {
+		tracing::warn!(
+			actor_id = %actor.actor_id,
+			generation = actor.generation,
+			actor_key = ?actor.key,
+			group = error.group(),
+			code = error.code(),
+			"actor http error response"
+		);
+	}
 	let body = serialize_http_response_error(
 		encoding,
 		error.group(),
 		error.code(),
-		error.message(),
-		None,
+		client_error_message(error.group(), error.code(), error.message()),
+		client_error_metadata(error.group(), error.code(), metadata.as_ref()),
+		actor,
 	)?;
 
-	Ok(HttpResponse {
+	let mut response = HttpResponse {
 		status: status.as_u16(),
 		headers: HashMap::from([(
 			http::header::CONTENT_TYPE.to_string(),
@@ -690,7 +739,11 @@ pub(super) fn message_boundary_error_response(
 		)]),
 		body: Some(body),
 		body_stream: None,
-	})
+	};
+	if let Some(actor) = actor {
+		attach_actor_response_headers(&mut response, actor);
+	}
+	Ok(response)
 }
 
 pub(super) fn content_type_for_encoding(encoding: HttpResponseEncoding) -> &'static str {
@@ -706,6 +759,7 @@ pub(super) fn serialize_http_response_error(
 	code: &str,
 	message: &str,
 	metadata: Option<&JsonValue>,
+	actor: Option<&ActorSpecifier>,
 ) -> Result<Vec<u8>> {
 	let mut json_body = json!({
 		"group": group,
@@ -714,6 +768,9 @@ pub(super) fn serialize_http_response_error(
 	});
 	if let Some(metadata) = metadata {
 		json_body["metadata"] = metadata.clone();
+	}
+	if let Some(actor) = actor {
+		json_body["actor"] = serde_json::to_value(actor)?;
 	}
 
 	match encoding {
@@ -737,6 +794,11 @@ pub(super) fn serialize_http_response_error(
 					code: code.to_owned(),
 					message: message.to_owned(),
 					metadata,
+					actor: actor.map(|actor| client_protocol::ActorSpecifier {
+						actor_id: actor.actor_id.clone(),
+						generation: serde_bare::Uint(actor.generation),
+						key: actor.key.clone(),
+					}),
 				},
 			)
 			.serialize_with_embedded_version(client_protocol::PROTOCOL_VERSION)
@@ -893,9 +955,21 @@ pub(super) fn encode_http_queue_response(
 pub(super) fn framework_action_error_response(
 	encoding: HttpResponseEncoding,
 	error: ActionDispatchError,
+	fallback_actor: Option<&ActorSpecifier>,
 ) -> Result<HttpResponse> {
 	let status = framework_error_status(&error.group, &error.code);
-	Ok(HttpResponse {
+	let actor = error.actor.as_ref().or(fallback_actor);
+	if let Some(actor) = actor {
+		tracing::warn!(
+			actor_id = %actor.actor_id,
+			generation = actor.generation,
+			actor_key = ?actor.key,
+			group = %error.group,
+			code = %error.code,
+			"actor framework action error response"
+		);
+	}
+	let mut response = HttpResponse {
 		status: status.as_u16(),
 		headers: HashMap::from([(
 			http::header::CONTENT_TYPE.to_string(),
@@ -905,11 +979,25 @@ pub(super) fn framework_action_error_response(
 			encoding,
 			&error.group,
 			&error.code,
-			&error.message,
-			error.metadata.as_ref(),
+			error.client_message(),
+			error.client_metadata(),
+			actor,
 		)?),
 		body_stream: None,
-	})
+	};
+	if let Some(actor) = actor {
+		attach_actor_response_headers(&mut response, actor);
+	}
+	Ok(response)
+}
+
+pub(super) fn framework_anyhow_error_response_with_actor(
+	encoding: HttpResponseEncoding,
+	error: anyhow::Error,
+	actor: Option<&ActorSpecifier>,
+) -> Result<HttpResponse> {
+	let status = framework_anyhow_status(&error);
+	message_boundary_error_response_with_actor(encoding, status, error, actor)
 }
 
 pub(super) fn framework_anyhow_status(error: &anyhow::Error) -> StatusCode {
@@ -929,29 +1017,6 @@ pub(super) fn framework_error_status(group: &str, code: &str) -> StatusCode {
 		("queue", _) => StatusCode::BAD_REQUEST,
 		_ => StatusCode::INTERNAL_SERVER_ERROR,
 	}
-}
-
-pub(super) fn unauthorized_response() -> HttpResponse {
-	HttpResponse {
-		status: http::StatusCode::UNAUTHORIZED.as_u16(),
-		headers: HashMap::new(),
-		body: Some(Vec::new()),
-		body_stream: None,
-	}
-}
-
-pub(super) fn request_has_bearer_token(
-	request: &HttpRequest,
-	configured_token: Option<&str>,
-) -> bool {
-	let Some(configured_token) = configured_token else {
-		return false;
-	};
-
-	request.headers.iter().any(|(name, value)| {
-		name.eq_ignore_ascii_case(http::header::AUTHORIZATION.as_str())
-			&& bearer_token_from_authorization(value) == Some(configured_token)
-	})
 }
 
 fn bearer_token_from_authorization(value: &str) -> Option<&str> {

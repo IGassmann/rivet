@@ -146,6 +146,7 @@ pub fn create_actor(
 #[tracing::instrument(
 	skip_all,
 	fields(
+		envoy_key = %shared.envoy_key,
 		actor_id = %actor_id,
 		generation = generation,
 		actor_key = %config.key.as_deref().unwrap_or(""),
@@ -1660,6 +1661,7 @@ mod tests {
 			)),
 			protocol_metadata: Arc::new(tokio::sync::Mutex::new(None)),
 			shutting_down: std::sync::atomic::AtomicBool::new(false),
+			last_ping_ts: std::sync::atomic::AtomicI64::new(crate::time::now_millis()),
 			stopped_tx: tokio::sync::watch::channel(true).0,
 		});
 		(shared, envoy_rx)

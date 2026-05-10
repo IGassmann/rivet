@@ -1,6 +1,6 @@
 //! Actor lifecycle task orchestration.
 //!
-//! `ActorTask` deliberately uses four separate bounded `mpsc` receivers instead
+//! `ActorTask` deliberately uses four separate unbounded `mpsc` receivers instead
 //! of one tagged command queue:
 //!
 //! - `lifecycle_inbox` carries trusted registry/envoy lifecycle commands:
@@ -13,22 +13,17 @@
 //! - `actor_event_rx` feeds the user runtime adapter with actor events after
 //!   `ActorTask` accepts dispatch work.
 //!
-//! Keeping these queues split gives the task loop explicit back-pressure and
-//! priority boundaries. Client dispatch can fill its own bounded inbox without
-//! starving lifecycle stop/destroy commands, while internal save/sleep/inspector
-//! events do not compete with untrusted client traffic. The main `tokio::select!`
-//! is biased so lifecycle commands are observed first, then internal lifecycle
-//! events, then dispatch and timers. During sleep grace, the same priority keeps
-//! lifecycle handling live while still draining accepted dispatch replies before
-//! final teardown.
+//! Keeping these queues split gives the task loop explicit priority boundaries.
+//! Client dispatch does not compete directly with lifecycle stop/destroy
+//! commands, and internal save/sleep/inspector events do not compete with
+//! untrusted client traffic. The main `tokio::select!` is biased so lifecycle
+//! commands are observed first, then internal lifecycle events, then dispatch
+//! and timers. During sleep grace, the same priority keeps lifecycle handling
+//! live while still draining accepted dispatch replies before final teardown.
 //!
-//! Producers reserve capacity with `try_reserve` before constructing channel
-//! work. Overload paths therefore fail fast with `actor.overloaded`, record the
-//! specific inbox metric (`lifecycle_inbox`, `dispatch_inbox`,
-//! `lifecycle_event_inbox`, or `actor_event_inbox`), and avoid orphaning reply
-//! oneshots. The sender topology follows the trust boundary: registry/envoy owns
-//! lifecycle and dispatch senders, core subsystems enqueue lifecycle events
-//! through `ActorContext`, and only `ActorTask` forwards accepted work into the
+//! The sender topology follows the trust boundary: registry/envoy owns lifecycle
+//! and dispatch senders, core subsystems enqueue lifecycle events through
+//! `ActorContext`, and only `ActorTask` forwards accepted work into the
 //! actor-event stream consumed by user code.
 
 use std::future;
@@ -50,15 +45,12 @@ use tracing::{Instrument, instrument::WithSubscriber};
 use crate::actor::action::ActionDispatchError;
 use crate::actor::connection::ConnHandle;
 use crate::actor::context::ActorContext;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::actor::diagnostics::record_actor_warning;
 use crate::actor::factory::ActorFactory;
 use crate::actor::keys::{LAST_PUSHED_ALARM_KEY, PERSIST_DATA_KEY};
 use crate::actor::lifecycle_hooks::{ActorEvents, ActorStart, Reply};
 use crate::actor::messages::{
 	ActorEvent, QueueSendResult, Request, Response, SerializeStateReason, StateDelta,
 };
-use crate::actor::metrics::ActorMetrics;
 use crate::actor::preload::{PreloadedKv, PreloadedPersistedActor};
 use crate::actor::state::{PersistedActor, decode_last_pushed_alarm, decode_persisted_actor};
 use crate::actor::task_types::ShutdownKind;
@@ -79,9 +71,6 @@ const LONG_SHUTDOWN_DRAIN_WARNING_THRESHOLD: Duration = Duration::from_secs(1);
 const INSPECTOR_SERIALIZE_STATE_INTERVAL: Duration = Duration::from_millis(50);
 const INSPECTOR_OVERLAY_CHANNEL_CAPACITY: usize = 32;
 
-pub(crate) const LIFECYCLE_INBOX_CHANNEL: &str = "lifecycle_inbox";
-pub(crate) const DISPATCH_INBOX_CHANNEL: &str = "dispatch_inbox";
-pub(crate) const LIFECYCLE_EVENT_INBOX_CHANNEL: &str = "lifecycle_event_inbox";
 pub use crate::actor::task_types::LifecycleState;
 
 // Test shim keeps moved tests in crate-root tests/ with private-module access.
@@ -198,85 +187,13 @@ impl LifecycleCommand {
 	}
 }
 
-pub(crate) fn actor_channel_overloaded_error(
-	channel: &'static str,
-	capacity: usize,
-	operation: &'static str,
-	metrics: Option<&ActorMetrics>,
-) -> anyhow::Error {
-	if let Some(metrics) = metrics {
-		match channel {
-			LIFECYCLE_INBOX_CHANNEL => metrics.inc_lifecycle_inbox_overload(operation),
-			DISPATCH_INBOX_CHANNEL => metrics.inc_dispatch_inbox_overload(operation),
-			LIFECYCLE_EVENT_INBOX_CHANNEL => metrics.inc_lifecycle_event_overload(operation),
-			_ => {}
-		}
-	}
-	#[cfg(not(target_arch = "wasm32"))]
-	{
-		if let Some(metrics) = metrics {
-			if let Some(suppression) =
-				record_actor_warning(metrics.actor_id(), "actor_channel_overloaded")
-			{
-				tracing::warn!(
-					actor_id = %suppression.actor_id,
-					channel,
-					capacity,
-					operation,
-					event = if channel == LIFECYCLE_EVENT_INBOX_CHANNEL {
-						operation
-					} else {
-						""
-					},
-					per_actor_suppressed = suppression.per_actor_suppressed,
-					global_suppressed = suppression.global_suppressed,
-					"actor bounded channel overloaded"
-				);
-			}
-		} else {
-			tracing::warn!(
-				channel,
-				capacity,
-				operation,
-				"actor bounded channel overloaded"
-			);
-		}
-	}
-	#[cfg(target_arch = "wasm32")]
-	{
-		let _ = metrics;
-		anyhow!(
-			"actor bounded channel overloaded: channel={channel}, capacity={capacity}, operation={operation}"
-		)
-	}
-
-	#[cfg(not(target_arch = "wasm32"))]
-	{
-		ActorLifecycleError::Overloaded {
-			channel: channel.to_owned(),
-			capacity,
-			operation: operation.to_owned(),
-		}
-		.build()
-	}
-}
-
 pub(crate) fn try_send_lifecycle_command(
-	sender: &mpsc::Sender<LifecycleCommand>,
-	capacity: usize,
-	operation: &'static str,
+	sender: &mpsc::UnboundedSender<LifecycleCommand>,
 	command: LifecycleCommand,
-	metrics: Option<&ActorMetrics>,
 ) -> Result<()> {
-	// Reserve capacity before sending so overload paths can return
-	// `actor.overloaded` without waiting or constructing more channel-owned work.
-	// Lifecycle callers also avoid creating reply oneshots when a full inbox would
-	// immediately orphan them.
-	let permit = sender.try_reserve().map_err(|_| {
-		actor_channel_overloaded_error(LIFECYCLE_INBOX_CHANNEL, capacity, operation, metrics)
-	})?;
-	permit.send(command);
-	Ok(())
+	sender
+		.send(command)
+		.map_err(|_| ActorLifecycleError::NotReady.build())
 }
 
 pub enum DispatchCommand {
@@ -328,20 +245,12 @@ impl DispatchCommand {
 }
 
 pub(crate) fn try_send_dispatch_command(
-	sender: &mpsc::Sender<DispatchCommand>,
-	capacity: usize,
-	operation: &'static str,
+	sender: &mpsc::UnboundedSender<DispatchCommand>,
 	command: DispatchCommand,
-	metrics: Option<&ActorMetrics>,
 ) -> Result<()> {
-	// Match lifecycle command backpressure semantics: capacity is checked before
-	// handing the value to the channel, which keeps reject paths cheap and avoids
-	// `try_send` returning a fully built command that must be discarded.
-	let permit = sender.try_reserve().map_err(|_| {
-		actor_channel_overloaded_error(DISPATCH_INBOX_CHANNEL, capacity, operation, metrics)
-	})?;
-	permit.send(command);
-	Ok(())
+	sender
+		.send(command)
+		.map_err(|_| ActorLifecycleError::NotReady.build())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,15 +301,15 @@ pub struct ActorTask {
 	// === INBOX CHANNELS ===
 	/// Lifecycle commands (Start / Stop / FireAlarm) sent by the registry
 	/// in response to engine-driven `EnvoyCallbacks` from the envoy client.
-	pub lifecycle_inbox: mpsc::Receiver<LifecycleCommand>,
+	pub lifecycle_inbox: mpsc::UnboundedReceiver<LifecycleCommand>,
 	/// Client-originated work sent by `RegistryDispatcher` in
 	/// `registry/dispatch.rs` (Action, OpenWebSocket, Workflow*) and
 	/// `registry/http.rs` (Http, QueueSend).
-	pub dispatch_inbox: mpsc::Receiver<DispatchCommand>,
+	pub dispatch_inbox: mpsc::UnboundedReceiver<DispatchCommand>,
 	/// Internal self-events the actor enqueues onto itself via `ActorContext`
 	/// hooks (save/inspector/activity notifications from
 	/// `actor/state.rs`, `actor/connection.rs`, `actor/context.rs`).
-	pub lifecycle_events: mpsc::Receiver<LifecycleEvent>,
+	pub lifecycle_events: mpsc::UnboundedReceiver<LifecycleEvent>,
 
 	// === RUNTIME STATE ===
 	pub lifecycle: LifecycleState,
@@ -463,9 +372,9 @@ impl ActorTask {
 	pub fn new(
 		actor_id: String,
 		generation: u32,
-		lifecycle_inbox: mpsc::Receiver<LifecycleCommand>,
-		dispatch_inbox: mpsc::Receiver<DispatchCommand>,
-		lifecycle_events: mpsc::Receiver<LifecycleEvent>,
+		lifecycle_inbox: mpsc::UnboundedReceiver<LifecycleCommand>,
+		dispatch_inbox: mpsc::UnboundedReceiver<DispatchCommand>,
+		lifecycle_events: mpsc::UnboundedReceiver<LifecycleEvent>,
 		factory: Arc<ActorFactory>,
 		ctx: ActorContext,
 		start_input: Option<Vec<u8>>,
@@ -560,6 +469,7 @@ impl ActorTask {
 					return exit;
 				}
 			}
+			// TODO: Sample inbox depths periodically instead of on every loop iteration.
 			self.record_inbox_depths();
 			tokio::select! {
 				biased;
@@ -970,6 +880,7 @@ impl ActorTask {
 						);
 						self.log_dispatch_command_handled(command_kind, "enqueued");
 						let actor_id = self.ctx.actor_id().to_owned();
+						let ctx = self.ctx.clone();
 						let action_keep_awake = self
 							.ctx
 							.internal_keep_awake_region()
@@ -979,6 +890,7 @@ impl ActorTask {
 							let _action_keep_awake = action_keep_awake;
 							match tracked_reply_rx.await {
 								Ok(result) => {
+									let result = result.map_err(|error| ctx.attach_actor_to_error(error));
 									tracing::info!(
 										actor_id = %actor_id,
 										action_name = %action_name_for_log,
@@ -993,8 +905,10 @@ impl ActorTask {
 										action_name = %action_name_for_log,
 										"actor task: tracked reply dropped before completion"
 									);
-									let _ =
-										reply.send(Err(ActorLifecycleError::DroppedReply.build()));
+									let error = ctx.attach_actor_to_error(
+										ActorLifecycleError::DroppedReply.build(),
+									);
+									let _ = reply.send(Err(error));
 								}
 							}
 						});
@@ -1006,7 +920,7 @@ impl ActorTask {
 							?error,
 							"actor task: failed to enqueue ActorEvent::Action"
 						);
-						let _ = reply.send(Err(error));
+						let _ = reply.send(Err(self.attach_actor_to_error(error)));
 						self.log_dispatch_command_handled(command_kind, "enqueue_failed");
 					}
 				}
@@ -1137,6 +1051,7 @@ impl ActorTask {
 	}
 
 	fn reply_dispatch_error(&self, command: DispatchCommand, error: anyhow::Error) {
+		let error = self.ctx.attach_actor_to_error(error);
 		match command {
 			DispatchCommand::Action { reply, .. } => {
 				let _ = reply.send(Err(error));
@@ -1157,6 +1072,10 @@ impl ActorTask {
 				let _ = reply.send(Err(error));
 			}
 		}
+	}
+
+	fn attach_actor_to_error(&self, error: anyhow::Error) -> anyhow::Error {
+		self.ctx.attach_actor_to_error(error)
 	}
 
 	fn dispatch_lifecycle_error(&self) -> Option<anyhow::Error> {
@@ -1689,6 +1608,7 @@ impl ActorTask {
 		reply: oneshot::Sender<Result<()>>,
 		result: Result<()>,
 	) {
+		let result = result.map_err(|error| self.attach_actor_to_error(error));
 		let outcome = result_outcome(&result);
 		let delivered = reply.send(result).is_ok();
 		tracing::debug!(

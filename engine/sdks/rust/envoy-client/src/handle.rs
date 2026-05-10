@@ -75,6 +75,17 @@ impl EnvoyHandle {
 		self.shared.protocol_metadata.lock().await.clone()
 	}
 
+	/// Threshold for `is_ping_healthy`.
+	pub const PING_HEALTHY_THRESHOLD_MS: i64 = 20_000;
+
+	/// True when the engine sent a ping within `PING_HEALTHY_THRESHOLD_MS`. Returns false once
+	/// the engine link has been silently dead long enough that an upstream health check should
+	/// treat this envoy as unhealthy and recycle it.
+	pub fn is_ping_healthy(&self) -> bool {
+		let last = self.shared.last_ping_ts.load(Ordering::Acquire);
+		crate::time::now_millis() - last < Self::PING_HEALTHY_THRESHOLD_MS
+	}
+
 	pub fn get_envoy_key(&self) -> &str {
 		&self.shared.envoy_key
 	}
@@ -541,12 +552,18 @@ impl EnvoyHandle {
 	/// Inject a serverless start payload into the envoy.
 	/// The payload is a u16 LE protocol version followed by a serialized ToEnvoy message.
 	pub async fn start_serverless_actor(&self, payload: &[u8]) -> anyhow::Result<()> {
+		tracing::debug!(
+			envoy_key = %self.shared.envoy_key,
+			payload_len = payload.len(),
+			"received serverless start request"
+		);
 		let (message, _) = decode_serverless_actor_start_payload(payload)?;
 
 		// Wait for envoy to be started before injecting
 		self.started().await?;
 
 		tracing::debug!(
+			envoy_key = %self.shared.envoy_key,
 			data = crate::stringify::stringify_to_envoy(&message),
 			"received serverless start"
 		);

@@ -12,6 +12,8 @@ pub(crate) fn new_with_kv(
 		name.into(),
 		key,
 		region.into(),
+		None,
+		String::new(),
 		ActorConfig::default(),
 		kv,
 		SqliteDb::default(),
@@ -33,6 +35,8 @@ fn build_applies_actor_config_to_owned_subsystems() {
 		"configured".to_owned(),
 		Vec::new(),
 		"local".to_owned(),
+		None,
+		String::new(),
 		config.clone(),
 		Kv::default(),
 		SqliteDb::default(),
@@ -66,7 +70,7 @@ async fn inspector_attach_guard_notifies_on_threshold_edges() {
 	let attach_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
 	let (overlay_tx, _) = tokio::sync::broadcast::channel(4);
 	ctx.configure_inspector_runtime(std::sync::Arc::clone(&attach_count), overlay_tx);
-	let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::channel(4);
+	let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
 	ctx.configure_lifecycle_events(Some(lifecycle_tx));
 
 	let first_guard = ctx

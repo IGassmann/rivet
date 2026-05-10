@@ -72,7 +72,7 @@ pub struct ServerlessRequest {
 pub struct ServerlessResponse {
 	pub status: u16,
 	pub headers: HashMap<String, String>,
-	pub body: mpsc::Receiver<Result<Vec<u8>, ServerlessStreamError>>,
+	pub body: mpsc::UnboundedReceiver<Result<Vec<u8>, ServerlessStreamError>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -247,14 +247,37 @@ impl CoreServerlessRuntime {
 				"text/plain; charset=utf-8",
 				"This is a RivetKit server.\n\nLearn more at https://rivet.dev",
 			)),
-			("GET", "/health") => Ok(json_response(
-				StatusCode::OK,
-				json!({
-					"status": "ok",
-					"runtime": "rivetkit",
-					"version": self.settings.package_version,
-				}),
-			)),
+			("GET", "/health") => {
+				// Report unhealthy when an envoy is currently running but its link to the
+				// engine has gone silent. A 503 is the conventional "recycle me" signal for
+				// container hosts (Cloud Run, k8s, etc.) running behind an HTTP health probe.
+				let envoy_unhealthy = {
+					let guard = self.envoy.lock().await;
+					guard
+						.as_ref()
+						.map(|handle| !handle.is_ping_healthy())
+						.unwrap_or(false)
+				};
+				if envoy_unhealthy {
+					Ok(json_response(
+						StatusCode::SERVICE_UNAVAILABLE,
+						json!({
+							"status": "engine_ping_stale",
+							"runtime": "rivetkit",
+							"version": self.settings.package_version,
+						}),
+					))
+				} else {
+					Ok(json_response(
+						StatusCode::OK,
+						json!({
+							"status": "ok",
+							"runtime": "rivetkit",
+							"version": self.settings.package_version,
+						}),
+					))
+				}
+			}
 			("GET", "/metadata") => Ok(self.metadata_response()),
 			("GET", "/start") | ("POST", "/start") => self.start_response(req).await,
 			("OPTIONS", _) => Ok(bytes_response(
@@ -286,8 +309,8 @@ impl CoreServerlessRuntime {
 		let actor_start = handle.decode_serverless_actor_start(&payload)?;
 		let cancel_token = req.cancel_token;
 		let cache_envoy = self.settings.cache_envoy;
-		let (tx, rx) = mpsc::channel(16);
-		let _ = tx.try_send(Ok(SSE_PING_FRAME.to_vec()));
+		let (tx, rx) = mpsc::unbounded_channel();
+		let _ = tx.send(Ok(SSE_PING_FRAME.to_vec()));
 
 		RuntimeSpawner::spawn(async move {
 			let shutdown_handle = handle.clone();
@@ -302,7 +325,7 @@ impl CoreServerlessRuntime {
 			};
 			if let Err(error) = result {
 				let error = stream_error(error);
-				let _ = tx.send(Err(error)).await;
+				let _ = tx.send(Err(error));
 				if !cache_envoy {
 					handle.shutdown_and_wait(false).await;
 				}
@@ -315,11 +338,11 @@ impl CoreServerlessRuntime {
 						break;
 					}
 					_ = handle.wait_actor_registered_then_stopped(&actor_start.actor_id, actor_start.generation) => {
-						let _ = tx.send(Ok(SSE_STOPPING_FRAME.to_vec())).await;
+						let _ = tx.send(Ok(SSE_STOPPING_FRAME.to_vec()));
 						break;
 					}
 					_ = sleep(SSE_PING_INTERVAL) => {
-						if tx.send(Ok(SSE_PING_FRAME.to_vec())).await.is_err() {
+						if tx.send(Ok(SSE_PING_FRAME.to_vec())).is_err() {
 							break;
 						}
 					}
@@ -607,8 +630,8 @@ fn bytes_response(
 	headers: HashMap<String, String>,
 	body: Vec<u8>,
 ) -> ServerlessResponse {
-	let (tx, rx) = mpsc::channel(1);
-	let _ = tx.try_send(Ok(body));
+	let (tx, rx) = mpsc::unbounded_channel();
+	let _ = tx.send(Ok(body));
 	ServerlessResponse {
 		status: status.as_u16(),
 		headers,

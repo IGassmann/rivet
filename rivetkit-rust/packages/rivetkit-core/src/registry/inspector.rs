@@ -1,7 +1,7 @@
 use super::dispatch::*;
 use super::http::*;
 use super::*;
-use crate::error::ProtocolError;
+use crate::error::{client_error_message, ProtocolError};
 use ::http;
 
 #[derive(rivet_error::RivetError, serde::Serialize)]
@@ -261,7 +261,6 @@ impl RegistryDispatcher {
 		);
 		let output = dispatch_action_through_task(
 			&instance.dispatch,
-			instance.factory.config().dispatch_command_inbox_capacity,
 			conn.clone(),
 			action_name.to_owned(),
 			args,
@@ -349,7 +348,6 @@ impl RegistryDispatcher {
 			.ctx
 			.internal_keep_awake(dispatch_workflow_history_through_task(
 				&instance.dispatch,
-				instance.factory.config().dispatch_command_inbox_capacity,
 			))
 			.await
 			.context("load inspector workflow history");
@@ -366,7 +364,6 @@ impl RegistryDispatcher {
 			.ctx
 			.internal_keep_awake(dispatch_workflow_replay_request_through_task(
 				&instance.dispatch,
-				instance.factory.config().dispatch_command_inbox_capacity,
 				entry_id,
 			))
 			.await
@@ -655,13 +652,18 @@ pub(super) fn action_error_response(error: ActionDispatchError) -> HttpResponse 
 	} else {
 		StatusCode::INTERNAL_SERVER_ERROR
 	};
-	inspector_error_response(status, &error.group, &error.code, &error.message)
+	inspector_error_response(status, &error.group, &error.code, error.client_message())
 }
 
 pub(super) fn inspector_anyhow_response(error: anyhow::Error) -> HttpResponse {
 	let error = RivetError::extract(&error);
 	let status = inspector_error_status(error.group(), error.code());
-	inspector_error_response(status, error.group(), error.code(), error.message())
+	inspector_error_response(
+		status,
+		error.group(),
+		error.code(),
+		client_error_message(error.group(), error.code(), error.message()),
+	)
 }
 
 pub(super) fn inspector_error_response(

@@ -3,9 +3,11 @@ use tokio::process::Command;
 
 mod database;
 mod pubsub;
+mod toxiproxy;
 
 pub use database::*;
 pub use pubsub::*;
+pub use toxiproxy::*;
 
 #[derive(Debug, Clone)]
 pub struct DockerRunConfig {
