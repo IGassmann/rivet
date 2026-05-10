@@ -4,7 +4,6 @@ import {
 	Effect,
 	Exit,
 	Layer,
-	Ref,
 	Schema,
 	Scope,
 	Stream,
@@ -93,22 +92,21 @@ export type Options = Pick<
 	"endpoint" | "token" | "namespace"
 >;
 
-export const make = Effect.fnUntraced(function* (
-	options: Options = {},
-): Effect.fn.Return<Registry> {
-	const ref = yield* Ref.make<
-		ReadonlyArray<RegistryEntry<any, any, any, any, any>>
-	>([]);
+export const make = (options: Options = {}): Registry => {
+	const entries: Array<RegistryEntry<any, any, any, any, any>> = [];
 	return Registry.of({
 		[TypeId]: TypeId,
 		options,
-		register: (entry) => Ref.update(ref, (xs) => [...xs, entry]),
-		entries: Ref.get(ref),
+		register: (entry) =>
+			Effect.sync(() => {
+				entries.push(entry);
+			}),
+		entries: Effect.sync(() => entries),
 	});
-});
+};
 
 export const layer = (options: Options = {}): Layer.Layer<Registry> =>
-	Layer.effect(Registry, make(options));
+	Layer.succeed(Registry, make(options));
 
 /**
  * Run the registered actors against the configured engine. Reads
