@@ -57,6 +57,7 @@ export const CounterLive = Counter.toLayer(
 
 		yield* Effect.addFinalizer(() =>
 			State.get(state).pipe(
+				Effect.orDie,
 				Effect.flatMap(({ count }) =>
 					Effect.log(
 						`sleeping ${address.name}/${address.key.join(",")} count=${count}`,
