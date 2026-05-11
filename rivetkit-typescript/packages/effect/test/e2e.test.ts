@@ -76,7 +76,7 @@ layer(TestLayer)("end-to-end", (it) => {
 	it.effect("persists state across a sleep/wake cycle", () =>
 		Effect.gen(function* () {
 			const counter = (yield* Counter.client).getOrCreate([
-				"t-sleep-wake",
+				"t-persist-state",
 			]);
 
 			// Bump the in-memory `Ref` so we can later assert that
