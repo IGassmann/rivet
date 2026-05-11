@@ -1,12 +1,5 @@
-import {
-	Context,
-	Effect,
-	Ref,
-	Schema,
-	SchemaTransformation,
-	SubscriptionRef,
-} from "effect";
-import { Action, Actor, ActorState } from "@rivetkit/effect";
+import { Context, Effect, Ref, Schema, SchemaTransformation } from "effect";
+import { Action, Actor, ActorState, State } from "@rivetkit/effect";
 
 // --- Counter ---
 
@@ -176,7 +169,7 @@ const CounterState = ActorState.make("CounterState", {
 		when: Schema.DateFromString,
 		tags: TagsCsv,
 	}),
-	initial: () => ({ count: 0, when: new Date(), tags: ["default"] }),
+	initialValue: () => ({ count: 0, when: new Date(), tags: ["default"] }),
 });
 
 export const CounterLive = Counter.toLayer(
@@ -241,41 +234,32 @@ export const CounterLive = Counter.toLayer(
 				}),
 			PersistAndSleep: ({ payload }) =>
 				Effect.gen(function* () {
-					const { count } = yield* SubscriptionRef.updateAndGet(
-						state,
-						(s) => ({
-							...s,
-							count: s.count + payload.amount,
-						}),
-					);
+					const { count } = yield* State.updateAndGet(state, (s) => ({
+						...s,
+						count: s.count + payload.amount,
+					}));
 					yield* sleep;
 					return count;
 				}),
 			PersistDateAndSleep: ({ payload }) =>
 				Effect.gen(function* () {
-					const { when } = yield* SubscriptionRef.updateAndGet(
-						state,
-						(s) => ({
-							...s,
-							when: payload.when,
-						}),
-					);
+					const { when } = yield* State.updateAndGet(state, (s) => ({
+						...s,
+						when: payload.when,
+					}));
 					yield* sleep;
 					return when;
 				}),
 			PersistTagsAndSleep: ({ payload }) =>
 				Effect.gen(function* () {
-					const { tags } = yield* SubscriptionRef.updateAndGet(
-						state,
-						(s) => ({
-							...s,
-							tags: payload.tags,
-						}),
-					);
+					const { tags } = yield* State.updateAndGet(state, (s) => ({
+						...s,
+						tags: payload.tags,
+					}));
 					yield* sleep;
 					return tags;
 				}),
-			GetPersistedState: () => SubscriptionRef.get(state),
+			GetPersistedState: () => State.get(state),
 		});
 	}),
 	{ state: CounterState },

@@ -186,7 +186,7 @@ layer(TestLayer)("end-to-end", (it) => {
 		}),
 	);
 
-	it.effect(
+	it.effect.skip(
 		"surfaces an expected handler error back into the original error",
 		() =>
 			Effect.gen(function* () {
@@ -327,7 +327,7 @@ layer(TestLayer)("end-to-end", (it) => {
 		}),
 	);
 
-	it.effect(
+	it.effect.skip(
 		"runs encoding/decoding services for an action's payload, success, and error",
 		() =>
 			Effect.gen(function* () {

@@ -7,8 +7,7 @@ import {
 	Option,
 	Schema,
 	Scope,
-	Stream,
-	SubscriptionRef,
+	Semaphore,
 	Tracer,
 } from "effect";
 import * as Rivetkit from "rivetkit";
@@ -18,6 +17,7 @@ import * as Actor from "./Actor";
 import type * as ActorState from "./ActorState";
 import { Client, type ClientService } from "./Client";
 import { readTraceMeta, rpcSystem } from "./internal/tracing";
+import * as State from "./State";
 import { hasStringProperty } from "./utils";
 
 const TypeId = "~@rivetkit/effect/Registry";
@@ -30,8 +30,8 @@ const TypeId = "~@rivetkit/effect/Registry";
  *
  * `state`, when present, carries the persisted-state schema and
  * initial-value factory. The runner uses it to seed `c.state` on
- * first create and to provide a typed `SubscriptionRef` under the
- * state's tag inside the build effect's context.
+ * first create and to provide a typed `State` under the state's tag
+ * inside the build effect's context.
  */
 interface RegistryEntry<
 	Name extends string,
@@ -55,6 +55,7 @@ type ActorInstance = {
 		}) => Effect.Effect<unknown, unknown>
 	>;
 	readonly scope: Scope.Closeable;
+	readonly state: Option.Option<State.State<unknown>>;
 };
 
 export interface Registry {
@@ -228,7 +229,7 @@ const toRivetkitRegistry = Effect.fnUntraced(function* (registry: Registry) {
 });
 
 const toRivetkitActor = Effect.fnUntraced(function* (
-	entry: RegistryEntry<any, any, any, any, any>,
+	{ actor, buildHandlers, options }: RegistryEntry<any, any, any, any, any>,
 	instances: Map<string, ActorInstance>,
 ) {
 	// Snapshot the current Effect context so action callbacks
@@ -236,7 +237,6 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 	// handler effects against the same services the Registry.start /
 	// Registry.test layer was provided with.
 	const services = yield* Effect.context<any>();
-	const actor = entry.actor;
 
 	const actions: Record<
 		string,
@@ -327,14 +327,12 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 		};
 	}
 
-	const actorOptions = entry.options
-		? Actor.splitOptions(entry.options)
-		: undefined;
+	const actorOptions = options ? Actor.splitOptions(options) : undefined;
 	const stateDef = actorOptions?.effectOptions.state;
 	const stateDefOption = Option.fromNullishOr(stateDef);
 	const stateInitialValue = Option.isSome(stateDefOption)
 		? yield* Schema.encodeUnknownEffect(stateDef.schema)(
-				stateDef.initial(),
+				stateDef.initialValue(),
 			).pipe(Effect.orDie)
 		: undefined;
 
@@ -342,7 +340,7 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 		actions,
 		options: actorOptions?.rivetkitOptions,
 		// rivetkit invokes this once at create time and seeds c.state
-		// with the result. We delegate to the user-supplied `initial`
+		// with the result. We delegate to the user-supplied `initialValue`
 		// factory so primitive states (e.g. `Schema.Number`) don't need
 		// `Schema.withConstructorDefault` boilerplate.
 		...(Option.isSome(stateDefOption)
@@ -363,57 +361,63 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 			// provided. Keeping both pieces in one fiber means a
 			// `buildHandlers` failure shares its cause with the scope it
 			// would have owned.
-			const acquire = Effect.gen(function* () {
-				const scope = yield* Scope.make();
+			const { handlers, scope, state } = await Effect.runPromiseWith(
+				services,
+			)(
+				Effect.gen(function* () {
+					const scope = yield* Scope.make();
 
-				const stateRef = yield* SubscriptionRef.make<unknown>(
-					Option.isSome(stateDefOption)
-						? yield* Schema.decodeUnknownEffect(stateDef.schema)(
-								c.state,
-							).pipe(Effect.orDie)
-						: undefined,
-				);
-				if (Option.isSome(stateDefOption)) {
-					yield* SubscriptionRef.changes(stateRef).pipe(
-						Stream.drop(1),
-						Stream.runForEach((decodedState) =>
-							Effect.gen(function* () {
-								c.state = yield* Schema.encodeUnknownEffect(
-									stateDef.schema,
-								)(decodedState).pipe(Effect.orDie);
-							}),
+					const state = Option.isSome(stateDefOption)
+						? Option.some(
+								// `c.state` IS the state — `State` is just a typed
+								// view + change stream over it. Effect-typed
+								// read/write so async schema transforms work.
+								// `Schema.Top`'s requirements show up as
+								// `unknown`; the captured `services` context
+								// satisfies them at runtime, so we erase R at
+								// the boundary.
+								(yield* State.make(
+									() =>
+										Schema.decodeUnknownEffect(
+											stateDef.schema,
+										)(c.state).pipe(Effect.orDie),
+									(next) =>
+										Schema.encodeUnknownEffect(
+											stateDef.schema,
+										)(next).pipe(
+											Effect.orDie,
+											Effect.tap((encoded) =>
+												Effect.sync(() => {
+													c.state = encoded;
+												}),
+											),
+											Effect.asVoid,
+										),
+								)) as State.State<unknown>,
+							)
+						: Option.none();
+
+					const context = Context.mergeAll(
+						Context.make(Actor.CurrentAddress, address),
+						Context.make(Scope.Scope, scope),
+						Context.make(
+							Actor.Sleep,
+							Effect.sync(() => c.sleep()),
 						),
-						Effect.forkIn(scope),
+						Option.match(state, {
+							onNone: () => Context.empty(),
+							onSome: (s) => Context.make(stateDef, s),
+						}),
 					);
-				}
 
-				const built = entry.buildHandlers;
-				let provided = built.pipe(
-					Effect.provideService(Actor.CurrentAddress, address),
-					Effect.provideService(Scope.Scope, scope),
-					Effect.provideService(
-						Actor.Sleep,
-						Effect.sync(() => c.sleep()),
-					),
-				);
-				if (Option.isSome(stateDefOption)) {
-					// Provide the SubscriptionRef under the user's typed
-					// `ActorState` tag so `yield* MyState` inside the build
-					// effect resolves to a `SubscriptionRef<S["Type"]>`.
-					provided = Effect.provideService(
-						provided,
-						stateDef,
-						stateRef,
+					const handlers = yield* buildHandlers.pipe(
+						Effect.provide(context),
 					);
-				}
-				return { handlers: yield* provided, scope };
-			});
-			const { handlers, scope } =
-				await Effect.runPromiseWith(services)(acquire);
-			instances.set(c.actorId, {
-				handlers,
-				scope,
-			});
+
+					return { handlers, scope, state };
+				}),
+			);
+			instances.set(c.actorId, { handlers, scope, state });
 		},
 		onSleep: async (
 			c: Rivetkit.SleepContextOf<Rivetkit.AnyActorDefinition>,
@@ -423,6 +427,27 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 			instances.delete(c.actorId);
 			await Effect.runPromiseWith(services)(
 				Scope.close(inst.scope, Exit.void),
+			);
+		},
+		onStateChange: (c, newState) => {
+			if (Option.isNone(stateDefOption)) return;
+			const inst = instances.get(c.actorId);
+			if (!inst || Option.isNone(inst.state)) return;
+			const stateRef = inst.state.value;
+			// `c.state` already holds `newState` — decode and notify the
+			// change stream. The decode is Effect-typed so async schema
+			// transforms work; we serialize through the State's semaphore
+			// so the publish order matches the write order.
+			void Effect.runForkWith(services)(
+				Semaphore.withPermit(
+					stateRef.semaphore,
+					Effect.gen(function* () {
+						const decoded = yield* Schema.decodeUnknownEffect(
+							stateDef.schema,
+						)(newState).pipe(Effect.orDie);
+						State.publishUnsafe(stateRef, decoded);
+					}),
+				),
 			);
 		},
 	});
