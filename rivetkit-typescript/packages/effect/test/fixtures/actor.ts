@@ -139,10 +139,16 @@ export const PersistDateAndSleep = Action.make("PersistDateAndSleep", {
 	success: Schema.Date,
 });
 
+export const PersistTagsAndSleep = Action.make("PersistTagsAndSleep", {
+	payload: { tags: TagsCsv },
+	success: TagsCsv,
+});
+
 export const GetPersistedState = Action.make("GetPersistedState", {
 	success: Schema.Struct({
 		count: Schema.Number,
 		when: Schema.DateFromString,
+		tags: TagsCsv,
 	}),
 });
 
@@ -159,6 +165,7 @@ export const Counter = Actor.make("Counter", {
 		Scale,
 		PersistAndSleep,
 		PersistDateAndSleep,
+		PersistTagsAndSleep,
 		GetPersistedState,
 	],
 });
@@ -167,8 +174,9 @@ const CounterState = ActorState.make("CounterState", {
 	schema: Schema.Struct({
 		count: Schema.Number,
 		when: Schema.DateFromString,
+		tags: TagsCsv,
 	}),
-	initial: () => ({ count: 0, when: new Date() }),
+	initial: () => ({ count: 0, when: new Date(), tags: ["default"] }),
 });
 
 export const CounterLive = Counter.toLayer(
@@ -254,6 +262,18 @@ export const CounterLive = Counter.toLayer(
 					);
 					yield* sleep;
 					return when;
+				}),
+			PersistTagsAndSleep: ({ payload }) =>
+				Effect.gen(function* () {
+					const { tags } = yield* SubscriptionRef.updateAndGet(
+						state,
+						(s) => ({
+							...s,
+							tags: payload.tags,
+						}),
+					);
+					yield* sleep;
+					return tags;
 				}),
 			GetPersistedState: () => SubscriptionRef.get(state),
 		});

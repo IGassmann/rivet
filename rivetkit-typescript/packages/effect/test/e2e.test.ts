@@ -149,6 +149,43 @@ layer(TestLayer)("end-to-end", (it) => {
 		}),
 	);
 
+	it.effect("persists state with a custom Schema.transform", () =>
+		Effect.gen(function* () {
+			const counter = (yield* Counter.client).getOrCreate([
+				"t-persist-state-transform",
+			]);
+
+			// Bump the in-memory `Ref` so we can later assert that
+			// the wake actually rebuilt the actor (the ref should
+			// reset to 0 on each wake).
+			yield* counter.Increment({ amount: 7 });
+
+			const tags = ["alpha", "beta", "gamma"];
+			const beforeSleep = yield* counter.PersistTagsAndSleep({
+				tags,
+			});
+			assert.deepEqual(beforeSleep, tags);
+
+			// Engine-side sleep teardown is asynchronous. `count`
+			// is `Ref.make(0)` per wake, so seeing 0 is the deterministic
+			// signal that the prior wake torn down and a fresh one started.
+			// `TestClock.withLive` swaps in the real Clock for the duration
+			// of the poll so the schedule's interval and the timeout both
+			// elapse in wall time (the suite otherwise runs under TestClock).
+			const inMemoryAfterWake = yield* counter.GetCount().pipe(
+				Effect.repeat({
+					until: (n) => n === 0,
+					schedule: Schedule.spaced("100 millis"),
+				}),
+				TestClock.withLive,
+			);
+			assert.strictEqual(inMemoryAfterWake, 0);
+
+			const persistedAfterWake = yield* counter.GetPersistedState();
+			assert.deepEqual(persistedAfterWake.tags, tags);
+		}),
+	);
+
 	it.effect(
 		"surfaces an expected handler error back into the original error",
 		() =>
