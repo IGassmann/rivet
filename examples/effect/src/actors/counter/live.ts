@@ -1,10 +1,10 @@
-import { Effect, Schema, SubscriptionRef } from "effect";
-import { Actor, ActorState } from "@rivetkit/effect";
+import { Effect, Schema } from "effect";
+import { Actor, ActorState, State } from "@rivetkit/effect";
 import { Counter, CounterOverflowError } from "./api.ts";
 
 // --- Actor State ---
 
-// State configuration (`schema` + `initial`) is server-only — it
+// State configuration (`schema` + `initialValue`) is server-only — it
 // describes the persisted shape and must not leak into the client
 // bundle. Defining it here keeps the contract in `api.ts` lean and
 // shareable; the client never imports this file.
@@ -12,7 +12,7 @@ const CounterState = ActorState.make("CounterState", {
 	schema: Schema.Struct({
 		count: Schema.Number,
 	}),
-	initial: () => ({ count: 0 }),
+	initialValue: () => ({ count: 0 }),
 });
 
 // --- Actor Implementation ---
@@ -39,14 +39,11 @@ export const CounterLive = Counter.toLayer(
 		// - Swappable via layers. Tests can provide an in-memory KV
 		//   or a mock DB without changing the actor code.
 
-		// Yielding `CounterState` resolves to a SubscriptionRef whose
-		// published changes are mirrored back to rivetkit's persisted
-		// state. Standard SubscriptionRef combinators (get, set, update,
-		// modify, changes) work as-is, and the wake-scope finalizer
-		// flushes pending writes before sleep so state is durable on
-		// teardown.
+		// Yielding `CounterState` resolves to a `State` view over the
+		// persisted store. `State.changes` exposes every state changes
+		// commit as a stream.
 		const state = yield* CounterState;
-		//    ^ SubscriptionRef<{ count: number }>
+		//    ^ State.State<{ count: number }>
 		// const events = yield* Counter.Events
 		//    // ^ { countChanged: PubSub<number> }
 		// const messages = yield* Counter.Messages
@@ -59,7 +56,7 @@ export const CounterLive = Counter.toLayer(
 		);
 
 		yield* Effect.addFinalizer(() =>
-			SubscriptionRef.get(state).pipe(
+			State.get(state).pipe(
 				Effect.flatMap(({ count }) =>
 					Effect.log(
 						`sleeping ${address.name}/${address.key.join(",")} count=${count}`,
@@ -78,13 +75,13 @@ export const CounterLive = Counter.toLayer(
 		// 	yield* Match.value(msg).pipe(
 		// 		Match.tag("Reset", () =>
 		// 			Effect.gen(function* () {
-		// 				yield* SubscriptionRef.set(state, 0)
+		// 				yield* State.set(state, 0)
 		// 				yield* PubSub.publish(events.countChanged, 0)
 		// 			})
 		// 		),
 		// 		Match.tag("IncrementBy", ({ payload, complete }) =>
 		// 			Effect.gen(function* () {
-		// 				const next = yield* SubscriptionRef.updateAndGet(
+		// 				const next = yield* State.updateAndGet(
 		// 					state,
 		// 					(s) => ({ count: s.count + payload.amount }),
 		// 				)
@@ -100,7 +97,7 @@ export const CounterLive = Counter.toLayer(
 		return Counter.of({
 			Increment: ({ payload }) =>
 				Effect.gen(function* () {
-					const { count: next } = yield* SubscriptionRef.updateAndGet(
+					const { count: next } = yield* State.updateAndGet(
 						state,
 						(s) => ({ count: s.count + payload.amount }),
 					);
@@ -114,8 +111,7 @@ export const CounterLive = Counter.toLayer(
 					return next;
 				}),
 
-			GetCount: () =>
-				SubscriptionRef.get(state).pipe(Effect.map((s) => s.count)),
+			GetCount: () => State.get(state).pipe(Effect.map((s) => s.count)),
 		});
 	}),
 	{
