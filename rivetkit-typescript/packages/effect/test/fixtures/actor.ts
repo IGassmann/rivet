@@ -137,11 +137,17 @@ export const PersistTagsAndSleep = Action.make("PersistTagsAndSleep", {
 	success: TagsCsv,
 });
 
+export const PersistScaledAndSleep = Action.make("PersistScaledAndSleep", {
+	payload: { amount: ScaledNumber },
+	success: ScaledNumber,
+});
+
 export const GetPersistedState = Action.make("GetPersistedState", {
 	success: Schema.Struct({
 		count: Schema.Number,
 		when: Schema.DateFromString,
 		tags: TagsCsv,
+		scaled: ScaledNumber,
 	}),
 });
 
@@ -159,6 +165,7 @@ export const Counter = Actor.make("Counter", {
 		PersistAndSleep,
 		PersistDateAndSleep,
 		PersistTagsAndSleep,
+		PersistScaledAndSleep,
 		GetPersistedState,
 	],
 });
@@ -168,8 +175,19 @@ const CounterState = ActorState.make("CounterState", {
 		count: Schema.Number,
 		when: Schema.DateFromString,
 		tags: TagsCsv,
+		// `scaled` is encoded/decoded through `ScaledNumber`, which
+		// yields `Multiplier` inside the transform. The Registry's state
+		// encode (write) and decode (wake) sites must resolve the
+		// service against the snapshotted Runner context, the same way
+		// action codec sites do.
+		scaled: ScaledNumber,
 	}),
-	initialValue: () => ({ count: 0, when: new Date(), tags: ["default"] }),
+	initialValue: () => ({
+		count: 0,
+		when: new Date(),
+		tags: ["default"],
+		scaled: 0,
+	}),
 });
 
 export const CounterLive = Counter.toLayer(
@@ -258,6 +276,15 @@ export const CounterLive = Counter.toLayer(
 					}));
 					yield* sleep;
 					return tags;
+				}),
+			PersistScaledAndSleep: ({ payload }) =>
+				Effect.gen(function* () {
+					const { scaled } = yield* State.updateAndGet(state, (s) => ({
+						...s,
+						scaled: payload.amount,
+					}));
+					yield* sleep;
+					return scaled;
 				}),
 			GetPersistedState: () => State.get(state),
 		});

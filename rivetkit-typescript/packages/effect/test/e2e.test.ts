@@ -186,6 +186,48 @@ layer(TestLayer)("end-to-end", (it) => {
 		}),
 	);
 
+	it.effect("persists state through a service-dependent transform", () =>
+		Effect.gen(function* () {
+			const counter = (yield* Counter.client).getOrCreate([
+				"t-persist-state-scaled",
+			]);
+
+			// Bump the in-memory `Ref` so we can later assert that
+			// the wake actually rebuilt the actor (the ref should
+			// reset to 0 on each wake).
+			yield* counter.Increment({ amount: 7 });
+
+			// 14 is the decoded (in-memory) value. With `factor: 2`,
+			// the state schema's encode (write) divides 14 -> 7 and
+			// its decode (read on wake) multiplies 7 -> 14. Both sites
+			// run server-side against the Runner's services snapshot;
+			// an unresolved `Multiplier` at either would corrupt the
+			// round-trip.
+			const beforeSleep = yield* counter.PersistScaledAndSleep({
+				amount: 14,
+			});
+			assert.strictEqual(beforeSleep, 14);
+
+			// Engine-side sleep teardown is asynchronous. `count`
+			// is `Ref.make(0)` per wake, so seeing 0 is the deterministic
+			// signal that the prior wake torn down and a fresh one started.
+			// `TestClock.withLive` swaps in the real Clock for the duration
+			// of the poll so the schedule's interval and the timeout both
+			// elapse in wall time (the suite otherwise runs under TestClock).
+			const inMemoryAfterWake = yield* counter.GetCount().pipe(
+				Effect.repeat({
+					until: (n) => n === 0,
+					schedule: Schedule.spaced("100 millis"),
+				}),
+				TestClock.withLive,
+			);
+			assert.strictEqual(inMemoryAfterWake, 0);
+
+			const persistedAfterWake = yield* counter.GetPersistedState();
+			assert.strictEqual(persistedAfterWake.scaled, 14);
+		}),
+	);
+
 	it.effect.skip(
 		"surfaces an expected handler error back into the original error",
 		() =>
