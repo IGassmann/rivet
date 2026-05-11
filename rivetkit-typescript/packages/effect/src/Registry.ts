@@ -4,6 +4,7 @@ import {
 	Effect,
 	Exit,
 	Layer,
+	Option,
 	Schema,
 	Scope,
 	Stream,
@@ -330,7 +331,12 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 		? Actor.splitOptions(entry.options)
 		: undefined;
 	const stateDef = actorOptions?.effectOptions.state;
-	const hasState = actorOptions?.effectOptions.state !== undefined;
+	const stateDefOption = Option.fromNullishOr(stateDef);
+	const stateInitialValue = Option.isSome(stateDefOption)
+		? yield* Schema.encodeUnknownEffect(stateDef.schema)(
+				stateDef.initial(),
+			).pipe(Effect.orDie)
+		: undefined;
 
 	return Rivetkit.actor({
 		actions,
@@ -339,9 +345,9 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 		// with the result. We delegate to the user-supplied `initial`
 		// factory so primitive states (e.g. `Schema.Number`) don't need
 		// `Schema.withConstructorDefault` boilerplate.
-		...(hasState
+		...(Option.isSome(stateDefOption)
 			? {
-					createState: () => stateDef.initial(),
+					createState: () => stateInitialValue,
 				}
 			: {}),
 		onWake: async (
@@ -361,19 +367,20 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 				const scope = yield* Scope.make();
 
 				const stateRef = yield* SubscriptionRef.make<unknown>(
-					hasState ? c.state : undefined,
+					Option.isSome(stateDefOption)
+						? yield* Schema.decodeUnknownEffect(stateDef.schema)(
+								c.state,
+							).pipe(Effect.orDie)
+						: undefined,
 				);
-				if (hasState) {
-					// Mirror published changes back to c.state so
-					// rivetkit's throttled save loop and shutdown flush
-					// pick them up. The identity guard skips no-op
-					// updates; otherwise rivetkit re-encodes the value
-					// as CBOR and reschedules a save on every publish.
+				if (Option.isSome(stateDefOption)) {
 					yield* SubscriptionRef.changes(stateRef).pipe(
 						Stream.drop(1),
-						Stream.runForEach((value) =>
-							Effect.sync(() => {
-								if (value !== c.state) c.state = value;
+						Stream.runForEach((decodedState) =>
+							Effect.gen(function* () {
+								c.state = yield* Schema.encodeUnknownEffect(
+									stateDef.schema,
+								)(decodedState).pipe(Effect.orDie);
 							}),
 						),
 						Effect.forkIn(scope),
@@ -389,7 +396,7 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 						Effect.sync(() => c.sleep()),
 					),
 				);
-				if (hasState) {
+				if (Option.isSome(stateDefOption)) {
 					// Provide the SubscriptionRef under the user's typed
 					// `ActorState` tag so `yield* MyState` inside the build
 					// effect resolves to a `SubscriptionRef<S["Type"]>`.

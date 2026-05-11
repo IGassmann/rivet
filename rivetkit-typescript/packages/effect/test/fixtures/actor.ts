@@ -129,14 +129,21 @@ export const Scale = Action.make("Scale", {
 	error: ScaledOverflowError,
 });
 
-export const PersistedTotal = Action.make("PersistedTotal", {
+export const PersistAndSleep = Action.make("PersistAndSleep", {
 	payload: { amount: Schema.Number },
 	success: Schema.Number,
 });
 
-export const PersistAndSleep = Action.make("PersistAndSleep", {
-	payload: { amount: Schema.Number },
-	success: Schema.Number,
+export const PersistDateAndSleep = Action.make("PersistDateAndSleep", {
+	payload: { when: Schema.DateFromString },
+	success: Schema.Date,
+});
+
+export const GetPersistedState = Action.make("GetPersistedState", {
+	success: Schema.Struct({
+		count: Schema.Number,
+		when: Schema.DateFromString,
+	}),
 });
 
 export const Counter = Actor.make("Counter", {
@@ -150,16 +157,18 @@ export const Counter = Actor.make("Counter", {
 		WakeGreeting,
 		Compute,
 		Scale,
-		PersistedTotal,
 		PersistAndSleep,
+		PersistDateAndSleep,
+		GetPersistedState,
 	],
 });
 
 const CounterState = ActorState.make("CounterState", {
 	schema: Schema.Struct({
 		count: Schema.Number,
+		when: Schema.DateFromString,
 	}),
-	initial: () => ({ count: 0 }),
+	initial: () => ({ count: 0, when: new Date() }),
 });
 
 export const CounterLive = Counter.toLayer(
@@ -222,19 +231,31 @@ export const CounterLive = Counter.toLayer(
 					// and payload codec sites firing on both sides.
 					return payload.amount + 100;
 				}),
-			PersistedTotal: ({ payload }) =>
-				SubscriptionRef.updateAndGet(state, (s) => ({
-					count: s.count + payload.amount,
-				})).pipe(Effect.map((s) => s.count)),
 			PersistAndSleep: ({ payload }) =>
 				Effect.gen(function* () {
 					const { count } = yield* SubscriptionRef.updateAndGet(
 						state,
-						(s) => ({ count: s.count + payload.amount }),
+						(s) => ({
+							...s,
+							count: s.count + payload.amount,
+						}),
 					);
 					yield* sleep;
 					return count;
 				}),
+			PersistDateAndSleep: ({ payload }) =>
+				Effect.gen(function* () {
+					const { when } = yield* SubscriptionRef.updateAndGet(
+						state,
+						(s) => ({
+							...s,
+							when: payload.when,
+						}),
+					);
+					yield* sleep;
+					return when;
+				}),
+			GetPersistedState: () => SubscriptionRef.get(state),
 		});
 	}),
 	{ state: CounterState },

@@ -100,15 +100,52 @@ layer(TestLayer)("end-to-end", (it) => {
 					until: (n) => n === 0,
 					schedule: Schedule.spaced("100 millis"),
 				}),
-				Effect.timeout("10 seconds"),
 				TestClock.withLive,
 			);
 			assert.strictEqual(inMemoryAfterWake, 0);
 
-			const persistedAfterWake = yield* counter.PersistedTotal({
-				amount: 0,
+			const persistedAfterWake = yield* counter.GetPersistedState();
+			assert.strictEqual(persistedAfterWake.count, 11);
+		}),
+	);
+
+	it.effect("persists state with a non-trivial schema (Date)", () =>
+		Effect.gen(function* () {
+			const counter = (yield* Counter.client).getOrCreate([
+				"t-persist-state-date",
+			]);
+
+			// Bump the in-memory `Ref` so we can later assert that
+			// the wake actually rebuilt the actor (the ref should
+			// reset to 0 on each wake).
+			yield* counter.Increment({ amount: 7 });
+
+			const when = new Date("2024-01-15T10:30:00.000Z");
+			const beforeSleep = yield* counter.PersistDateAndSleep({
+				when,
 			});
-			assert.strictEqual(persistedAfterWake, 11);
+			assert.strictEqual(beforeSleep.toISOString(), when.toISOString());
+
+			// Engine-side sleep teardown is asynchronous. `count`
+			// is `Ref.make(0)` per wake, so seeing 0 is the deterministic
+			// signal that the prior wake torn down and a fresh one started.
+			// `TestClock.withLive` swaps in the real Clock for the duration
+			// of the poll so the schedule's interval and the timeout both
+			// elapse in wall time (the suite otherwise runs under TestClock).
+			const inMemoryAfterWake = yield* counter.GetCount().pipe(
+				Effect.repeat({
+					until: (n) => n === 0,
+					schedule: Schedule.spaced("100 millis"),
+				}),
+				TestClock.withLive,
+			);
+			assert.strictEqual(inMemoryAfterWake, 0);
+
+			const persistedAfterWake = yield* counter.GetPersistedState();
+			assert.strictEqual(
+				persistedAfterWake.when.toISOString(),
+				when.toISOString(),
+			);
 		}),
 	);
 
