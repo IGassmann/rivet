@@ -67,8 +67,8 @@ layer(TestLayer)("end-to-end", (it) => {
 			]);
 
 			// Bump the in-memory `Ref` so we can later assert that
-			// the wake actually rebuilt the actor (the ref resets
-			// to 0 on each wake).
+			// the wake actually rebuilt the actor (the ref should
+			// reset to 0 on each wake).
 			yield* counter.Increment({ amount: 7 });
 
 			const beforeSleep = yield* counter.PersistAndSleep({
@@ -76,14 +76,12 @@ layer(TestLayer)("end-to-end", (it) => {
 			});
 			assert.strictEqual(beforeSleep, 11);
 
-			// Engine-side sleep teardown is asynchronous and the SDK
-			// exposes no "actor slept" hook today, so poll the
-			// post-condition. `count` is `Ref.make(0)` per wake, so
-			// seeing 0 is the deterministic signal that the prior
-			// wake torn down and a fresh one started. `TestClock.withLive`
-			// swaps in the real Clock for the duration of the poll so
-			// the schedule's interval and the timeout both elapse in
-			// wall time (the suite otherwise runs under TestClock).
+			// Engine-side sleep teardown is asynchronous. `count`
+			// is `Ref.make(0)` per wake, so seeing 0 is the deterministic
+			// signal that the prior wake torn down and a fresh one started.
+			// `TestClock.withLive` swaps in the real Clock for the duration
+			// of the poll so the schedule's interval and the timeout both
+			// elapse in wall time (the suite otherwise runs under TestClock).
 			const inMemoryAfterWake = yield* counter.GetCount().pipe(
 				Effect.repeat({
 					until: (n) => n === 0,
@@ -94,10 +92,6 @@ layer(TestLayer)("end-to-end", (it) => {
 			);
 			assert.strictEqual(inMemoryAfterWake, 0);
 
-			// `+ 0` is a no-op increment whose return value is the
-			// freshly-loaded persisted total. Anything other than
-			// 11 means either the write didn't durably land before
-			// sleep or the load on wake didn't seed the ref.
 			const persistedAfterWake = yield* counter.PersistedTotal({
 				amount: 0,
 			});
@@ -331,7 +325,10 @@ layer(TestLayer)("end-to-end", (it) => {
 				const parent = onTrace[i].parent;
 				assert.strictEqual(parent._tag, "Some");
 				if (parent._tag === "Some") {
-					assert.strictEqual(parent.value.spanId, onTrace[i - 1].spanId);
+					assert.strictEqual(
+						parent.value.spanId,
+						onTrace[i - 1].spanId,
+					);
 				}
 			}
 		}),
