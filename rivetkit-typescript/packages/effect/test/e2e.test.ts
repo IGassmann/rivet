@@ -60,6 +60,19 @@ layer(TestLayer)("end-to-end", (it) => {
 		}),
 	);
 
+	it.effect("isolates in-wake state across keys", () =>
+		Effect.gen(function* () {
+			const client = yield* Counter.client;
+			const a = client.getOrCreate(["t-iso-a"]);
+			const b = client.getOrCreate(["t-iso-b"]);
+			yield* a.Increment({ amount: 2 });
+			yield* a.Increment({ amount: 3 });
+			yield* b.Increment({ amount: 1 });
+			assert.strictEqual(yield* a.GetCount(), 5);
+			assert.strictEqual(yield* b.GetCount(), 1);
+		}),
+	);
+
 	it.effect("persists state across a sleep/wake cycle", () =>
 		Effect.gen(function* () {
 			const counter = (yield* Counter.client).getOrCreate([
@@ -96,19 +109,6 @@ layer(TestLayer)("end-to-end", (it) => {
 				amount: 0,
 			});
 			assert.strictEqual(persistedAfterWake, 11);
-		}),
-	);
-
-	it.effect("isolates in-wake state across keys", () =>
-		Effect.gen(function* () {
-			const client = yield* Counter.client;
-			const a = client.getOrCreate(["t-iso-a"]);
-			const b = client.getOrCreate(["t-iso-b"]);
-			yield* a.Increment({ amount: 2 });
-			yield* a.Increment({ amount: 3 });
-			yield* b.Increment({ amount: 1 });
-			assert.strictEqual(yield* a.GetCount(), 5);
-			assert.strictEqual(yield* b.GetCount(), 1);
 		}),
 	);
 
