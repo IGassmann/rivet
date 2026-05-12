@@ -2,6 +2,7 @@ import { assert, layer } from "@effect/vitest";
 import { Effect, Layer, Schedule } from "effect";
 import { TestClock } from "effect/testing";
 import { Registry, RivetError } from "@rivetkit/effect";
+import { inject } from "vitest";
 import {
 	BuildSetRejected,
 	BuildSetRejectedLive,
@@ -22,6 +23,17 @@ import {
 	WakeDecodeFailLive,
 } from "./fixtures/actor";
 import { TestTracer } from "./fixtures/tracer";
+import { prepareNamespace, waitForEnvoy } from "./shared-engine";
+
+// Each test file talks to the shared engine spawned in globalSetup
+// against a unique namespace + runner pool, so envoy registrations
+// from prior files (or prior test runs) cannot pollute this file's
+// actor routing. The namespace is created and the pool's runner
+// config is upserted before `Registry.test` registers the in-process
+// envoy at `.start()`.
+const { endpoint, token, namespace, poolName } = await prepareNamespace(
+	inject("rivetEngine").endpoint,
+);
 
 const GreeterLive = Layer.succeed(
 	Greeter,
@@ -38,21 +50,36 @@ const GreeterLive = Layer.succeed(
 // itself sees it too.
 const MultiplierLive = Layer.succeed(Multiplier, Multiplier.of({ factor: 2 }));
 
-const TestLayer = Registry.test.pipe(
+// Block test execution until the in-process envoy has registered
+// against the engine's pool view. `rivetkitRegistry.start()` returns
+// before that registration round-trip completes, and the first
+// action call against an empty pool would otherwise burn the entire
+// per-test timeout waiting on the engine.
+const ReadyForEnvoy = Layer.effectDiscard(
+	Effect.tryPromise(() => waitForEnvoy(endpoint, namespace, poolName)).pipe(
+		Effect.orDie,
+	),
+);
+
+const TestLayer = ReadyForEnvoy.pipe(
 	Layer.provideMerge(
-		Layer.mergeAll(
-			CounterLive,
-			PingerLive,
-			FailingActorLive,
-			StrictLive,
-			WakeDecodeFailLive,
-			BuildSetRejectedLive,
+		Registry.test.pipe(
+			Layer.provideMerge(
+				Layer.mergeAll(
+					CounterLive,
+					PingerLive,
+					FailingActorLive,
+					StrictLive,
+					WakeDecodeFailLive,
+					BuildSetRejectedLive,
+				),
+			),
+			Layer.provide(GreeterLive),
+			Layer.provideMerge(MultiplierLive),
+			Layer.provideMerge(TestTracer.layer()),
+			Layer.provide(Registry.layer({ endpoint, token, namespace })),
 		),
 	),
-	Layer.provide(GreeterLive),
-	Layer.provideMerge(MultiplierLive),
-	Layer.provideMerge(TestTracer.layer()),
-	Layer.provide(Registry.layer()),
 );
 
 layer(TestLayer)("end-to-end", (it) => {

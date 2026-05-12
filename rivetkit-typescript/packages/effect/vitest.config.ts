@@ -19,12 +19,13 @@ export default defineConfig({
 	test: {
 		...defaultConfig.test,
 		env,
-		// The in-process Rivet engine binds to a fixed port; serialize
-		// test files. Use the default fork pool (per-test isolation) so
-		// each test gets a fresh process and a clean engine envoy state.
+		// One rivet-engine is shared across all test files in this suite.
+		// Each file creates its own namespace + runner pool against it, so
+		// envoy registrations from one file can't pollute another. We
+		// still serialize files for now because `Registry.test` registers
+		// an in-process envoy that binds local ports.
 		fileParallelism: false,
 		sequence: { concurrent: false },
-		// Kill any orphaned engine + clear state before the suite runs.
-		globalSetup: ["./test/globalSetup.ts"],
+		globalSetup: ["./test/global-setup.ts"],
 	},
 });
