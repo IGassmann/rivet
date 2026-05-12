@@ -42,7 +42,7 @@ interface RegistryEntry<
 > {
 	readonly actor: Actor.Actor<Name, Actions>;
 	readonly buildHandlers: Effect.Effect<Handlers, never, RX>;
-	readonly options?: Actor.Options<State>;
+	readonly options: Actor.Options<State>;
 }
 
 type ActorInstance = {
@@ -327,8 +327,8 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 		};
 	}
 
-	const actorOptions = options ? Actor.splitOptions(options) : undefined;
-	const stateDef = actorOptions?.effectOptions.state;
+	const { effectOptions, rivetkitOptions } = Actor.splitOptions(options);
+	const stateDef = effectOptions.state;
 	const stateDefOption = Option.fromNullishOr(stateDef);
 	const stateInitialValue = Option.isSome(stateDefOption)
 		? yield* Schema.encodeUnknownEffect(stateDef.schema)(
@@ -338,7 +338,7 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 
 	return Rivetkit.actor({
 		actions,
-		options: actorOptions?.rivetkitOptions,
+		options: rivetkitOptions,
 		// rivetkit invokes this once at create time and seeds c.state
 		// with the result. We delegate to the user-supplied `initialValue`
 		// factory so primitive states (e.g. `Schema.Number`) don't need

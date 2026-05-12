@@ -190,7 +190,7 @@ const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 	>(
 		this: Actor<string, Actions>,
 		build: Handlers | Effect.Effect<Handlers, never, RX>,
-		options?: Options<State>,
+		options: Options<State> = {},
 	) {
 		return Registry.Registry.asEffect().pipe(
 			Effect.flatMap((registry) =>
