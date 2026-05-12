@@ -1,4 +1,12 @@
-import { Context, Effect, Ref, Schema, SchemaTransformation } from "effect";
+import {
+	Context,
+	Effect,
+	Option,
+	Ref,
+	Schema,
+	SchemaIssue,
+	SchemaTransformation,
+} from "effect";
 import { Action, Actor, ActorState, State } from "@rivetkit/effect";
 
 // --- Counter ---
@@ -292,6 +300,62 @@ export const CounterLive = Counter.toLayer(
 	{ state: CounterState },
 );
 
+// --- Strict ---
+
+// State schema that rejects negative values. Used to exercise the
+// typed-error channel on `State` writes: encoding a negative through
+// `State.set` fails with `SchemaError`, which now flows through the
+// handler effect instead of dying as a defect.
+const StrictState = ActorState.make("StrictState", {
+	schema: Schema.Number.pipe(Schema.check(Schema.isGreaterThanOrEqualTo(0))),
+	initialValue: () => 0,
+});
+
+// Catches the `SchemaError` from `State.set` and reports the outcome.
+// Proves a handler can react to a schema failure that originates inside
+// the State layer — the new behavior since `State<A, E, R>` carries `E`.
+export const StrictSet = Action.make("StrictSet", {
+	payload: { value: Schema.Number },
+	success: Schema.Literals(["ok", "rejected"]),
+});
+
+// Lets the `SchemaError` propagate. The registry's catch-encode-die
+// path converts it to a `RivetError` on the wire — same shape an
+// unhandled defect would have produced before this change.
+export const StrictSetUnhandled = Action.make("StrictSetUnhandled", {
+	payload: { value: Schema.Number },
+	success: Schema.Number,
+});
+
+export const StrictGet = Action.make("StrictGet", {
+	success: Schema.Number,
+});
+
+export const Strict = Actor.make("Strict", {
+	actions: [StrictSet, StrictSetUnhandled, StrictGet],
+});
+
+export const StrictLive = Strict.toLayer(
+	Effect.gen(function* () {
+		const state = yield* StrictState;
+		return Strict.of({
+			StrictSet: ({ payload }) =>
+				State.set(state, payload.value).pipe(
+					Effect.match({
+						onFailure: () => "rejected" as const,
+						onSuccess: () => "ok" as const,
+					}),
+				),
+			StrictSetUnhandled: ({ payload }) =>
+				State.set(state, payload.value).pipe(
+					Effect.as(payload.value),
+				),
+			StrictGet: () => State.get(state),
+		});
+	}),
+	{ state: StrictState },
+);
+
 // --- Pinger ---
 
 // Minimal second actor used solely to assert that the registry serves
@@ -323,3 +387,84 @@ export const FailingActorLive = FailingActor.toLayer(
 export const Echo = Action.make("Echo", { success: Schema.String });
 
 export const Unregistered = Actor.make("Unregistered", { actions: [Echo] });
+
+// --- WakeDecodeFail ---
+
+// Schema whose encode is permissive (identity) but whose decode rejects
+// negatives. Used to plant an "invalid" value into `c.state` that the
+// next wake's `State.make` initial-read decode will reject.
+const PermissiveEncodeStrictDecode = Schema.Number.pipe(
+	Schema.decodeTo(
+		Schema.Number,
+		SchemaTransformation.transformOrFail({
+			decode: (n: number) =>
+				n >= 0
+					? Effect.succeed(n)
+					: Effect.fail(
+							new SchemaIssue.InvalidValue(Option.some(n), {
+								message: "decode rejects negative",
+							}),
+						),
+			encode: (n: number) => Effect.succeed(n),
+		}),
+	),
+);
+
+const WakeDecodeFailState = ActorState.make("WakeDecodeFailState", {
+	schema: PermissiveEncodeStrictDecode,
+	// `-1` encodes successfully (encode is identity) so registry setup
+	// passes; but the wake-time decode rejects it, so State.make's
+	// initial read inside the build effect dies.
+	initialValue: () => -1,
+});
+
+export const WakeDecodeFail = Actor.make("WakeDecodeFail", {
+	actions: [Ping],
+});
+
+export const WakeDecodeFailLive = WakeDecodeFail.toLayer(
+	Effect.gen(function* () {
+		const _state = yield* WakeDecodeFailState;
+		return WakeDecodeFail.of({
+			Ping: () => Effect.succeed("never reached"),
+		});
+	}),
+	{ state: WakeDecodeFailState },
+);
+
+// --- BuildSetRejected ---
+
+// Strict schema rejecting negatives on encode. The build effect below
+// deliberately calls `State.set` with a value the schema rejects,
+// catches the resulting `SchemaError` via `Effect.match`, and exposes
+// the outcome via `BuildOutcome`. Demonstrates that the new typed-`E`
+// channel on `State` is observable inside the wake-scope build effect,
+// not just inside action handlers.
+const StrictForBuildState = ActorState.make("StrictForBuildState", {
+	schema: Schema.Number.pipe(Schema.check(Schema.isGreaterThanOrEqualTo(0))),
+	initialValue: () => 0,
+});
+
+export const BuildOutcome = Action.make("BuildOutcome", {
+	success: Schema.Literals(["wrote", "rejected"]),
+});
+
+export const BuildSetRejected = Actor.make("BuildSetRejected", {
+	actions: [BuildOutcome],
+});
+
+export const BuildSetRejectedLive = BuildSetRejected.toLayer(
+	Effect.gen(function* () {
+		const state = yield* StrictForBuildState;
+		const wrote = yield* State.set(state, -1).pipe(
+			Effect.match({
+				onFailure: () => false,
+				onSuccess: () => true,
+			}),
+		);
+		return BuildSetRejected.of({
+			BuildOutcome: () => Effect.succeed(wrote ? "wrote" : "rejected"),
+		});
+	}),
+	{ state: StrictForBuildState },
+);

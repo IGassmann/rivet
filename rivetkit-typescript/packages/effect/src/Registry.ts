@@ -55,7 +55,7 @@ type ActorInstance = {
 		}) => Effect.Effect<unknown, unknown>
 	>;
 	readonly scope: Scope.Closeable;
-	readonly state: Option.Option<State.State<unknown>>;
+	readonly state: Option.Option<State.State<unknown, Schema.SchemaError>>;
 };
 
 export interface Registry {
@@ -371,21 +371,24 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 						? Option.some(
 								// `c.state` IS the state — `State` is just a typed
 								// view + change stream over it. Effect-typed
-								// read/write so async schema transforms work.
-								// `Schema.Top`'s requirements show up as
-								// `unknown`; the captured `services` context
-								// satisfies them at runtime, so we erase R at
-								// the boundary.
+								// read/write so async schema transforms work,
+								// and `SchemaError` flows through `State.get` /
+								// `set` / `update` to action handlers. The
+								// wake-time initial read still dies if persisted
+								// state can't be decoded — no caller exists yet
+								// to handle it. `Schema.Top`'s requirements show
+								// up as `unknown`; the captured `services`
+								// context satisfies them at runtime, so we erase
+								// R at the boundary.
 								(yield* State.make(
 									() =>
 										Schema.decodeUnknownEffect(
 											stateDef.schema,
-										)(c.state).pipe(Effect.orDie),
+										)(c.state),
 									(next) =>
 										Schema.encodeUnknownEffect(
 											stateDef.schema,
 										)(next).pipe(
-											Effect.orDie,
 											Effect.tap((encoded) =>
 												Effect.sync(() => {
 													c.state = encoded;
@@ -393,7 +396,10 @@ const toRivetkitActor = Effect.fnUntraced(function* (
 											),
 											Effect.asVoid,
 										),
-								)) as State.State<unknown>,
+								).pipe(Effect.orDie)) as State.State<
+									unknown,
+									Schema.SchemaError
+								>,
 							)
 						: Option.none();
 

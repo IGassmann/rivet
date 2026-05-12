@@ -1,4 +1,4 @@
-import { Context, type Schema } from "effect";
+import { Context, Schema } from "effect";
 import type * as State from "./State";
 
 const TypeId = "~@rivetkit/effect/ActorState";
@@ -15,7 +15,10 @@ const TypeId = "~@rivetkit/effect/ActorState";
 export interface ActorState<
 	in out Name extends string,
 	in out S extends Schema.Top,
-> extends Context.Service<ActorState<Name, S>, State.State<S["Type"]>> {
+> extends Context.Service<
+		ActorState<Name, S>,
+		State.State<S["Type"], Schema.SchemaError>
+	> {
 	readonly [TypeId]: typeof TypeId;
 	readonly _tag: Name;
 	readonly schema: S;
@@ -35,7 +38,8 @@ export interface Any {
  * Used by the runtime to seed `c.state` and provide the `State` under
  * the state's tag.
  */
-export interface AnyWithProps extends Context.Service<any, State.State<any>> {
+export interface AnyWithProps
+	extends Context.Service<any, State.State<any, Schema.SchemaError>> {
 	readonly [TypeId]: typeof TypeId;
 	readonly _tag: string;
 	readonly schema: Schema.Top;
@@ -68,9 +72,10 @@ export const make = <Name extends string, S extends Schema.Top>(
 	name: Name,
 	options: { readonly schema: S; readonly initialValue: () => S["Type"] },
 ): ActorState<Name, S> => {
-	const tag = Context.Service<ActorState<Name, S>, State.State<S["Type"]>>(
-		`@rivetkit/effect/ActorState/${name}`,
-	) as ActorState<Name, S>;
+	const tag = Context.Service<
+		ActorState<Name, S>,
+		State.State<S["Type"], Schema.SchemaError>
+	>(`@rivetkit/effect/ActorState/${name}`) as ActorState<Name, S>;
 	(tag as any)[TypeId] = TypeId;
 	(tag as any)._tag = name;
 	(tag as any).schema = options.schema;

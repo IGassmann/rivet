@@ -37,14 +37,16 @@ const TypeId = "~@rivetkit/effect/State";
  * A view over a persisted state cell with a subscribable change stream.
  *
  * - `A` — the value type
+ * - `E` — the read/write closures' failure type (e.g. a schema's
+ *         `SchemaError` when read/write decode/encode against a schema)
  * - `R` — the read/write closures' service requirements
  */
-export interface State<in out A, out R = never>
-	extends State.Variance<A, R>,
+export interface State<in out A, out E = never, out R = never>
+	extends State.Variance<A, E, R>,
 		Pipeable.Pipeable,
 		Inspectable.Inspectable {
-	readonly read: () => Effect.Effect<A, never, R>;
-	readonly write: (value: A) => Effect.Effect<void, never, R>;
+	readonly read: () => Effect.Effect<A, E, R>;
+	readonly write: (value: A) => Effect.Effect<void, E, R>;
 	readonly pubsub: PubSub.PubSub<A>;
 	/**
 	 * Serializes writes (`set`, `update`, `modify`) so the read/apply/
@@ -56,13 +58,14 @@ export interface State<in out A, out R = never>
 	readonly semaphore: Semaphore.Semaphore;
 }
 
-export const isState = (u: unknown): u is State<unknown> =>
+export const isState = (u: unknown): u is State<unknown, unknown> =>
 	Predicate.hasProperty(u, TypeId);
 
 export declare namespace State {
-	export interface Variance<in out A, out R> {
+	export interface Variance<in out A, out E, out R> {
 		readonly [TypeId]: {
 			readonly _A: Types.Invariant<A>;
+			readonly _E: Types.Covariant<E>;
 			readonly _R: Types.Covariant<R>;
 		};
 	}
@@ -71,8 +74,8 @@ export declare namespace State {
 const Proto = {
 	...Pipeable.Prototype,
 	...Inspectable.BaseProto,
-	[TypeId]: { _A: identity, _R: identity },
-	toJSON(this: State<unknown, unknown>) {
+	[TypeId]: { _A: identity, _E: identity, _R: identity },
+	toJSON(this: State<unknown, unknown, unknown>) {
 		return { _id: "State" };
 	},
 };
@@ -88,10 +91,10 @@ const Proto = {
  * The PubSub is not explicitly shut down — it's reclaimed by GC when
  * the `State` and any subscribers become unreachable.
  */
-export const make = <A, R>(
-	read: () => Effect.Effect<A, never, R>,
-	write: (value: A) => Effect.Effect<void, never, R>,
-): Effect.Effect<State<A, R>, never, R> =>
+export const make = <A, E, R>(
+	read: () => Effect.Effect<A, E, R>,
+	write: (value: A) => Effect.Effect<void, E, R>,
+): Effect.Effect<State<A, E, R>, E, R> =>
 	Effect.gen(function* () {
 		const pubsub = yield* PubSub.unbounded<A>({ replay: 1 });
 		const initial = yield* read();
@@ -107,7 +110,7 @@ export const make = <A, R>(
 /**
  * Reads the current value.
  */
-export const get = <A, R>(self: State<A, R>): Effect.Effect<A, never, R> =>
+export const get = <A, E, R>(self: State<A, E, R>): Effect.Effect<A, E, R> =>
 	self.read();
 
 /**
@@ -115,11 +118,11 @@ export const get = <A, R>(self: State<A, R>): Effect.Effect<A, never, R> =>
  * happen in invocation order.
  */
 export const set: {
-	<A>(value: A): <R>(self: State<A, R>) => Effect.Effect<void, never, R>;
-	<A, R>(self: State<A, R>, value: A): Effect.Effect<void, never, R>;
+	<A>(value: A): <E, R>(self: State<A, E, R>) => Effect.Effect<void, E, R>;
+	<A, E, R>(self: State<A, E, R>, value: A): Effect.Effect<void, E, R>;
 } = dual(
 	2,
-	<A, R>(self: State<A, R>, value: A): Effect.Effect<void, never, R> =>
+	<A, E, R>(self: State<A, E, R>, value: A): Effect.Effect<void, E, R> =>
 		Semaphore.withPermit(self.semaphore, self.write(value)),
 );
 
@@ -130,11 +133,17 @@ export const set: {
 export const update: {
 	<A>(
 		f: (a: A) => A,
-	): <R>(self: State<A, R>) => Effect.Effect<void, never, R>;
-	<A, R>(self: State<A, R>, f: (a: A) => A): Effect.Effect<void, never, R>;
+	): <E, R>(self: State<A, E, R>) => Effect.Effect<void, E, R>;
+	<A, E, R>(
+		self: State<A, E, R>,
+		f: (a: A) => A,
+	): Effect.Effect<void, E, R>;
 } = dual(
 	2,
-	<A, R>(self: State<A, R>, f: (a: A) => A): Effect.Effect<void, never, R> =>
+	<A, E, R>(
+		self: State<A, E, R>,
+		f: (a: A) => A,
+	): Effect.Effect<void, E, R> =>
 		Semaphore.withPermit(
 			self.semaphore,
 			Effect.flatMap(self.read(), (a) => self.write(f(a))),
@@ -146,11 +155,13 @@ export const update: {
  * read/apply/write triple is atomic across fibers.
  */
 export const updateAndGet: {
-	<A>(f: (a: A) => A): <R>(self: State<A, R>) => Effect.Effect<A, never, R>;
-	<A, R>(self: State<A, R>, f: (a: A) => A): Effect.Effect<A, never, R>;
+	<A>(
+		f: (a: A) => A,
+	): <E, R>(self: State<A, E, R>) => Effect.Effect<A, E, R>;
+	<A, E, R>(self: State<A, E, R>, f: (a: A) => A): Effect.Effect<A, E, R>;
 } = dual(
 	2,
-	<A, R>(self: State<A, R>, f: (a: A) => A): Effect.Effect<A, never, R> =>
+	<A, E, R>(self: State<A, E, R>, f: (a: A) => A): Effect.Effect<A, E, R> =>
 		Semaphore.withPermit(
 			self.semaphore,
 			Effect.flatMap(self.read(), (a) => {
@@ -168,17 +179,17 @@ export const updateAndGet: {
 export const modify: {
 	<A, B>(
 		f: (a: A) => readonly [B, A],
-	): <R>(self: State<A, R>) => Effect.Effect<B, never, R>;
-	<A, R, B>(
-		self: State<A, R>,
+	): <E, R>(self: State<A, E, R>) => Effect.Effect<B, E, R>;
+	<A, E, R, B>(
+		self: State<A, E, R>,
 		f: (a: A) => readonly [B, A],
-	): Effect.Effect<B, never, R>;
+	): Effect.Effect<B, E, R>;
 } = dual(
 	2,
-	<A, R, B>(
-		self: State<A, R>,
+	<A, E, R, B>(
+		self: State<A, E, R>,
 		f: (a: A) => readonly [B, A],
-	): Effect.Effect<B, never, R> =>
+	): Effect.Effect<B, E, R> =>
 		Semaphore.withPermit(
 			self.semaphore,
 			Effect.flatMap(self.read(), (a) => {
@@ -193,7 +204,7 @@ export const modify: {
  * immediately see the most recent value (replay = 1), then every
  * subsequent publish.
  */
-export const changes = <A, R>(self: State<A, R>): Stream.Stream<A> =>
+export const changes = <A, E, R>(self: State<A, E, R>): Stream.Stream<A> =>
 	Stream.fromPubSub(self.pubsub);
 
 /**
@@ -201,11 +212,11 @@ export const changes = <A, R>(self: State<A, R>): Stream.Stream<A> =>
  * modify the underlying store.
  */
 export const publish: {
-	<A>(value: A): <R>(self: State<A, R>) => Effect.Effect<boolean>;
-	<A, R>(self: State<A, R>, value: A): Effect.Effect<boolean>;
+	<A>(value: A): <E, R>(self: State<A, E, R>) => Effect.Effect<boolean>;
+	<A, E, R>(self: State<A, E, R>, value: A): Effect.Effect<boolean>;
 } = dual(
 	2,
-	<A, R>(self: State<A, R>, value: A): Effect.Effect<boolean> =>
+	<A, E, R>(self: State<A, E, R>, value: A): Effect.Effect<boolean> =>
 		PubSub.publish(self.pubsub, value),
 );
 
@@ -215,5 +226,7 @@ export const publish: {
  * uses this from rivetkit's `onStateChange` callback to feed the
  * change stream.
  */
-export const publishUnsafe = <A, R>(self: State<A, R>, value: A): boolean =>
-	PubSub.publishUnsafe(self.pubsub, value);
+export const publishUnsafe = <A, E, R>(
+	self: State<A, E, R>,
+	value: A,
+): boolean => PubSub.publishUnsafe(self.pubsub, value);

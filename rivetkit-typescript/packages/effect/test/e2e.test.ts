@@ -3,6 +3,8 @@ import { Effect, Layer, Schedule } from "effect";
 import { TestClock } from "effect/testing";
 import { Registry, RivetError } from "@rivetkit/effect";
 import {
+	BuildSetRejected,
+	BuildSetRejectedLive,
 	Counter,
 	CounterLive,
 	CounterOverflowError,
@@ -13,7 +15,11 @@ import {
 	Pinger,
 	PingerLive,
 	ScaledOverflowError,
+	Strict,
+	StrictLive,
 	Unregistered,
+	WakeDecodeFail,
+	WakeDecodeFailLive,
 } from "./fixtures/actor";
 import { TestTracer } from "./fixtures/tracer";
 
@@ -34,7 +40,14 @@ const MultiplierLive = Layer.succeed(Multiplier, Multiplier.of({ factor: 2 }));
 
 const TestLayer = Registry.test.pipe(
 	Layer.provideMerge(
-		Layer.mergeAll(CounterLive, PingerLive, FailingActorLive),
+		Layer.mergeAll(
+			CounterLive,
+			PingerLive,
+			FailingActorLive,
+			StrictLive,
+			WakeDecodeFailLive,
+			BuildSetRejectedLive,
+		),
 	),
 	Layer.provide(GreeterLive),
 	Layer.provideMerge(MultiplierLive),
@@ -228,6 +241,47 @@ layer(TestLayer)("end-to-end", (it) => {
 		}),
 	);
 
+	it.effect("handler can catch a State.set schema-encode failure", () =>
+		Effect.gen(function* () {
+			const strict = (yield* Strict.client).getOrCreate([
+				"t-strict-handled",
+			]);
+			// A passing value writes through and reports "ok".
+			assert.strictEqual(yield* strict.StrictSet({ value: 5 }), "ok");
+			// A failing value (negative — rejected by the state schema's
+			// `isGreaterThanOrEqualTo(0)` check on encode) surfaces as a
+			// typed `SchemaError` through `State.set`; the handler
+			// catches it via `Effect.match` and reports "rejected".
+			// Before `State<A, E, R>` carried `E`, this failure would
+			// have died as a defect and the handler had no way to
+			// observe it.
+			assert.strictEqual(
+				yield* strict.StrictSet({ value: -5 }),
+				"rejected",
+			);
+			// And the prior write of 5 stuck (the rejected -5 never
+			// touched `c.state`).
+			assert.strictEqual(yield* strict.StrictGet(), 5);
+		}),
+	);
+
+	it.effect(
+		"unhandled State.set schema-encode failure surfaces as RivetError",
+		() =>
+			Effect.gen(function* () {
+				const strict = (yield* Strict.client).getOrCreate([
+					"t-strict-unhandled",
+				]);
+				const exit = yield* strict
+					.StrictSetUnhandled({ value: -5 })
+					.pipe(Effect.flip, Effect.exit);
+				assert.isTrue(exit._tag === "Success");
+				if (exit._tag === "Success") {
+					assert.instanceOf(exit.value, RivetError.RivetError);
+				}
+			}),
+	);
+
 	it.effect.skip(
 		"surfaces an expected handler error back into the original error",
 		() =>
@@ -366,6 +420,32 @@ layer(TestLayer)("end-to-end", (it) => {
 			if (exit._tag === "Success") {
 				assert.instanceOf(exit.value, RivetError.RivetError);
 			}
+		}),
+	);
+
+	it.effect(
+		"State.make initial-read decode failure inside build effect surfaces as RivetError",
+		() =>
+			Effect.gen(function* () {
+				const failing = (yield* WakeDecodeFail.client).getOrCreate([
+					"t-wake-decode-fail",
+				]);
+				const exit = yield* failing
+					.Ping()
+					.pipe(Effect.flip, Effect.exit);
+				assert.isTrue(exit._tag === "Success");
+				if (exit._tag === "Success") {
+					assert.instanceOf(exit.value, RivetError.RivetError);
+				}
+			}),
+	);
+
+	it.effect("build effect can catch a State.set schema-encode failure", () =>
+		Effect.gen(function* () {
+			const a = (yield* BuildSetRejected.client).getOrCreate([
+				"t-build-set-rejected",
+			]);
+			assert.strictEqual(yield* a.BuildOutcome(), "rejected");
 		}),
 	);
 

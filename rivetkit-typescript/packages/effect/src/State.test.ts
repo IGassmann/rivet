@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
-import { Effect, PubSub, Stream } from "effect";
+import { Effect, Exit, PubSub, Stream } from "effect";
 import * as State from "./State";
 
 // Helper: build a State backed by a plain mutable cell, with
@@ -7,7 +7,7 @@ import * as State from "./State";
 // `decodeUnknownEffect` / `encodeUnknownEffect` over `c.state`.
 const makeCellState = <A>(initial: A) => {
 	const cell = { value: initial };
-	return State.make<A, never>(
+	return State.make<A, never, never>(
 		() => Effect.sync(() => cell.value),
 		(v) =>
 			Effect.sync(() => {
@@ -146,6 +146,36 @@ describe("State", () => {
 
 			yield* s.pipe(State.update((n) => n * 2));
 			assert.strictEqual(yield* State.get(s), 10);
+		}),
+	);
+
+	it.effect("read failure propagates through get", () =>
+		Effect.gen(function* () {
+			const reads = { count: 0 };
+			// Construction reads once to seed the pubsub; subsequent reads
+			// fail. Mirrors a schema mismatch on persisted state.
+			const s = yield* State.make<number, "boom", never>(
+				() =>
+					Effect.suspend(() => {
+						reads.count++;
+						if (reads.count === 1) return Effect.succeed(0);
+						return Effect.fail("boom" as const);
+					}),
+				() => Effect.void,
+			);
+			const exit = yield* Effect.exit(State.get(s));
+			assert.isTrue(Exit.isFailure(exit));
+		}),
+	);
+
+	it.effect("write failure propagates through set", () =>
+		Effect.gen(function* () {
+			const s = yield* State.make<number, "boom", never>(
+				() => Effect.succeed(0),
+				() => Effect.fail("boom" as const),
+			);
+			const exit = yield* Effect.exit(State.set(s, 1));
+			assert.isTrue(Exit.isFailure(exit));
 		}),
 	);
 });
