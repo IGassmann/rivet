@@ -11,6 +11,7 @@ import {
 	CounterOverflowError,
 	FailingActor,
 	FailingActorLive,
+	Flags,
 	Greeter,
 	Multiplier,
 	Pinger,
@@ -74,6 +75,7 @@ const TestLayer = ReadyForEnvoy.pipe(
 					BuildSetRejectedLive,
 				),
 			),
+			Layer.provideMerge(Flags.layer),
 			Layer.provide(GreeterLive),
 			Layer.provideMerge(MultiplierLive),
 			Layer.provideMerge(TestTracer.layer()),
@@ -432,7 +434,37 @@ layer(TestLayer)("end-to-end", (it) => {
 			}),
 	);
 
-	it.todo("fires the wake-scope finalizer on sleep");
+	it.effect("fires the wake-scope finalizer on sleep", () =>
+		Effect.gen(function* () {
+			const key = "t-wake-finalizer";
+			const counter = (yield* Counter.client).getOrCreate([key]);
+			// `Flags` is shared across all tests in the suite, so the
+			// `Counter` build effect namespaces its finalizer flag by
+			// actor key.
+			const flagName = `finalizer:${key}`;
+
+			const flags = yield* Flags;
+			assert.strictEqual(flags.get(flagName), undefined);
+
+			yield* counter.PersistAndSleep({ amount: 1 });
+
+			// `c.sleep()` is a non-blocking signal: the action returns
+			// before the engine tears the wake scope down. Poll the
+			// flag until the wake-scope finalizer has run. `TestClock.withLive`
+			// swaps in the real Clock so the schedule's interval elapses
+			// in wall time (the suite otherwise runs under TestClock).
+			const finalizerFired = yield* Effect.sync(() =>
+				flags.get(flagName),
+			).pipe(
+				Effect.repeat({
+					until: (v) => v === true,
+					schedule: Schedule.spaced("100 millis"),
+				}),
+				TestClock.withLive,
+			);
+			assert.strictEqual(finalizerFired, true);
+		}),
+	);
 
 	it.effect("surfaces an error thrown inside an actor's build effect", () =>
 		Effect.gen(function* () {

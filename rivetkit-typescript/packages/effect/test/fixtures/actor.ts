@@ -1,6 +1,7 @@
 import {
 	Context,
 	Effect,
+	Layer,
 	Option,
 	Ref,
 	Schema,
@@ -18,6 +19,12 @@ export class CounterOverflowError extends Schema.TaggedErrorClass<CounterOverflo
 		message: Schema.String,
 	},
 ) {}
+
+export class Flags extends Context.Service<Flags>()("Flags", {
+	make: Effect.sync(() => new Map<string, boolean | string>()),
+}) {
+	static readonly layer = Layer.effect(Flags, this.make);
+}
 
 /**
  * A non-built-in service used by `Counter` to verify that user-provided
@@ -202,12 +209,24 @@ export const CounterLive = Counter.toLayer(
 	Effect.gen(function* () {
 		const state = yield* CounterState;
 		const count = yield* Ref.make(0);
-		// Wake-scope yield of a non-built-in service. Resolved once per
-		// wake; the captured value is closed over by `WakeGreeting`.
+		const flags = yield* Flags;
+		flags.set("on wake", true);
 		const greeter = yield* Greeter;
 		const wakeGreeting = greeter.greet("on wake");
 
 		const sleep = yield* Actor.Sleep;
+		// `Flags` is a process-wide Map shared across all tests in the
+		// suite, so the finalizer flag must be namespaced by actor key
+		// to keep cross-test wake/sleep cycles from leaking into each
+		// other's assertions.
+		const address = yield* Actor.CurrentAddress;
+		const finalizerFlag = `finalizer:${address.key.join("/")}`;
+
+		yield* Effect.addFinalizer(() =>
+			Effect.sync(() => {
+				flags.set(finalizerFlag, true);
+			}),
+		);
 
 		return Counter.of({
 			Increment: ({ payload }) =>
@@ -287,10 +306,13 @@ export const CounterLive = Counter.toLayer(
 				}),
 			PersistScaledAndSleep: ({ payload }) =>
 				Effect.gen(function* () {
-					const { scaled } = yield* State.updateAndGet(state, (s) => ({
-						...s,
-						scaled: payload.amount,
-					}));
+					const { scaled } = yield* State.updateAndGet(
+						state,
+						(s) => ({
+							...s,
+							scaled: payload.amount,
+						}),
+					);
 					yield* sleep;
 					return scaled;
 				}),
@@ -347,9 +369,7 @@ export const StrictLive = Strict.toLayer(
 					}),
 				),
 			StrictSetUnhandled: ({ payload }) =>
-				State.set(state, payload.value).pipe(
-					Effect.as(payload.value),
-				),
+				State.set(state, payload.value).pipe(Effect.as(payload.value)),
 			StrictGet: () => State.get(state),
 		});
 	}),
