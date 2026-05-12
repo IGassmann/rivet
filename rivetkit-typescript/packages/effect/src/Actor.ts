@@ -6,6 +6,7 @@ import {
 	Predicate,
 	Schema,
 	Scope,
+	Struct,
 } from "effect";
 import * as Rivetkit from "rivetkit";
 import * as Registry from "./Registry";
@@ -20,9 +21,16 @@ const TypeId = "~@rivetkit/effect/Actor";
 export const isActor = (u: unknown): u is Actor<any, any> =>
 	Predicate.hasProperty(u, TypeId);
 
+const rivetkitActorOptionsKeys = [
+	"name",
+	"icon",
+] as const satisfies ReadonlyArray<
+	keyof NonNullable<Rivetkit.ActorOptionsInput>
+>;
+
 export type RivetkitActorOptions = Pick<
 	NonNullable<Rivetkit.ActorOptionsInput>,
-	"name" | "icon"
+	(typeof rivetkitActorOptionsKeys)[number]
 >;
 
 /**
@@ -37,13 +45,10 @@ export type Options<State extends ActorState.AnyWithProps> =
 
 export const splitOptions = <State extends ActorState.AnyWithProps>(
 	options: Options<State>,
-): {
-	readonly rivetkitOptions: RivetkitActorOptions;
-	readonly effectOptions: Omit<Options<State>, keyof RivetkitActorOptions>;
-} => {
-	const { state, ...rivetkitOptions } = options;
-	return { rivetkitOptions, effectOptions: { state } };
-};
+) => ({
+	rivetkitOptions: Struct.pick(options, rivetkitActorOptionsKeys),
+	effectOptions: Struct.omit(options, rivetkitActorOptionsKeys),
+});
 
 /**
  * Per-instance identity carried inside the wake scope. An actor
