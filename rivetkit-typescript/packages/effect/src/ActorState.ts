@@ -39,7 +39,10 @@ export interface Any {
  * the state's tag.
  */
 export interface AnyWithProps
-	extends Context.Service<any, State.State<any, Schema.SchemaError>> {
+	extends Context.Service<
+		any,
+		State.State<any, Schema.SchemaError, unknown>
+	> {
 	readonly [TypeId]: typeof TypeId;
 	readonly _tag: string;
 	readonly schema: Schema.Top;

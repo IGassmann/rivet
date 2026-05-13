@@ -7,14 +7,23 @@ import {
 	Schema,
 	Scope,
 	Struct,
+	Record,
+	MutableHashMap,
+	Option,
+	Tracer,
+	Exit,
+	Cause,
+	Semaphore,
 } from "effect";
 import * as Rivetkit from "rivetkit";
+import { hasStringProperty } from "./utils";
 import * as Registry from "./Registry";
 import type * as Action from "./Action";
 import type * as ActorState from "./ActorState";
 import * as Client from "./Client";
+import * as State from "./State";
 import * as RivetError from "./RivetError";
-import { rpcSystem } from "./internal/tracing";
+import { readTraceMeta, rpcSystem } from "./internal/tracing";
 
 const TypeId = "~@rivetkit/effect/Actor";
 
@@ -43,7 +52,7 @@ export type Options<State extends ActorState.AnyWithProps> =
 		readonly state?: State;
 	};
 
-export const splitOptions = <State extends ActorState.AnyWithProps>(
+const splitOptions = <State extends ActorState.AnyWithProps>(
 	options: Options<State>,
 ) => ({
 	rivetkitOptions: Struct.pick(options, rivetkitActorOptionsKeys),
@@ -183,7 +192,7 @@ export type HandlersFrom<Action extends Action.Any> = {
 const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 	[TypeId]: TypeId,
 	toLayer<
-		Actions extends Action.Any,
+		Actions extends Action.AnyWithProps,
 		Handlers extends HandlersFrom<Actions>,
 		State extends ActorState.AnyWithProps = never,
 		RX = never,
@@ -192,15 +201,24 @@ const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 		build: Handlers | Effect.Effect<Handlers, never, RX>,
 		options: Options<State> = {},
 	) {
-		return Registry.Registry.asEffect().pipe(
-			Effect.flatMap((registry) =>
-				registry.register({
-					actor: this,
-					buildHandlers: Effect.isEffect(build)
-						? build
-						: Effect.succeed(build),
-					options,
-				}),
+		return makeRivetkitActor({
+			actor: this,
+			buildHandlers: Effect.isEffect(build)
+				? build
+				: Effect.succeed(build),
+			options,
+		}).pipe(
+			Effect.flatMap((rivetKitActor) =>
+				Registry.Registry.asEffect().pipe(
+					Effect.flatMap((registry) =>
+						Effect.sync(() =>
+							registry.rivetkitActors.set(
+								this.name,
+								rivetKitActor,
+							),
+						),
+					),
+				),
 			),
 			Layer.effectDiscard,
 		);
@@ -320,3 +338,257 @@ export const make = <
 	self.actions = options?.actions;
 	return self;
 };
+
+const makeRivetkitActor = Effect.fnUntraced(function* <
+	Name extends string,
+	Actions extends Action.AnyWithProps,
+	Handlers extends HandlersFrom<Actions>,
+	RX,
+	State extends ActorState.AnyWithProps = never,
+>({
+	actor,
+	buildHandlers,
+	options,
+}: {
+	readonly actor: Actor<Name, Actions>;
+	readonly buildHandlers: Effect.Effect<Handlers, never, RX>;
+	readonly options: Options<State>;
+}) {
+	// Snapshot the current Effect context so action callbacks
+	// (which run in rivetkit's plain Promise world) can run
+	// handler effects against the same services the Registry.start /
+	// Registry.test layer was provided with.
+	const services = yield* Effect.context<any>();
+
+	const { effectOptions, rivetkitOptions } = splitOptions(options);
+	const stateDef = effectOptions.state;
+	const stateDefOption = Option.fromNullishOr(stateDef);
+	const stateInitialValue = Option.isSome(stateDefOption)
+		? yield* Schema.encodeUnknownEffect(stateDefOption.value.schema)(
+				stateDefOption.value.initialValue(),
+			).pipe(Effect.orDie)
+		: undefined;
+
+	const instances = MutableHashMap.empty<
+		string,
+		{
+			readonly handlers: Handlers;
+			readonly scope: Scope.Closeable;
+			readonly state: Option.Option<
+				State.State<
+					State["schema"]["Type"],
+					Schema.SchemaError,
+					unknown
+				>
+			>;
+		}
+	>();
+
+	const onWake = async (
+		c: Rivetkit.WakeContextOf<Rivetkit.AnyActorDefinition>,
+	) => {
+		await Effect.runPromiseWith(services)(
+			Effect.gen(function* () {
+				const scope = yield* Scope.make();
+
+				const state = Option.isSome(stateDefOption)
+					? Option.some(
+							// `c.state` IS the state — `State` is just a typed
+							// view + change stream over it. Effect-typed
+							// read/write so async schema transforms work,
+							// and `SchemaError` flows through `State.get` /
+							// `set` / `update` to action handlers. The
+							// wake-time initial read still dies if persisted
+							// state can't be decoded — no caller exists yet
+							// to handle it. `Schema.Top`'s requirements show
+							// up as `unknown`; the captured `services`
+							// context satisfies them at runtime, so we erase
+							// R at the boundary.
+							yield* State.make(
+								() =>
+									Schema.decodeUnknownEffect(
+										stateDefOption.value.schema,
+									)(c.state),
+								(next) =>
+									Schema.encodeUnknownEffect(
+										stateDefOption.value.schema,
+									)(next).pipe(
+										Effect.tap((encoded) =>
+											Effect.sync(() => {
+												c.state = encoded;
+											}),
+										),
+										Effect.asVoid,
+									),
+							).pipe(Effect.orDie),
+						)
+					: Option.none();
+
+				const context = Context.mergeAll(
+					Context.make(CurrentAddress, {
+						actorId: c.actorId,
+						name: c.name,
+						key: c.key,
+					}),
+					Context.make(Scope.Scope, scope),
+					Context.make(
+						Sleep,
+						Effect.sync(() => c.sleep()),
+					),
+					Option.match(state, {
+						onNone: () => Context.empty(),
+						onSome: (s) =>
+							Context.make(Option.getOrThrow(stateDefOption), s),
+					}),
+				);
+
+				const handlers = yield* buildHandlers.pipe(
+					Effect.provide(context),
+				);
+
+				yield* Effect.sync(() =>
+					MutableHashMap.set(instances, c.actorId, {
+						handlers,
+						scope,
+						state,
+					}),
+				);
+			}),
+		);
+	};
+
+	const actions = Record.fromIterableWith(actor.actions, (action) => {
+		const decodePayload = Schema.decodeUnknownEffect(action.payloadSchema);
+		const encodeSuccess = Schema.encodeUnknownEffect(action.successSchema);
+		const encodeError = Schema.encodeUnknownEffect(action.errorSchema);
+		return [
+			action._tag,
+			async (
+				c: Rivetkit.ActionContextOf<Rivetkit.AnyActorDefinition>,
+				payload: Action.Payload<typeof action>,
+				meta?: Client.ActionMeta, // TODO: Find better type
+			) => {
+				// Always wrap in a server-side span so the handler has a
+				// live `currentSpan` even when the caller didn't ship trace
+				// context (e.g. a non-Effect-SDK client). When trace context
+				// is present, reattach it as the parent so the server span
+				// joins the caller's trace.
+				const rpcMethod = `${actor.name}/${action._tag}`;
+				const traceMeta = readTraceMeta(meta);
+
+				const exit = await Effect.runPromiseExitWith(services)(
+					Effect.gen(function* () {
+						const instance = yield* MutableHashMap.get(
+							instances,
+							c.actorId,
+						).pipe(Effect.fromOption, Effect.orDie);
+						const actionHandler = instance.handlers[action._tag];
+						const decoded = yield* decodePayload(payload).pipe(
+							Effect.orDie,
+						);
+						const result = yield* actionHandler({
+							_tag: action._tag,
+							action,
+							payload: decoded,
+						}).pipe(
+							Effect.catch((expectedError) =>
+								Effect.gen(function* () {
+									const error = yield* encodeError(
+										expectedError,
+									).pipe(Effect.orDie);
+									return yield* Effect.die(
+										new Rivetkit.UserError(
+											hasStringProperty("message")(error)
+												? error.message
+												: `${action._tag} failed`,
+											{
+												code: hasStringProperty("_tag")(
+													error,
+												)
+													? error._tag
+													: undefined,
+												metadata: error,
+											},
+										),
+									);
+								}),
+							),
+						);
+						return yield* encodeSuccess(result).pipe(Effect.orDie);
+					}).pipe(
+						Effect.withSpan(rpcMethod, {
+							parent: traceMeta
+								? Tracer.externalSpan(traceMeta)
+								: undefined,
+							kind: "server",
+							attributes: {
+								"rpc.system.name": rpcSystem,
+								"rpc.method": rpcMethod,
+							},
+						}),
+					),
+				);
+
+				if (Exit.isSuccess(exit)) return exit.value;
+				throw Cause.squash(exit.cause);
+			},
+		];
+	});
+
+	const onStateChange = (
+		c: Rivetkit.WakeContextOf<Rivetkit.AnyActorDefinition>,
+		newState: unknown,
+	) => {
+		void Effect.runForkWith(services)(
+			Effect.gen(function* () {
+				if (Option.isNone(stateDefOption)) return;
+
+				const instance = yield* MutableHashMap.get(
+					instances,
+					c.actorId,
+				).pipe(Effect.fromOption, Effect.orDie);
+
+				if (Option.isNone(instance.state)) return;
+
+				const stateRef = instance.state.value;
+				yield* Semaphore.withPermit(
+					stateRef.semaphore,
+					Effect.gen(function* () {
+						const decoded = yield* Schema.decodeUnknownEffect(
+							stateDefOption.value.schema,
+						)(newState).pipe(Effect.orDie);
+						State.publishUnsafe(stateRef, decoded);
+					}),
+				);
+			}),
+		);
+	};
+
+	const onSleep = async (
+		c: Rivetkit.SleepContextOf<Rivetkit.AnyActorDefinition>,
+	) => {
+		await Effect.runPromiseWith(services)(
+			Effect.gen(function* () {
+				const instance = yield* MutableHashMap.get(
+					instances,
+					c.actorId,
+				).pipe(Effect.fromOption, Effect.orDie);
+				yield* Scope.close(instance.scope, Exit.void);
+				yield* Effect.sync(() => {
+					MutableHashMap.remove(c.actorId);
+				});
+			}),
+		);
+	};
+
+	return Rivetkit.actor({
+		options: rivetkitOptions,
+		onWake,
+		...(Option.isSome(stateDefOption)
+			? { createState: () => stateInitialValue }
+			: {}),
+		actions,
+		onStateChange,
+		onSleep,
+	});
+});
