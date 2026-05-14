@@ -22,7 +22,7 @@ import {
 	Unregistered,
 	WakeDecodeFail,
 	WakeDecodeFailLive,
-} from "./fixtures/actor";
+} from "./fixtures/actors";
 import { TestTracer } from "./fixtures/tracer";
 import { prepareNamespace, waitForEnvoy } from "./shared-engine";
 
