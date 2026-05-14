@@ -27,6 +27,10 @@ import { readTraceMeta, rpcSystem } from "./internal/tracing";
 
 const TypeId = "~@rivetkit/effect/Actor";
 
+const decodeRivetErrorFromWire = Schema.decodeUnknownEffect(
+	RivetError.RivetErrorFromWire,
+);
+
 export const isActor = (u: unknown): u is Actor<any, any> =>
 	Predicate.hasProperty(u, TypeId);
 
@@ -340,11 +344,6 @@ export const make = <
 	self.actions = options?.actions;
 	return self;
 };
-
-const eraseStateSchemaServices = <StateDef extends ActorState.AnyWithProps>(
-	state: State.State<unknown, Schema.SchemaError, unknown>,
-): State.State<StateDef["schema"]["Type"], Schema.SchemaError> =>
-	state as State.State<StateDef["schema"]["Type"], Schema.SchemaError>;
 
 const makeRivetkitActor = Effect.fnUntraced(function* <
 	Name extends string,
