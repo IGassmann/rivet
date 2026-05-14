@@ -243,6 +243,15 @@ const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 					for (const action of actions) {
 						const tag = action._tag;
 						const rpcMethod = `${self.name}/${tag}`;
+						const encodePayload = Schema.encodeUnknownEffect(
+							action.payloadSchema,
+						);
+						const decodeSuccess = Schema.decodeUnknownEffect(
+							action.successSchema,
+						);
+						const decodeError = Schema.decodeUnknownEffect(
+							action.errorSchema,
+						);
 						// `Effect.fn` wraps the generator in a span named
 						// `rpcMethod` (kind=client + OTel `rpc.*` attrs)
 						// without an extra `pipe(Effect.withSpan(...))`.
@@ -259,9 +268,6 @@ const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 								"rpc.method": rpcMethod,
 							},
 						})(function* (payload: unknown) {
-							const encoded = yield* Schema.encodeUnknownEffect(
-								action.payloadSchema,
-							)(payload);
 							const span = yield* Effect.currentSpan;
 							const meta: Client.ActionMeta = {
 								trace: {
@@ -275,7 +281,8 @@ const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 									actorName: self.name,
 									key,
 									actionName: tag,
-									encodedPayload: encoded,
+									encodedPayload:
+										yield* encodePayload(payload),
 									meta,
 								})
 								.pipe(
@@ -283,9 +290,7 @@ const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 									// wire metadata. Fall back to wrapping
 									// the raw RivetError via `RivetErrorFromWire`.
 									Effect.catch((rivetErr) =>
-										Schema.decodeUnknownEffect(
-											action.errorSchema,
-										)(
+										decodeError(
 											(rivetErr as { metadata?: unknown })
 												.metadata,
 										).pipe(
@@ -293,9 +298,7 @@ const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 												onSuccess: (typed) =>
 													Effect.fail(typed),
 												onFailure: () =>
-													Schema.decodeUnknownEffect(
-														RivetError.RivetErrorFromWire,
-													)({
+													decodeRivetErrorFromWire({
 														group: rivetErr.group,
 														code: rivetErr.code,
 														message:
@@ -314,9 +317,7 @@ const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 										),
 									),
 								);
-							return yield* Schema.decodeUnknownEffect(
-								action.successSchema,
-							)(raw);
+							return yield* decodeSuccess(raw);
 						}) as (p: unknown) => Effect.Effect<unknown, unknown>;
 					}
 					return handle as Handle<Action.AnyWithProps>;
@@ -369,10 +370,14 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 	const { effectOptions, rivetkitOptions } = splitOptions(options);
 	const stateDef = effectOptions.state;
 	const stateDefOption = Option.fromNullishOr(stateDef);
+	const stateCodec = Option.map(stateDefOption, (def) => ({
+		decode: Schema.decodeUnknownEffect(def.schema),
+		encode: Schema.encodeUnknownEffect(def.schema),
+	}));
 	const stateInitialValue = Option.isSome(stateDefOption)
-		? yield* Schema.encodeUnknownEffect(stateDefOption.value.schema)(
-				stateDefOption.value.initialValue(),
-			).pipe(Effect.orDie)
+		? yield* Option.getOrThrow(stateCodec)
+				.encode(stateDefOption.value.initialValue())
+				.pipe(Effect.orDie)
 		: undefined;
 
 	const instances = MutableHashMap.empty<
@@ -393,7 +398,7 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 			Effect.gen(function* () {
 				const scope = yield* Scope.make();
 
-				const state = Option.isSome(stateDefOption)
+				const state = Option.isSome(stateCodec)
 					? Option.some(
 							// `c.state` IS the state — `State` is just a typed
 							// view + change stream over it. Effect-typed
@@ -407,14 +412,9 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 							// context satisfies them at runtime, so we erase
 							// R at the boundary.
 							(yield* State.make(
-								() =>
-									Schema.decodeUnknownEffect(
-										stateDefOption.value.schema,
-									)(c.state),
+								() => stateCodec.value.decode(c.state),
 								(next) =>
-									Schema.encodeUnknownEffect(
-										stateDefOption.value.schema,
-									)(next).pipe(
+									stateCodec.value.encode(next).pipe(
 										Effect.tap((encoded) =>
 											Effect.sync(() => {
 												c.state = encoded;
@@ -559,7 +559,7 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 	) => {
 		void Effect.runForkWith(services)(
 			Effect.gen(function* () {
-				if (Option.isNone(stateDefOption)) return;
+				if (Option.isNone(stateCodec)) return;
 
 				const instance = yield* MutableHashMap.get(
 					instances,
@@ -572,9 +572,9 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 				yield* Semaphore.withPermit(
 					stateRef.semaphore,
 					Effect.gen(function* () {
-						const decoded = yield* Schema.decodeUnknownEffect(
-							stateDefOption.value.schema,
-						)(newState).pipe(Effect.orDie);
+						const decoded = yield* stateCodec.value
+							.decode(newState)
+							.pipe(Effect.orDie);
 						State.publishUnsafe(stateRef, decoded);
 					}),
 				);
