@@ -484,16 +484,28 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 							instances,
 							c.actorId,
 						).pipe(Effect.fromOption, Effect.orDie);
-						const actionHandler =
-							instance.actionHandlers[action._tag];
+						// The handler map is keyed by the same action
+						// definitions being registered here, but
+						// TypeScript loses that relationship once the
+						// actions are widened into the RivetKit actions
+						// record.
+						const actionHandler = instance.actionHandlers[
+							action._tag as keyof ActionHandlers
+						] as (
+							envelope: ActionRequest<typeof action>,
+						) => Action.ResultFrom<typeof action, any>;
 						const decoded = yield* decodePayload(payload).pipe(
 							Effect.orDie,
 						);
-						const result = yield* actionHandler({
+						// The payload was decoded with this action's schema,
+						// so this is the runtime boundary that restores the
+						// typed envelope expected by the user handler.
+						const actionRequest = {
 							_tag: action._tag,
 							action,
 							payload: decoded,
-						}).pipe(
+						} as ActionRequest<typeof action>;
+						const result = yield* actionHandler(actionRequest).pipe(
 							Effect.catch((expectedError) =>
 								Effect.gen(function* () {
 									const error = yield* encodeError(
