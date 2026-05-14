@@ -102,13 +102,13 @@ export type ActionRequest<A extends Action.Any> =
 			}
 		: never;
 
-type HandlerServices<Handlers> = {
-	readonly [Name in keyof Handlers]: Handlers[Name] extends (
+type ActionHandlerServices<ActionHandlers> = {
+	readonly [Name in keyof ActionHandlers]: ActionHandlers[Name] extends (
 		...args: ReadonlyArray<any>
 	) => Effect.Effect<any, any, infer R>
 		? R
 		: never;
-}[keyof Handlers];
+}[keyof ActionHandlers];
 
 export type ActorKeyParam = string | Rivetkit.ActorKey;
 
@@ -147,20 +147,22 @@ export interface Actor<
 	readonly name: Name;
 	readonly actions: ReadonlyArray<Actions>;
 
-	of<Handlers extends HandlersFrom<Actions>>(handlers: Handlers): Handlers;
+	of<ActionHandlers extends ActionHandlersFrom<Actions>>(
+		actionHandlers: ActionHandlers,
+	): ActionHandlers;
 
 	toLayer<
-		Handlers extends HandlersFrom<Actions>,
+		ActionHandlers extends ActionHandlersFrom<Actions>,
 		State extends ActorState.AnyWithProps = never,
 		RX = never,
 	>(
-		build: Handlers | Effect.Effect<Handlers, never, RX>,
+		build: ActionHandlers | Effect.Effect<ActionHandlers, never, RX>,
 		options?: Options<State>,
 	): Layer.Layer<
 		never,
 		never,
 		| Exclude<RX, Scope.Scope | CurrentAddress | Sleep | State>
-		| HandlerServices<Handlers>
+		| ActionHandlerServices<ActionHandlers>
 		| Action.ServicesServer<Actions>
 		| Action.ServicesClient<Actions>
 		| Registry.Registry
@@ -183,27 +185,27 @@ export interface Actor<
 
 export type Any = Actor<string, Action.AnyWithProps>;
 
-export type HandlersFrom<Action extends Action.Any> = {
-	readonly [Current in Action as Current["_tag"]]: (
-		envelope: ActionRequest<Current>,
-	) => Action.ResultFrom<Current, any>;
+export type ActionHandlersFrom<Actions extends Action.Any> = {
+	readonly [Action in Actions as Action["_tag"]]: (
+		envelope: ActionRequest<Action>,
+	) => Action.ResultFrom<Action, any>;
 };
 
 const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 	[TypeId]: TypeId,
 	toLayer<
 		Actions extends Action.AnyWithProps,
-		Handlers extends HandlersFrom<Actions>,
+		ActionHandlers extends ActionHandlersFrom<Actions>,
 		State extends ActorState.AnyWithProps = never,
 		RX = never,
 	>(
 		this: Actor<string, Actions>,
-		build: Handlers | Effect.Effect<Handlers, never, RX>,
+		build: ActionHandlers | Effect.Effect<ActionHandlers, never, RX>,
 		options: Options<State> = {},
 	) {
 		return makeRivetkitActor({
 			actor: this,
-			buildHandlers: Effect.isEffect(build)
+			buildActionHandlers: Effect.isEffect(build)
 				? build
 				: Effect.succeed(build),
 			options,
@@ -342,16 +344,16 @@ export const make = <
 const makeRivetkitActor = Effect.fnUntraced(function* <
 	Name extends string,
 	Actions extends Action.AnyWithProps,
-	Handlers extends HandlersFrom<Actions>,
+	ActionHandlers extends ActionHandlersFrom<Actions>,
 	RX,
 	State extends ActorState.AnyWithProps = never,
 >({
 	actor,
-	buildHandlers,
+	buildActionHandlers,
 	options,
 }: {
 	readonly actor: Actor<Name, Actions>;
-	readonly buildHandlers: Effect.Effect<Handlers, never, RX>;
+	readonly buildActionHandlers: Effect.Effect<ActionHandlers, never, RX>;
 	readonly options: Options<State>;
 }) {
 	// Snapshot the current Effect context so action callbacks
@@ -372,7 +374,7 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 	const instances = MutableHashMap.empty<
 		string,
 		{
-			readonly handlers: Handlers;
+			readonly actionHandlers: ActionHandlers;
 			readonly scope: Scope.Closeable;
 			readonly state: Option.Option<
 				State.State<
@@ -442,13 +444,13 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 					}),
 				);
 
-				const handlers = yield* buildHandlers.pipe(
+				const actionHandlers = yield* buildActionHandlers.pipe(
 					Effect.provide(context),
 				);
 
 				yield* Effect.sync(() =>
 					MutableHashMap.set(instances, c.actorId, {
-						handlers,
+						actionHandlers,
 						scope,
 						state,
 					}),
@@ -482,7 +484,8 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 							instances,
 							c.actorId,
 						).pipe(Effect.fromOption, Effect.orDie);
-						const actionHandler = instance.handlers[action._tag];
+						const actionHandler =
+							instance.actionHandlers[action._tag];
 						const decoded = yield* decodePayload(payload).pipe(
 							Effect.orDie,
 						);
