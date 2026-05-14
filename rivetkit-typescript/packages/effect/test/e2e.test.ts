@@ -588,4 +588,71 @@ layer(TestLayer)("end-to-end", (it) => {
 			}
 		}),
 	);
+
+	it.effect("writes through the db captured from RivetkitContext", () =>
+		Effect.gen(function* () {
+			const counter = (yield* Counter.client).getOrCreate(["t-db-write"]);
+			const afterFirst = yield* counter.LogEvent({ event: "alpha" });
+			const afterSecond = yield* counter.LogEvent({ event: "beta" });
+			assert.strictEqual(afterFirst, 1);
+			assert.strictEqual(afterSecond, 2);
+		}),
+	);
+
+	it.effect("reads rows back through the captured db", () =>
+		Effect.gen(function* () {
+			const counter = (yield* Counter.client).getOrCreate(["t-db-list"]);
+			yield* counter.LogEvent({ event: "one" });
+			yield* counter.LogEvent({ event: "two" });
+			yield* counter.LogEvent({ event: "three" });
+			const events = yield* counter.ListEvents();
+			assert.deepStrictEqual(events, ["one", "two", "three"]);
+		}),
+	);
+
+	it.effect("isolates db state across actor keys", () =>
+		Effect.gen(function* () {
+			const client = yield* Counter.client;
+			const a = client.getOrCreate(["t-db-iso-a"]);
+			const b = client.getOrCreate(["t-db-iso-b"]);
+			yield* a.LogEvent({ event: "a1" });
+			yield* a.LogEvent({ event: "a2" });
+			yield* b.LogEvent({ event: "b1" });
+			assert.strictEqual(yield* a.CountEvents(), 2);
+			assert.strictEqual(yield* b.CountEvents(), 1);
+			assert.deepStrictEqual(yield* a.ListEvents(), ["a1", "a2"]);
+			assert.deepStrictEqual(yield* b.ListEvents(), ["b1"]);
+		}),
+	);
+
+	it.effect("persists db rows across a sleep/wake cycle", () =>
+		Effect.gen(function* () {
+			const counter = (yield* Counter.client).getOrCreate([
+				"t-db-persist",
+			]);
+			yield* counter.LogEvent({ event: "before-sleep" });
+
+			// `PersistAndSleep` signals `c.sleep()` after writing state; the
+			// engine tears the wake scope down asynchronously. The
+			// `in-memory Ref` resets to 0 on the next wake, so polling
+			// `GetCount` until it reads 0 is the deterministic signal that
+			// a fresh wake started. `TestClock.withLive` runs the poll in
+			// wall time since the suite otherwise drives `TestClock`.
+			yield* counter.PersistAndSleep({ amount: 1 });
+			const inMemoryAfterWake = yield* counter.GetCount().pipe(
+				Effect.repeat({
+					until: (n) => n === 0,
+					schedule: Schedule.spaced("100 millis"),
+				}),
+				TestClock.withLive,
+			);
+			assert.strictEqual(inMemoryAfterWake, 0);
+
+			yield* counter.LogEvent({ event: "after-wake" });
+			assert.deepStrictEqual(yield* counter.ListEvents(), [
+				"before-sleep",
+				"after-wake",
+			]);
+		}),
+	);
 });

@@ -16,6 +16,7 @@ import {
 	Semaphore,
 } from "effect";
 import * as Rivetkit from "rivetkit";
+import type * as RivetkitDb from "rivetkit/db";
 import { hasStringProperty } from "./utils";
 import * as Registry from "./Registry";
 import type * as Action from "./Action";
@@ -54,6 +55,7 @@ export type RivetkitActorOptions = Pick<
 export type Options<State extends ActorState.AnyWithProps> =
 	Readonly<RivetkitActorOptions> & {
 		readonly state?: State;
+		readonly db?: RivetkitDb.AnyDatabaseProvider;
 	};
 
 const splitOptions = <State extends ActorState.AnyWithProps>(
@@ -91,6 +93,11 @@ export class CurrentAddress extends Context.Service<
 export class Sleep extends Context.Service<Sleep, Effect.Effect<void>>()(
 	"@rivetkit/effect/Actor/Sleep",
 ) {}
+
+export class RivetkitContext extends Context.Service<
+	RivetkitContext,
+	Rivetkit.RunContextOf<Rivetkit.AnyActorDefinition>
+>()("@rivetkit/effect/Actor/RivetkitContext") {}
 
 export type ActionRequest<A extends Action.Any> =
 	A extends Action.Action<
@@ -165,7 +172,10 @@ export interface Actor<
 	): Layer.Layer<
 		never,
 		never,
-		| Exclude<RX, Scope.Scope | CurrentAddress | Sleep | State>
+		| Exclude<
+				RX,
+				Scope.Scope | CurrentAddress | Sleep | RivetkitContext | State
+		  >
 		| ActionHandlerServices<ActionHandlers>
 		| Action.ServicesServer<Actions>
 		| Action.ServicesClient<Actions>
@@ -434,6 +444,7 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 						Sleep,
 						Effect.sync(() => c.sleep()),
 					),
+					Context.make(RivetkitContext, c),
 					Option.match(state, {
 						onNone: () => Context.empty(),
 						onSome: (s) =>
@@ -595,6 +606,7 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 
 	return Rivetkit.actor({
 		options: rivetkitOptions,
+		...(effectOptions.db ? { db: effectOptions.db } : {}),
 		onWake,
 		...(Option.isSome(stateDefOption)
 			? {

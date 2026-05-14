@@ -9,6 +9,7 @@ import {
 	SchemaTransformation,
 } from "effect";
 import { Action, Actor, ActorState, State } from "@rivetkit/effect";
+import { db, type RawAccess } from "rivetkit/db";
 
 // --- Counter ---
 
@@ -166,6 +167,19 @@ export const GetPersistedState = Action.make("GetPersistedState", {
 	}),
 });
 
+export const LogEvent = Action.make("LogEvent", {
+	payload: { event: Schema.String },
+	success: Schema.Number,
+});
+
+export const ListEvents = Action.make("ListEvents", {
+	success: Schema.Array(Schema.String),
+});
+
+export const CountEvents = Action.make("CountEvents", {
+	success: Schema.Number,
+});
+
 export const Counter = Actor.make("Counter", {
 	actions: [
 		Increment,
@@ -182,6 +196,9 @@ export const Counter = Actor.make("Counter", {
 		PersistTagsAndSleep,
 		PersistScaledAndSleep,
 		GetPersistedState,
+		LogEvent,
+		ListEvents,
+		CountEvents,
 	],
 });
 
@@ -215,6 +232,13 @@ export const CounterLive = Counter.toLayer(
 		const wakeGreeting = greeter.greet("on wake");
 
 		const sleep = yield* Actor.Sleep;
+		// `RivetkitContext`'s `db` widens to `any` against
+		// `RunContextOf<AnyActorDefinition>`. The provider configured on
+		// `Counter.toLayer` below is the `rivetkit/db` raw-access factory,
+		// so re-narrow to `RawAccess` for typed `execute` calls inside
+		// handler closures.
+		const ctx = yield* Actor.RivetkitContext;
+		const db = ctx.db as RawAccess;
 		// `Flags` is a process-wide Map shared across all tests in the
 		// suite, so the finalizer flag must be namespaced by actor key
 		// to keep cross-test wake/sleep cycles from leaking into each
@@ -317,9 +341,55 @@ export const CounterLive = Counter.toLayer(
 					return scaled;
 				}),
 			GetPersistedState: () => State.get(state),
+			// Per-actor SQLite is provisioned via the `db:` option on
+			// `Counter.toLayer` below. The build effect destructures `db`
+			// from `Actor.RivetkitContext`, so handlers reach SQLite
+			// through the captured client without going through `c.db`.
+			LogEvent: ({ payload }) =>
+				Effect.tryPromise(async () => {
+					await db.execute(
+						"INSERT INTO events (event, created_at) VALUES (?, ?)",
+						payload.event,
+						Date.now(),
+					);
+					const rows = await db.execute<{ count: number }>(
+						"SELECT COUNT(*) as count FROM events",
+					);
+					return rows[0]?.count ?? 0;
+				}).pipe(Effect.orDie),
+			ListEvents: () =>
+				Effect.tryPromise(async () => {
+					const rows = await db.execute<{ event: string }>(
+						"SELECT event FROM events ORDER BY id ASC",
+					);
+					return rows.map((r) => r.event);
+				}).pipe(Effect.orDie),
+			CountEvents: () =>
+				Effect.tryPromise(async () => {
+					const rows = await db.execute<{ count: number }>(
+						"SELECT COUNT(*) as count FROM events",
+					);
+					return rows[0]?.count ?? 0;
+				}).pipe(Effect.orDie),
 		});
 	}),
-	{ state: CounterState },
+	{
+		state: CounterState,
+		// Migration runs once before the wake-scope build effect, so the
+		// destructured `db` is already pointed at a migrated database
+		// when handlers capture it.
+		db: db({
+			onMigrate: async (client) => {
+				await client.execute(`
+					CREATE TABLE IF NOT EXISTS events (
+						id INTEGER PRIMARY KEY AUTOINCREMENT,
+						event TEXT NOT NULL,
+						created_at INTEGER NOT NULL
+					)
+				`);
+			},
+		}),
+	},
 );
 
 // --- Strict ---
