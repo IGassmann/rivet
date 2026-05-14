@@ -7,7 +7,7 @@ const TypeId = "~@rivetkit/effect/Registry";
 
 export type Options = Pick<
 	Rivetkit.RegistryConfigInput<Rivetkit.RegistryActors>,
-	"endpoint" | "token" | "namespace"
+	"endpoint" | "token" | "namespace" | "envoy"
 >;
 
 export interface Registry {
@@ -96,6 +96,10 @@ export const test: Layer.Layer<Client, never, Registry> = Layer.effect(
 				RivetkitClient.createClient({
 					...registry.options,
 					endpoint: registry.options.endpoint ?? resolvedEndpoint,
+					// `RegistryConfigInput` nests pool under `envoy.poolName`
+					// but the client schema reads `poolName` at the top
+					// level, so propagate it explicitly.
+					poolName: registry.options.envoy?.poolName,
 				}),
 			),
 			(c) => Effect.promise(() => c.dispose()),

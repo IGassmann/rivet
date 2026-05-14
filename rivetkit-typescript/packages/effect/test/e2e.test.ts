@@ -79,7 +79,14 @@ const TestLayer = ReadyForEnvoy.pipe(
 			Layer.provide(GreeterLive),
 			Layer.provideMerge(MultiplierLive),
 			Layer.provideMerge(TestTracer.layer()),
-			Layer.provide(Registry.layer({ endpoint, token, namespace })),
+			Layer.provide(
+				Registry.layer({
+					endpoint,
+					token,
+					namespace,
+					envoy: { poolName },
+				}),
+			),
 		),
 	),
 );

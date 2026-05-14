@@ -16,38 +16,30 @@ export interface PreparedNamespace {
 	readonly poolName: string;
 }
 
+// Mirrors what `setupTest` + `startEngine: true` does internally
+// (`rivetkit-core::registry::runner_config::ensure_local_normal_runner_config`):
+// reuses the engine's bootstrap-created `default` namespace and only
+// upserts a normal runner config with the same body shape core emits.
+// Per-file isolation comes from a unique pool name; the registry
+// registers its envoy under that pool so envoy routing stays partitioned
+// across test files even though they share the namespace.
+//
+// The engine's `/health` route returns OK as soon as the HTTP servers
+// are listening, but the bootstrap workflows (epoxy replica/coordinator,
+// default namespace, datacenter ping) keep running in the background.
+// Actor wakes need those workflows settled or the first SQLite
+// `get_pages` against a fresh bucket fails with `sqlite database was
+// not found in this bucket branch`. Probe `getDatacenters` plus an
+// idempotent runner-config upsert with `drain_on_version_upgrade: true`
+// until both succeed back-to-back; bootstrap is settled by then.
 export async function prepareNamespace(
 	endpoint: string,
-	options: { namespace?: string; poolName?: string } = {},
+	options: { poolName?: string } = {},
 ): Promise<PreparedNamespace> {
-	const namespace = options.namespace ?? `effect-e2e-${randomUUID()}`;
-	const poolName = options.poolName ?? "default";
-	await createNamespace(endpoint, namespace);
+	const namespace = "default";
+	const poolName = options.poolName ?? `effect-e2e-${randomUUID()}`;
 	await upsertNormalRunnerConfig(endpoint, namespace, poolName);
 	return { endpoint, token: TEST_ENGINE_TOKEN, namespace, poolName };
-}
-
-async function createNamespace(
-	endpoint: string,
-	namespace: string,
-): Promise<void> {
-	const response = await fetch(`${endpoint}/namespaces`, {
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${TEST_ENGINE_TOKEN}`,
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify({
-			name: namespace,
-			display_name: `Effect e2e ${namespace}`,
-		}),
-	});
-
-	if (!response.ok) {
-		throw new Error(
-			`failed to create namespace ${namespace}: ${response.status} ${await response.text()}`,
-		);
-	}
 }
 
 export async function waitForEnvoy(
@@ -127,6 +119,7 @@ async function upsertNormalRunnerConfig(
 					datacenters: {
 						[datacenter]: {
 							normal: {},
+							drain_on_version_upgrade: true,
 						},
 					},
 				}),
