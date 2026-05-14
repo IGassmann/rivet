@@ -594,7 +594,7 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 				).pipe(Effect.fromOption, Effect.orDie);
 				yield* Scope.close(instance.scope, Exit.void);
 				yield* Effect.sync(() => {
-					MutableHashMap.remove(c.actorId);
+					MutableHashMap.remove(instances, c.actorId);
 				});
 			}),
 		);
