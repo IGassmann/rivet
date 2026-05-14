@@ -374,11 +374,6 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 		decode: Schema.decodeUnknownEffect(def.schema),
 		encode: Schema.encodeUnknownEffect(def.schema),
 	}));
-	const stateInitialValue = Option.isSome(stateDefOption)
-		? yield* Option.getOrThrow(stateCodec)
-				.encode(stateDefOption.value.initialValue())
-				.pipe(Effect.orDie)
-		: undefined;
 
 	const instances = MutableHashMap.empty<
 		string,
@@ -603,7 +598,12 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 		options: rivetkitOptions,
 		onWake,
 		...(Option.isSome(stateDefOption)
-			? { createState: () => stateInitialValue }
+			? {
+					createState: () =>
+						Option.getOrThrow(stateCodec)
+							.encode(stateDefOption.value.initialValue())
+							.pipe(Effect.orDie),
+				}
 			: {}),
 		actions,
 		onStateChange,
