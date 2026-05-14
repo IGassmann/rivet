@@ -341,6 +341,11 @@ export const make = <
 	return self;
 };
 
+const eraseStateSchemaServices = <StateDef extends ActorState.AnyWithProps>(
+	state: State.State<unknown, Schema.SchemaError, unknown>,
+): State.State<StateDef["schema"]["Type"], Schema.SchemaError> =>
+	state as State.State<StateDef["schema"]["Type"], Schema.SchemaError>;
+
 const makeRivetkitActor = Effect.fnUntraced(function* <
 	Name extends string,
 	Actions extends Action.AnyWithProps,
@@ -377,11 +382,7 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 			readonly actionHandlers: ActionHandlers;
 			readonly scope: Scope.Closeable;
 			readonly state: Option.Option<
-				State.State<
-					State["schema"]["Type"],
-					Schema.SchemaError,
-					unknown
-				>
+				State.State<State["schema"]["Type"], Schema.SchemaError>
 			>;
 		}
 	>();
@@ -406,7 +407,7 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 							// up as `unknown`; the captured `services`
 							// context satisfies them at runtime, so we erase
 							// R at the boundary.
-							yield* State.make(
+							(yield* State.make(
 								() =>
 									Schema.decodeUnknownEffect(
 										stateDefOption.value.schema,
@@ -422,7 +423,10 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 										),
 										Effect.asVoid,
 									),
-							).pipe(Effect.orDie),
+							).pipe(Effect.orDie)) as State.State<
+								ActorState.AnyWithProps["schema"]["Type"],
+								Schema.SchemaError
+							>,
 						)
 					: Option.none();
 

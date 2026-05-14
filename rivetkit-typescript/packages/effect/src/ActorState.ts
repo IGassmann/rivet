@@ -36,13 +36,11 @@ export interface Any {
 /**
  * Like `Any`, but with the prop fields (`schema`, `initialValue`) accessible.
  * Used by the runtime to seed `c.state` and provide the `State` under
- * the state's tag.
+ * the state's tag. The yielded `State` has no visible service requirement
+ * because schema services are resolved against the actor runner context.
  */
 export interface AnyWithProps
-	extends Context.Service<
-		any,
-		State.State<any, Schema.SchemaError, unknown>
-	> {
+	extends Context.Service<any, State.State<any, Schema.SchemaError>> {
 	readonly [TypeId]: typeof TypeId;
 	readonly _tag: string;
 	readonly schema: Schema.Top;
