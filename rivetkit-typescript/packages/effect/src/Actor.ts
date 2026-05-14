@@ -368,8 +368,7 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 	const services = yield* Effect.context<any>();
 
 	const { effectOptions, rivetkitOptions } = splitOptions(options);
-	const stateDef = effectOptions.state;
-	const stateDefOption = Option.fromNullishOr(stateDef);
+	const stateDefOption = Option.fromNullishOr(effectOptions.state);
 	const stateCodec = Option.map(stateDefOption, (def) => ({
 		decode: Schema.decodeUnknownEffect(def.schema),
 		encode: Schema.encodeUnknownEffect(def.schema),
