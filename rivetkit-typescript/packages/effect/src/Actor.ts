@@ -612,13 +612,15 @@ const makeRivetkitActor = Effect.fnUntraced(function* <
 		...(options.state
 			? {
 					createState: () =>
-						UndefinedOr.getOrThrow(stateCodec)
-							.encode(
-								UndefinedOr.getOrThrow(
-									options.state,
-								).initialValue(),
-							)
-							.pipe(Effect.orDie),
+						Effect.runPromiseWith(services)(
+							UndefinedOr.getOrThrow(stateCodec)
+								.encode(
+									UndefinedOr.getOrThrow(
+										options.state,
+									).initialValue(),
+								)
+								.pipe(Effect.orDie),
+						),
 				}
 			: {}),
 		actions,
