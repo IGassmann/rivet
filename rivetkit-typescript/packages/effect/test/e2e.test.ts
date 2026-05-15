@@ -589,7 +589,7 @@ layer(TestLayer)("end-to-end", (it) => {
 		}),
 	);
 
-	it.effect("writes through the db captured from RivetkitContext", () =>
+	it.effect("writes through the db captured from RawRivetkitContext", () =>
 		Effect.gen(function* () {
 			const counter = (yield* Counter.client).getOrCreate(["t-db-write"]);
 			const afterFirst = yield* counter.LogEvent({ event: "alpha" });

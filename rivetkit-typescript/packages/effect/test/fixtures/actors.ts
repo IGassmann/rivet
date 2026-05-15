@@ -232,12 +232,12 @@ export const CounterLive = Counter.toLayer(
 		const wakeGreeting = greeter.greet("on wake");
 
 		const sleep = yield* Actor.Sleep;
-		// `RivetkitContext`'s `db` widens to `any` against
+		// `RawRivetkitContext`'s `db` widens to `any` against
 		// `RunContextOf<AnyActorDefinition>`. The provider configured on
 		// `Counter.toLayer` below is the `rivetkit/db` raw-access factory,
 		// so re-narrow to `RawAccess` for typed `execute` calls inside
 		// handler closures.
-		const ctx = yield* Actor.RivetkitContext;
+		const ctx = yield* Actor.RawRivetkitContext;
 		const db = ctx.db as RawAccess;
 		// `Flags` is a process-wide Map shared across all tests in the
 		// suite, so the finalizer flag must be namespaced by actor key
@@ -343,7 +343,7 @@ export const CounterLive = Counter.toLayer(
 			GetPersistedState: () => State.get(state),
 			// Per-actor SQLite is provisioned via the `db:` option on
 			// `Counter.toLayer` below. The build effect destructures `db`
-			// from `Actor.RivetkitContext`, so handlers reach SQLite
+			// from `Actor.RawRivetkitContext`, so handlers reach SQLite
 			// through the captured client without going through `c.db`.
 			LogEvent: ({ payload }) =>
 				Effect.tryPromise(async () => {
