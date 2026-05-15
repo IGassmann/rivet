@@ -1,0 +1,87 @@
+import { Schema } from "effect";
+import { Action, Actor } from "@rivetkit/effect";
+
+export const Member = Schema.Struct({
+	name: Schema.String,
+	joinedAt: Schema.Number,
+});
+
+export const Message = Schema.Struct({
+	id: Schema.Number,
+	sender: Schema.String,
+	text: Schema.String,
+	createdAt: Schema.Number,
+});
+
+export const SendMessageResult = Schema.Struct({
+	ok: Schema.Boolean,
+	reason: Schema.optionalKey(Schema.String),
+	createdAt: Schema.optionalKey(Schema.Number),
+});
+
+// The plain RivetKit example uses createState input to name the room at
+// creation time. The Effect SDK does not expose create input yet, so this
+// action initializes the persisted room state explicitly after getOrCreate.
+export const Initialize = Action.make("Initialize", {
+	payload: { name: Schema.String },
+});
+
+export const Join = Action.make("Join", {
+	payload: { name: Schema.String },
+	success: Member,
+});
+
+export const Leave = Action.make("Leave", {
+	payload: { name: Schema.String },
+});
+
+export const SendMessage = Action.make("SendMessage", {
+	payload: {
+		sender: Schema.String,
+		text: Schema.String,
+	},
+	success: SendMessageResult,
+});
+
+export const GetHistory = Action.make("GetHistory", {
+	success: Schema.Array(Message),
+});
+
+export const GetMembers = Action.make("GetMembers", {
+	success: Schema.Array(Member),
+});
+
+export const ScheduleAnnouncement = Action.make("ScheduleAnnouncement", {
+	payload: {
+		text: Schema.String,
+		delayMs: Schema.Number,
+	},
+	success: Schema.Struct({
+		firesAt: Schema.Number,
+	}),
+});
+
+// Scheduled actions receive the same single schema payload that normal
+// Effect actions use. This replaces the plain SDK example's positional
+// triggerAnnouncement(text) action.
+export const TriggerAnnouncement = Action.make("TriggerAnnouncement", {
+	payload: { text: Schema.String },
+});
+
+// The plain RivetKit example closes the room from onDestroy. The Effect SDK
+// does not expose onDestroy yet, so archive performs cleanup before destroy.
+export const Archive = Action.make("Archive");
+
+export const ChatRoom = Actor.make("chatRoom", {
+	actions: [
+		Initialize,
+		Join,
+		Leave,
+		SendMessage,
+		GetHistory,
+		GetMembers,
+		ScheduleAnnouncement,
+		TriggerAnnouncement,
+		Archive,
+	],
+});
