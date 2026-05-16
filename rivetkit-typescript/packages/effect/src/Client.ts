@@ -90,10 +90,11 @@ export const make = Effect.fnUntraced(function* (options: Options = {}) {
 							const encodedPayload =
 								yield* encodePayload(payload);
 							const raw = yield* Effect.tryPromise({
-								try: () =>
+								try: (abortSignal) =>
 									rivetkitActorHandle.action({
 										name: action._tag,
 										args: [encodedPayload, meta],
+										signal: abortSignal,
 									}),
 								catch: (cause) =>
 									cause instanceof Rivetkit.RivetError
