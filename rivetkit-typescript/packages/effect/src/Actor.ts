@@ -1,31 +1,30 @@
 import {
+	Cause,
 	Context,
 	Effect,
+	Exit,
 	identity,
 	Layer,
+	MutableHashMap,
 	Predicate,
+	Record,
 	Schema,
 	Scope,
-	Struct,
-	Record,
-	MutableHashMap,
-	Option,
-	Tracer,
-	Exit,
-	Cause,
 	Semaphore,
+	Struct,
+	Tracer,
 	UndefinedOr,
 } from "effect";
 import * as Rivetkit from "rivetkit";
 import type * as RivetkitDb from "rivetkit/db";
-import { hasStringProperty } from "./utils";
-import * as Registry from "./Registry";
 import type * as Action from "./Action";
 import type * as ActorState from "./ActorState";
 import * as Client from "./Client";
-import * as State from "./State";
-import * as RivetError from "./RivetError";
 import { readTraceMeta, rpcSystem } from "./internal/tracing";
+import * as Registry from "./Registry";
+import * as RivetError from "./RivetError";
+import * as State from "./State";
+import { hasStringProperty } from "./utils";
 
 const TypeId = "~@rivetkit/effect/Actor";
 
