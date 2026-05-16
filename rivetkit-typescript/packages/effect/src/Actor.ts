@@ -245,15 +245,9 @@ const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 		const self = this as Any;
 		return Effect.gen(function* () {
 			const client = yield* Client.Client;
-			const actions = self.actions;
 			return {
 				getOrCreate: (key: ActorKeyParam) => {
-					const handle: Record<
-						string,
-						(p: unknown) => Effect.Effect<unknown, unknown>
-					> = {};
-					for (const action of actions) {
-						const rpcMethod = `${self.name}/${action._tag}`;
+					return Record.fromIterableWith(self.actions, (action) => {
 						const encodePayload = Schema.encodeUnknownEffect(
 							action.payloadSchema,
 						);
@@ -263,66 +257,76 @@ const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 						const decodeError = Schema.decodeUnknownEffect(
 							action.errorSchema,
 						);
-						handle[action._tag] = Effect.fn(rpcMethod, {
-							kind: "client",
-							attributes: {
-								"rpc.system.name": rpcSystem,
-								"rpc.method": rpcMethod,
-							},
-						})(function* (payload: unknown) {
-							const span = yield* Effect.currentSpan;
-							const meta: Client.ActionMeta = {
-								trace: {
-									traceId: span.traceId,
-									spanId: span.spanId,
-									sampled: span.sampled,
+
+						const rpcMethod = `${self.name}/${action._tag}`;
+
+						return [
+							action._tag,
+							Effect.fn(rpcMethod, {
+								kind: "client",
+								attributes: {
+									"rpc.system.name": rpcSystem,
+									"rpc.method": rpcMethod,
 								},
-							};
-							const raw = yield* client
-								.callAction({
-									actorName: self.name,
-									key,
-									actionName: action._tag,
-									encodedPayload:
-										yield* encodePayload(payload),
-									meta,
-								})
-								.pipe(
-									// Try `errorSchema` first against the
-									// wire metadata. Fall back to wrapping
-									// the raw RivetError via `RivetErrorFromWire`.
-									Effect.catch((rivetErr) =>
-										decodeError(
-											(rivetErr as { metadata?: unknown })
-												.metadata,
-										).pipe(
-											Effect.matchEffect({
-												onSuccess: (typed) =>
-													Effect.fail(typed),
-												onFailure: () =>
-													decodeRivetErrorFromWire({
-														group: rivetErr.group,
-														code: rivetErr.code,
-														message:
-															rivetErr.message,
-														metadata: (
-															rivetErr as {
-																metadata?: unknown;
-															}
-														).metadata,
-													}).pipe(
-														Effect.flatMap(
-															Effect.fail,
+							})(function* (payload: unknown) {
+								const span = yield* Effect.currentSpan;
+								const meta: Client.ActionMeta = {
+									trace: {
+										traceId: span.traceId,
+										spanId: span.spanId,
+										sampled: span.sampled,
+									},
+								};
+								const raw = yield* client
+									.action({
+										actorName: self.name,
+										key,
+										actionName: action._tag,
+										encodedPayload:
+											yield* encodePayload(payload),
+										meta,
+									})
+									.pipe(
+										// Try `errorSchema` first against the
+										// wire metadata. Fall back to wrapping
+										// the raw RivetError via `RivetErrorFromWire`.
+										Effect.catch((rivetErr) =>
+											decodeError(
+												(
+													rivetErr as {
+														metadata?: unknown;
+													}
+												).metadata,
+											).pipe(
+												Effect.matchEffect({
+													onSuccess: (typed) =>
+														Effect.fail(typed),
+													onFailure: () =>
+														decodeRivetErrorFromWire(
+															{
+																group: rivetErr.group,
+																code: rivetErr.code,
+																message:
+																	rivetErr.message,
+																metadata: (
+																	rivetErr as {
+																		metadata?: unknown;
+																	}
+																).metadata,
+															},
+														).pipe(
+															Effect.flatMap(
+																Effect.fail,
+															),
 														),
-													),
-											}),
+												}),
+											),
 										),
-									),
-								);
-							return yield* decodeSuccess(raw);
-						}) as (p: unknown) => Effect.Effect<unknown, unknown>;
-					}
-					return handle as Handle<Action.AnyWithProps>;
+									);
+								return yield* decodeSuccess(raw);
+							}),
+						];
+					}) as Handle<Action.AnyWithProps>;
 				},
 			};
 		});
