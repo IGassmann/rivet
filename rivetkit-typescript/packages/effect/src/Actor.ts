@@ -253,8 +253,7 @@ const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 						(p: unknown) => Effect.Effect<unknown, unknown>
 					> = {};
 					for (const action of actions) {
-						const tag = action._tag;
-						const rpcMethod = `${self.name}/${tag}`;
+						const rpcMethod = `${self.name}/${action._tag}`;
 						const encodePayload = Schema.encodeUnknownEffect(
 							action.payloadSchema,
 						);
@@ -273,7 +272,7 @@ const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 						// wrapper can reattach it as the handler's
 						// parent. Same pattern as Effect's RPC layer
 						// (`RpcClient.ts`).
-						handle[tag] = Effect.fn(rpcMethod, {
+						handle[action._tag] = Effect.fn(rpcMethod, {
 							kind: "client",
 							attributes: {
 								"rpc.system.name": rpcSystem,
@@ -292,7 +291,7 @@ const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 								.callAction({
 									actorName: self.name,
 									key,
-									actionName: tag,
+									actionName: action._tag,
 									encodedPayload:
 										yield* encodePayload(payload),
 									meta,
