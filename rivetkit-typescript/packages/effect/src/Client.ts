@@ -28,7 +28,7 @@ export interface ActionMeta {
 /**
  * Service holding the rivetkit client transport. Provided once via
  * `Client.layer({ ... })`. Consumed by `Actor.client` to dispatch
- * action calls through a single shared transport.
+ * action calls through a single and shared transport.
  */
 export class Client extends Context.Service<
 	Client,
