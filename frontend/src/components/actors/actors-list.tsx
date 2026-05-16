@@ -18,7 +18,7 @@ import {
 } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
-import { Suspense, useCallback, useRef, type RefObject } from "react";
+import { Suspense, useCallback, useEffect, useRef, type RefObject } from "react";
 import { useLocalStorage } from "usehooks-ts";
 import { RECORDS_PER_PAGE } from "@/app/data-providers/default-data-provider";
 import {
@@ -141,7 +141,7 @@ function List({
 	viewportRef,
 }: { viewportRef: RefObject<HTMLDivElement | null> }) {
 	const filters = useFiltersValue({ onlyStatic: true });
-	const { actorId, actorKey, n } = useSearch({
+	const { actorId, n } = useSearch({
 		from: "/_context",
 	});
 	const { data: actors = [] } = useInfiniteQuery(
@@ -154,6 +154,10 @@ function List({
 		estimateSize: () => 56,
 		overscan: 5,
 	});
+
+	useEffect(() => {
+		rowVirtualizer.measure();
+	}, [rowVirtualizer]);
 
 	return (
 		<div
@@ -173,12 +177,8 @@ function List({
 						}}
 					>
 						<ActorsListRow
-							actorKey={actor.key}
 							actorId={actor.actorId}
-							isCurrent={
-								actorId === actor.actorId ||
-								actorKey === actor.key
-							}
+							isCurrent={actorId === actor.actorId}
 						/>
 					</div>
 				);

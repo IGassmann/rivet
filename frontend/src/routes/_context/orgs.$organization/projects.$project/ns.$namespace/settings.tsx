@@ -43,7 +43,7 @@ export const Route = createFileRoute(
 
 	pendingComponent: DataLoadingPlaceholder,
 	beforeLoad: async () => {
-		if (!features.multitenancy) {
+		if (!features.platform) {
 			throw notFound();
 		}
 	},
@@ -139,6 +139,8 @@ function NoRunnersAlert() {
 }
 
 function Providers() {
+	const dataProvider = useEngineCompatDataProvider();
+	const navigate = useNavigate();
 	const {
 		isLoading,
 		isError,
@@ -146,8 +148,15 @@ function Providers() {
 		hasNextPage,
 		fetchNextPage,
 	} = useInfiniteQuery({
-		...useEngineCompatDataProvider().runnerConfigsQueryOptions(),
+		...dataProvider.runnerConfigsQueryOptions(),
 		refetchInterval: 5000,
+	});
+
+	const { data: totalDatacenterCount } = useInfiniteQuery({
+		...dataProvider.datacentersQueryOptions(),
+		maxPages: Infinity,
+		select: (data) =>
+			data.pages.reduce((acc, page) => acc + page.datacenters?.length, 0),
 	});
 
 	return (
@@ -177,6 +186,32 @@ function Providers() {
 						configs={configs || []}
 						fetchNextPage={fetchNextPage}
 						hasNextPage={hasNextPage}
+						totalDatacenterCount={totalDatacenterCount}
+						renderRegion={(regionId, { abbreviated }) => (
+							<ActorRegion
+								className="w-full items-center flex-1 whitespace-nowrap"
+								regionId={regionId}
+								showLabel={abbreviated ? "abbreviated" : true}
+							/>
+						)}
+						onEditConfig={(name) =>
+							navigate({
+								to: ".",
+								search: {
+									modal: "edit-provider-config",
+									config: name,
+								},
+							})
+						}
+						onDeleteConfig={(name) =>
+							navigate({
+								to: ".",
+								search: {
+									modal: "delete-provider-config",
+									config: name,
+								},
+							})
+						}
 					/>
 				</div>
 			</div>
@@ -284,11 +319,11 @@ function Advanced() {
 				<AccordionContent>
 					<Suspense
 						fallback={
-							<>
-								<Skeleton className="w-full h-20 rounded-md" />
-								<Skeleton className="w-full h-20 rounded-md" />
-								<Skeleton className="w-full h-20 rounded-md" />
-							</>
+							<div className="pb-4 pb-8 px-6 max-w-5xl mx-auto mb-8">
+								<Skeleton className="w-full h-36 rounded-md mb-4" />
+								<Skeleton className="w-full h-36 rounded-md mb-4" />
+								<Skeleton className="w-full h-36 rounded-md mb-4" />
+							</div>
 						}
 					>
 						<SecretToken />
