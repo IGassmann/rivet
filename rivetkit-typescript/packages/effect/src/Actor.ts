@@ -142,9 +142,9 @@ export type Handle<Actions extends Action.Any> = {
  * Yielded by `Actor.client`. Address an actor instance by key, then
  * dispatch typed action calls against the returned `Handle`.
  */
-export interface TypedAccessor<Actions extends Action.Any> {
+export type Accessor<Actions extends Action.Any> = {
 	readonly getOrCreate: (key: ActorKeyParam) => Handle<Actions>;
-}
+};
 
 /**
  * A Rivet Actor contract. It carries the action schemas and
@@ -193,7 +193,7 @@ export interface Actor<
 	 * transport.
 	 */
 	readonly client: Effect.Effect<
-		TypedAccessor<Actions>,
+		Accessor<Actions>,
 		never,
 		Client.Client | Action.ServicesClient<Actions>
 	>;
