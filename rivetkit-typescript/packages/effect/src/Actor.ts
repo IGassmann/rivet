@@ -175,7 +175,11 @@ export interface Actor<
 		never,
 		| Exclude<
 				RX,
-				Scope.Scope | CurrentAddress | Sleep | RawRivetkitContext | State
+				| Scope.Scope
+				| CurrentAddress
+				| Sleep
+				| RawRivetkitContext
+				| State
 		  >
 		| ActionHandlerServices<ActionHandlers>
 		| Action.ServicesServer<Actions>
@@ -187,9 +191,7 @@ export interface Actor<
 	 * Effect-yielded typed accessor for this actor. Provide a
 	 * `Client.layer({ ... })` once at the program root; every
 	 * `yield* SomeActor.client` then dispatches through the same
-	 * transport. Per-call signatures are `Effect<Success, Error |
-	 * RivetError, never>` — schema services are pulled in at the
-	 * getter level via `Action.ServicesClient<Actions>`.
+	 * transport.
 	 */
 	readonly client: Effect.Effect<
 		TypedAccessor<Actions>,
