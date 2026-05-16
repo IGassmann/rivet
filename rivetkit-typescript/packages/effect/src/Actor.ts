@@ -22,7 +22,7 @@ import type * as ActorState from "./ActorState";
 import * as Client from "./Client";
 import { readTraceMeta, rpcSystem } from "./internal/tracing";
 import * as Registry from "./Registry";
-import * as RivetError from "./RivetError";
+import type * as RivetError from "./RivetError";
 import * as State from "./State";
 import { hasStringProperty } from "./utils";
 
