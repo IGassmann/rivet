@@ -263,15 +263,6 @@ const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 						const decodeError = Schema.decodeUnknownEffect(
 							action.errorSchema,
 						);
-						// `Effect.fn` wraps the generator in a span named
-						// `rpcMethod` (kind=client + OTel `rpc.*` attrs)
-						// without an extra `pipe(Effect.withSpan(...))`.
-						// The active span inside is the one whose IDs
-						// the body reads via `Effect.currentSpan` and
-						// ships as `meta.trace`, so the server-side
-						// wrapper can reattach it as the handler's
-						// parent. Same pattern as Effect's RPC layer
-						// (`RpcClient.ts`).
 						handle[action._tag] = Effect.fn(rpcMethod, {
 							kind: "client",
 							attributes: {
