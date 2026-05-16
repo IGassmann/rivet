@@ -246,8 +246,8 @@ const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 		return Effect.gen(function* () {
 			const client = yield* Client.Client;
 			return {
-				getOrCreate: (key: ActorKeyParam) => {
-					return Record.fromIterableWith(self.actions, (action) => {
+				getOrCreate: (key: ActorKeyParam) =>
+					Record.fromIterableWith(self.actions, (action) => {
 						const encodePayload = Schema.encodeUnknownEffect(
 							action.payloadSchema,
 						);
@@ -326,8 +326,7 @@ const Proto: Omit<Actor<any, any>, "name" | "actions"> = {
 								return yield* decodeSuccess(raw);
 							}),
 						];
-					}) as Handle<Action.AnyWithProps>;
-				},
+					}) as Handle<Action.AnyWithProps>,
 			};
 		});
 	},
