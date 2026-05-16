@@ -101,33 +101,6 @@ export const test: Layer.Layer<Client, never, Registry> = Layer.effect(
 			(c) => Effect.promise(() => c.dispose()),
 		);
 
-		return Client.of({
-			action: ({ actorName, key, actionName, encodedPayload, meta }) =>
-				Effect.tryPromise({
-					try: () =>
-						rivetkitClient[actorName].getOrCreate(key).action({
-							name: actionName,
-							args: meta
-								? [encodedPayload, meta]
-								: [encodedPayload],
-						}),
-					catch: (cause) =>
-						cause instanceof Rivetkit.RivetError
-							? cause
-							: new Rivetkit.RivetError(
-									"client",
-									"unknown",
-									cause instanceof Error
-										? cause.message
-										: String(cause),
-									{
-										cause:
-											cause instanceof Error
-												? cause
-												: undefined,
-									},
-								),
-				}),
-		});
+		return Client.fromRivetkitClient(rivetkitClient);
 	}),
 );
