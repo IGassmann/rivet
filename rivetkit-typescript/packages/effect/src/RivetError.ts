@@ -56,3 +56,6 @@ export const RivetErrorFromWire = Wire.pipe(
 		}),
 	}),
 );
+
+export const decodeRivetErrorFromWire =
+	Schema.decodeUnknownEffect(RivetErrorFromWire);

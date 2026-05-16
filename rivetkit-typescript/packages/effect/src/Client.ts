@@ -7,12 +7,14 @@ import type * as Actor from "./Actor";
 import { rpcSystem, type TraceMeta } from "./internal/tracing";
 import * as RivetError from "./RivetError";
 
+const TypeId = "~@rivetkit/effect/Client";
+
 /**
  * Connection options for the Rivet Engine client transport. Mirrors
  * the `(endpoint, token, namespace)` subset of rivetkit's
  * `ClientConfigInput`.
  */
-export type ClientOptions = Pick<
+export type Options = Pick<
 	RivetkitClient.ClientConfigInput,
 	"endpoint" | "token" | "namespace"
 >;
@@ -28,97 +30,105 @@ export interface ActionMeta {
 	readonly trace?: TraceMeta;
 }
 
-export class Client extends Context.Service<
-	Client,
-	{
-		readonly makeActorAccessor: <Actions extends Action.AnyWithProps>(
-			actor: Actor.Actor<string, Actions>,
-		) => Actor.Accessor<Actions>;
-	}
->()("@rivetkit/effect/Client") {
-	static readonly fromRivetkitClient = (
-		rivetkitClient: RivetkitClient.Client<Rivetkit.Registry<any>>,
-	): ClientService =>
-		Client.of({
-			makeActorAccessor: (actor) => ({
-				getOrCreate: (key) => {
-					const rivetkitActorHandle = rivetkitClient.getOrCreate(
-						actor.name,
-						key,
+export interface Client {
+	readonly [TypeId]: typeof TypeId;
+
+	readonly makeActorAccessor: <Actions extends Action.AnyWithProps>(
+		actor: Actor.Actor<string, Actions>,
+	) => Actor.Accessor<Actions>;
+}
+
+export const Client: Context.Service<Client, Client> = Context.Service<Client>(
+	"@rivetkit/effect/Client",
+);
+
+export const make = Effect.fnUntraced(function* (options: Options = {}) {
+	const rivetkitClient = yield* Effect.acquireRelease(
+		Effect.sync(() => RivetkitClient.createClient(options)),
+		(c) => Effect.promise(() => c.dispose()),
+	);
+
+	return Client.of({
+		[TypeId]: TypeId,
+		makeActorAccessor: (actor) => ({
+			getOrCreate: (key) => {
+				const rivetkitActorHandle = rivetkitClient.getOrCreate(
+					actor.name,
+					key,
+				);
+
+				return Record.fromIterableWith(actor.actions, (action) => {
+					const encodePayload = Schema.encodeUnknownEffect(
+						action.payloadSchema,
+					);
+					const decodeSuccess = Schema.decodeUnknownEffect(
+						action.successSchema,
+					);
+					const decodeError = Schema.decodeUnknownEffect(
+						action.errorSchema,
 					);
 
-					return Record.fromIterableWith(actor.actions, (action) => {
-						const encodePayload = Schema.encodeUnknownEffect(
-							action.payloadSchema,
-						);
-						const decodeSuccess = Schema.decodeUnknownEffect(
-							action.successSchema,
-						);
-						const decodeError = Schema.decodeUnknownEffect(
-							action.errorSchema,
-						);
+					const rpcMethod = `${actor.name}/${action._tag}`;
 
-						const rpcMethod = `${actor.name}/${action._tag}`;
-
-						return [
-							action._tag,
-							Effect.fn(rpcMethod, {
-								kind: "client",
-								attributes: {
-									"rpc.system.name": rpcSystem,
-									"rpc.method": rpcMethod,
+					return [
+						action._tag,
+						Effect.fn(rpcMethod, {
+							kind: "client",
+							attributes: {
+								"rpc.system.name": rpcSystem,
+								"rpc.method": rpcMethod,
+							},
+						})(function* (payload: unknown) {
+							const span = yield* Effect.currentSpan;
+							const meta: ActionMeta = {
+								trace: {
+									traceId: span.traceId,
+									spanId: span.spanId,
+									sampled: span.sampled,
 								},
-							})(function* (payload: unknown) {
-								const span = yield* Effect.currentSpan;
-								const meta: ActionMeta = {
-									trace: {
-										traceId: span.traceId,
-										spanId: span.spanId,
-										sampled: span.sampled,
-									},
-								};
-								const encodedPayload =
-									yield* encodePayload(payload);
-								const raw = yield* Effect.tryPromise({
-									try: () =>
-										rivetkitActorHandle.action({
-											name: action._tag,
-											args: [encodedPayload, meta],
-										}),
-									catch: (cause) =>
-										cause instanceof Rivetkit.RivetError
-											? cause
-											: new Rivetkit.RivetError(
-													"client",
-													"unknown",
-													cause instanceof Error
-														? cause.message
-														: String(cause),
+							};
+							const encodedPayload =
+								yield* encodePayload(payload);
+							const raw = yield* Effect.tryPromise({
+								try: () =>
+									rivetkitActorHandle.action({
+										name: action._tag,
+										args: [encodedPayload, meta],
+									}),
+								catch: (cause) =>
+									cause instanceof Rivetkit.RivetError
+										? cause
+										: new Rivetkit.RivetError(
+												"client",
+												"unknown",
+												cause instanceof Error
+													? cause.message
+													: String(cause),
+												{
+													cause:
+														cause instanceof Error
+															? cause
+															: undefined,
+												},
+											),
+							}).pipe(
+								// Try `errorSchema` first against the
+								// wire metadata. Fall back to wrapping
+								// the raw RivetError via `RivetErrorFromWire`.
+								Effect.catch((rivetErr) =>
+									decodeError(
+										(
+											rivetErr as {
+												metadata?: unknown;
+											}
+										).metadata,
+									).pipe(
+										Effect.matchEffect({
+											onSuccess: (typed) =>
+												Effect.fail(typed),
+											onFailure: () =>
+												RivetError.decodeRivetErrorFromWire(
 													{
-														cause:
-															cause instanceof
-															Error
-																? cause
-																: undefined,
-													},
-												),
-								}).pipe(
-									// Try `errorSchema` first against the
-									// wire metadata. Fall back to wrapping
-									// the raw RivetError via `RivetErrorFromWire`.
-									Effect.catch((rivetErr) =>
-										decodeError(
-											(
-												rivetErr as {
-													metadata?: unknown;
-												}
-											).metadata,
-										).pipe(
-											Effect.matchEffect({
-												onSuccess: (typed) =>
-													Effect.fail(typed),
-												onFailure: () =>
-													decodeRivetErrorFromWire({
 														group: rivetErr.group,
 														code: rivetErr.code,
 														message:
@@ -128,35 +138,22 @@ export class Client extends Context.Service<
 																metadata?: unknown;
 															}
 														).metadata,
-													}).pipe(
-														Effect.flatMap(
-															Effect.fail,
-														),
-													),
-											}),
-										),
+													},
+												).pipe(
+													Effect.flatMap(Effect.fail),
+												),
+										}),
 									),
-								);
-								return yield* decodeSuccess(raw);
-							}),
-						];
-					}) as Actor.Handle<(typeof actor.actions)[number]>;
-				},
-			}),
-		});
+								),
+							);
+							return yield* decodeSuccess(raw);
+						}),
+					];
+				}) as Actor.Handle<(typeof actor.actions)[number]>;
+			},
+		}),
+	});
+});
 
-	static readonly layer = (options: ClientOptions = {}) =>
-		Layer.effect(
-			Client,
-			Effect.acquireRelease(
-				Effect.sync(() => RivetkitClient.createClient(options)),
-				(c) => Effect.promise(() => c.dispose()),
-			).pipe(Effect.map(Client.fromRivetkitClient)),
-		);
-}
-
-const decodeRivetErrorFromWire = Schema.decodeUnknownEffect(
-	RivetError.RivetErrorFromWire,
-);
-
-export type ClientService = Client["Service"];
+export const layer = (options: Options = {}): Layer.Layer<Client> =>
+	Layer.effect(Client, make(options));

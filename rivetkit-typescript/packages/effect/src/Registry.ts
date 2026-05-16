@@ -1,7 +1,6 @@
 import { Context, Effect, Layer } from "effect";
 import * as Rivetkit from "rivetkit";
-import * as RivetkitClient from "rivetkit/client";
-import { Client, type ClientService } from "./Client";
+import * as Client from "./Client";
 
 const TypeId = "~@rivetkit/effect/Registry";
 
@@ -21,7 +20,7 @@ export interface Registry {
 export const Registry: Context.Service<Registry, Registry> =
 	Context.Service<Registry>("@rivetkit/effect/Registry");
 
-export const make = (options: Options = {}): Registry => {
+const make = (options: Options = {}): Registry => {
 	return Registry.of({
 		[TypeId]: TypeId,
 		options,
@@ -58,8 +57,8 @@ export const serve: Layer.Layer<never, never, Registry> = Layer.effectDiscard(
  * expose a public `shutdown()` today; only the SIGINT handler can
  * drive `#runShutdown`. This matches `setupTest`'s existing behavior.
  */
-export const test: Layer.Layer<Client, never, Registry> = Layer.effect(
-	Client,
+export const test: Layer.Layer<Client.Client, never, Registry> = Layer.effect(
+	Client.Client,
 	Effect.gen(function* () {
 		const registry = yield* Registry;
 		const rivetkitRegistry = Rivetkit.setup({
@@ -91,16 +90,10 @@ export const test: Layer.Layer<Client, never, Registry> = Layer.effect(
 		// endpoint to the client so `createClient` doesn't fall back
 		// to its (warning-emitting) default.
 		const resolvedEndpoint = rivetkitRegistry.parseConfig().endpoint;
-		const rivetkitClient = yield* Effect.acquireRelease(
-			Effect.sync(() =>
-				RivetkitClient.createClient({
-					...registry.options,
-					endpoint: registry.options.endpoint ?? resolvedEndpoint,
-				}),
-			),
-			(c) => Effect.promise(() => c.dispose()),
-		);
 
-		return Client.fromRivetkitClient(rivetkitClient);
+		return yield* Client.make({
+			...registry.options,
+			endpoint: registry.options.endpoint ?? resolvedEndpoint,
+		});
 	}),
 );
